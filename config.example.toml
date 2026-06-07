@@ -1,0 +1,32 @@
+# Chameleon-PQ — configuratiebestand
+# Genereer sleutels met: chameleon-pq keygen
+
+[identity]
+# Eigen Ed25519 seed (32 bytes hex) — GEHEIM houden.
+ed25519_seed_hex      = "0101010101010101010101010101010101010101010101010101010101010101"
+# Voorgedeelde publieke sleutel van de peer — uit 'keygen' van de andere kant.
+peer_ed25519_pub_hex  = "0909090909090909090909090909090909090909090909090909090909090909"
+
+# ── Hybride post-quantum peer-auth (AANBEVOLEN) ─────────────────────────────
+# Vul deze twee in voor hybride Ed25519 + ML-DSA-65 authenticatie. De sleutels
+# zijn groot; genereer ze met `chameleon-pq keygen` en plak de hex hier.
+# Zet ze aan BEIDE kanten, of laat ze aan beide kanten weg voor Ed25519-only.
+#   mldsa_secret_hex    = "…eigen ML-DSA secret key (geheim)…"
+#   peer_mldsa_pub_hex  = "…ML-DSA publieke sleutel van de peer…"
+
+[network]
+# Server luistert hier op; client verbindt hierheen (overschrijfbaar via --bind / --server).
+bind_addr   = "0.0.0.0:51820"
+server_addr = "1.2.3.4:51820"   # alleen nodig in client-modus
+
+[tun]
+name    = "chameleon0"           # interface-naam (Linux/macOS: vrije keuze; Windows: ook)
+address = "10.99.0.1"           # IP-adres van deze kant van de tunnel
+netmask = "255.255.255.0"
+mtu     = 1400                  # laat ruimte voor VPN-header boven de 1280-MTU
+
+[engine]
+# Maximale wachttijd (µs) voor een batch voordat die geflusht wordt.
+# 200 µs is veilig voor gaming; verhoog voor hogere throughput.
+# Het datapad draait volledig op de CPU (constant-time, low-latency).
+batch_linger_us = 200

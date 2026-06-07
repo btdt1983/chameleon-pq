@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# === SECURITY: never commit secrets ===
+# Echte configs met private keys/seeds (alleen example mag in git)
+config.toml
+config*.toml
+!config.example.toml
+
+# Sleutel-bestanden in elke vorm
+*.key
+*.pem
+*.seed
+*_secret*
+*_private*
+
+# Local environment overrides
+.env
+.env.local

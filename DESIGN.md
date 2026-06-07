@@ -1,0 +1,387 @@
+# Design & Rationale — Chameleon-PQ
+
+*🇬🇧 English | [🇩🇪 Deutsch](DESIGN.de.md)*
+
+This document explains *why* Chameleon-PQ is built the way it is. Every
+significant choice is recorded with its reasoning and its trade-offs, so
+that reviewers, contributors, and future-me can understand the decisions
+rather than guess at them.
+
+> **Status reminder:** this is experimental, unaudited software. The
+> reasoning below explains the intent of the design; it is not a claim
+> that the implementation is proven secure. See `SECURITY.md`.
+
+---
+
+## 1. Threat model & scope
+
+Chameleon-PQ targets **site-to-site tunnels between known endpoints** —
+infrastructure-to-infrastructure traffic where the peers are configured
+in advance with pre-shared identities. It is *not* designed as a
+consumer anonymity service (à la commercial VPN providers).
+
+Adversaries considered:
+- **Passive network observer** — can read all ciphertext. Defended by
+  AEAD encryption of the data path.
+- **Active man-in-the-middle** — can inject, drop, reorder, replay.
+  Defended by authenticated handshake + replay protection.
+- **Future quantum adversary ("harvest now, decrypt later")** — records
+  traffic today to decrypt once a quantum computer exists. This is the
+  central reason for the post-quantum key agreement: site-to-site traffic
+  can remain sensitive for years, so the key exchange must resist a
+  quantum attack made *later* against traffic captured *now*.
+
+Explicitly **out of scope** for now: traffic-analysis resistance beyond
+fixed-length padded handshakes, and protection against a compromised
+endpoint.
+
+---
+
+## 2. Hybrid post-quantum key agreement
+
+**Decision:** combine X25519 (classical ECDH) with Kyber768 (post-quantum
+KEM), both ephemeral, and derive the session key from *both* shared
+secrets concatenated through HKDF.
+
+**Why hybrid and not pure post-quantum:** post-quantum algorithms are
+young. Their mathematical assumptions have far fewer years of scrutiny
+than classical ECDH. By combining the two, the session stays secure as
+long as *either* leg holds. A break in Kyber alone does not break the
+session (X25519 still protects it); a quantum computer that breaks X25519
+does not break the session (Kyber still protects it). You are only
+vulnerable if both fall at once. This is strictly safer than betting on
+one alone.
+
+**Why concatenation and not XOR of the secrets:** XOR would destroy the
+hybrid guarantee — if one secret were known, it could cancel out. Feeding
+both into HKDF as concatenated input keying material preserves the
+"secure if either holds" property.
+
+**Why both legs are ephemeral:** forward secrecy. Ephemeral keys are
+discarded after the handshake, so a later compromise of any long-term
+key cannot decrypt previously recorded sessions.
+
+---
+
+## 3. Peer authentication (hybrid Ed25519 + ML-DSA-65)
+
+**Decision:** authenticate the handshake by signing the transcript hash
+with a *hybrid* scheme — Ed25519 **and** ML-DSA-65 (FIPS 204) — using
+pre-shared peer public keys (exchanged out-of-band). Both signing schemes
+sit behind an `Authenticator` trait and are combined by `HybridAuth`, which
+requires **every** leg to verify. If no ML-DSA keys are configured the
+system falls back to Ed25519-only (classical) and says so loudly in the log.
+
+**Why pre-shared identities:** in a site-to-site setting the peers are
+known in advance. Pre-sharing public keys means an unknown signer is
+rejected immediately — there is no trust-on-first-use window for a MITM
+to exploit.
+
+**Why keep Ed25519 as a leg at all:** authentication only needs to hold
+*during* the handshake — an attacker must break it in real time to
+impersonate a peer. The "harvest now, decrypt later" threat does **not**
+apply to signatures (a forged signature next year cannot retroactively
+break today's session), so the urgency for PQ signatures is genuinely lower
+than for the PQ key exchange. Ed25519 via `ring` is fast, small, and
+constant-time, and it is decades-scrutinised. We keep it as one leg rather
+than dropping it.
+
+**Why also ML-DSA, and why hybrid:** the same "young assumptions" argument
+from §2 applies to signatures — ML-DSA's lattice assumptions have far less
+scrutiny than Ed25519's discrete log. By signing with *both* and requiring
+both to verify (`HybridAuth`), authentication holds as long as *either*
+scheme is unbroken: a break in ML-DSA alone does not let an attacker
+impersonate a peer (Ed25519 still gates), and a quantum computer that
+breaks Ed25519 does not either (ML-DSA still gates). The `Authenticator`
+trait made this cheap — `MlDsaAuth` is one struct implementing the trait,
+wrapped alongside `Ed25519Auth` in `HybridAuth`; the state machine did not
+change. (See §9 for the message-size consequence, which is now realised.)
+
+**Why ML-DSA-65 specifically:** it targets the ~192-bit (NIST level 3)
+security category, the common middle choice, matching the level of Kyber768
+in the KEM. Keys and signatures are large (public key ~1952 B, signature
+~3309 B), which is exactly why the handshake had to grow (§9). ML-DSA keys
+are not derivable from a short seed, so `keygen` emits a full keypair and
+the secret key is stored in the config (hex); the peer's public key is
+pre-shared out-of-band like the Ed25519 identity.
+
+**Mutual authentication (implemented):** the handshake is a 3-message,
+2-RTT exchange — Init, Response, Confirm. The responder signs the
+transcript in the Response (authenticating itself to the initiator), and
+the initiator signs the same transcript in the Confirm (authenticating
+itself to the responder). Crucially, the responder does **not** trust the
+session until it has verified the Confirm: it holds the derived session in
+a `SentResponse` state and only transitions to `Established` after the
+initiator's signature checks out. This closes the earlier one-way gap —
+both peers now prove their identity, and an attacker who cannot produce
+the expected initiator signature is rejected at the Confirm step.
+
+---
+
+## 4. Data-path encryption (pluggable AEAD: ChaCha20-Poly1305 + AEGIS-256X2)
+
+**Decision:** the data path encrypts through an `Aead` trait with two
+implementations — ChaCha20-Poly1305 (via `ring`) and AEGIS-256X2 (via the
+`aegis` crate). The cipher is chosen per session by hardware-aware
+negotiation, with ChaCha20 as the universal default and fallback.
+
+**Why ChaCha20 is the default and fallback:** ChaCha20-Poly1305 is
+constant-time on *all* hardware, because it uses only add/rotate/XOR
+operations with no data-dependent table lookups. It is provided by `ring`,
+among the most heavily audited crypto libraries available. It is the safe
+floor that works correctly and securely on any CPU.
+
+**Why AEGIS-256X2 is offered as the fast option:** AEGIS won the
+performance category of the CAESAR competition, is fully open, and has an
+IETF draft for inclusion in TLS 1.3. It uses the AES round function (the
+hardware-accelerated primitive) in a stream-cipher construction, which is
+both faster and a stronger AEAD than AES-GCM on CPUs with AES instructions
+— and faster than ChaCha20 there too. On modern server and desktop
+hardware (which almost always has AES acceleration) it is the better
+choice on speed and on AEAD robustness.
+
+**Why it is negotiated, not hard-wired:** AEGIS's advantage is conditional
+on AES hardware. Without it, AEGIS falls back to software AES, which is
+slower *and* vulnerable to cache-timing attacks — exactly what ChaCha20
+avoids. So the choice is made by capability detection, not assumption:
+
+- At session setup each side computes `AeadAlgo::preferred()`, which
+  returns AEGIS only if the CPU reports AES support (AES-NI on x86, the
+  AES extension on aarch64), otherwise ChaCha20.
+- The initiator advertises its preference in the Init; the responder
+  negotiates with `negotiate(local, peer)` — AEGIS only if *both* sides
+  prefer it, ChaCha20 otherwise. A fast server therefore interoperates
+  safely with a constrained client without anyone running software AES.
+- The negotiated algorithm id is **bound into the handshake transcript**,
+  so a downgrade attempt (forcing the weaker cipher) breaks the transcript
+  hash and fails the signature/MAC verification. This is the §10 transcript
+  binding doing exactly the job it was built for.
+
+**Nonce widths differ and are handled per cipher:** ChaCha20 uses a 96-bit
+nonce, AEGIS-256X2 a 256-bit nonce. The session builds the nonce at the
+width the chosen cipher requires (salt ‖ counter, zero-padded), so the
+monotonic-counter uniqueness guarantee (§5) holds for both.
+
+**A note on "post-quantum" and the cipher:** AEGIS does not add quantum
+resistance. Symmetric ciphers with 256-bit keys (both ChaCha20-Poly1305
+and AEGIS-256) already retain ~128-bit strength against Grover's
+algorithm. The post-quantum protection lives entirely in the Kyber key
+exchange (§2), independent of which AEAD is chosen. AEGIS buys speed and a
+stronger AEAD, not extra quantum safety.
+
+---
+
+## 5. Nonce management
+
+**Decision:** each direction gets a 96-bit nonce built from a 4-byte
+per-direction salt plus a 64-bit monotonic counter. The counter never
+repeats without a rekey.
+
+**Why this matters:** ChaCha20-Poly1305 with a repeated (key, nonce) pair
+is a catastrophic break — an attacker can XOR two ciphertexts and recover
+plaintext. The monotonic counter guarantees uniqueness within a session;
+the rekey-before-exhaustion rule (see §7) guarantees the counter never
+wraps under a live key. Per-direction salts ensure the two directions
+never collide on a nonce.
+
+---
+
+## 6. Replay protection (sliding window)
+
+**Decision:** a 2048-entry sliding-window bitset (32 × `u64` words) per
+receiving direction. Order of operations on receive is **check → decrypt
+→ commit**.
+
+**Why that order:** if the window were updated before AEAD verification,
+an attacker could pollute it with forged packets and cause legitimate
+packets to be rejected — a denial of service. By committing only after
+successful decryption, a forged packet can never affect the window. A
+cheap pre-check before decryption avoids wasting crypto work on the
+common case of an obvious replay; an authoritative re-check under lock at
+commit time closes the race when packets are processed in parallel.
+
+**Window size:** 2048 packets, matching WireGuard's scale, which is ample
+for paths with heavy reordering. The mechanism is a multi-word bitset; the
+bit at distance *d* below the highest seen counter records whether that
+counter has arrived. Advancing the window shifts the bitset; the logic is
+identical to a single-word version, just spread across 32 words.
+
+---
+
+## 7. Rekey
+
+**Decision:** rekey before the nonce counter approaches exhaustion, with
+a current+previous session overlap, an anti-storm minimum interval, and
+bounded retries on packet loss.
+
+**Why current+previous overlap:** during a rekey the new session becomes
+active for outbound traffic, but in-flight packets encrypted under the old
+session must still decrypt. Keeping the previous session alive for a short
+grace period prevents packet loss during the swap. After the grace period
+the old session is retired and its key is destroyed.
+
+**Why an anti-storm interval:** without a minimum time between rekey
+attempts, a failed rekey could retrigger in a tight loop. A 5-second floor
+prevents the storm while still allowing a later retry.
+
+**Why retry on loss (and why keys stay constant across retries):** a
+handshake packet can be lost. The initiator resends the init message and
+waits again, up to a bounded number of attempts. Crucially, the ephemeral
+keys are generated once and reused across resends — generating fresh keys
+per retry would break the handshake.
+
+---
+
+## 8. The shared-socket problem (rekey demux)
+
+**Decision:** during a live tunnel, the inbound loop is the *only* reader
+of the UDP socket. A mid-session handshake frame is demultiplexed — routed
+to an in-progress rekey driver via a channel, or answered directly if the
+peer initiated the rekey.
+
+**Why this is non-obvious and necessary:** a naive rekey would call a
+handshake routine that does its own `recv_from` on the socket. But the
+data loop is already reading that same socket. Two readers race: the rekey
+response gets consumed by the data loop and dropped as an unknown frame,
+and the rekey hangs forever. Making the inbound loop the sole reader, and
+feeding the rekey driver through a channel, eliminates the race.
+
+---
+
+## 9. Handshake framing & DPI resistance
+
+**Decision:** handshake messages are a fixed 8192 bytes, padded with
+cryptographically random noise, with a single KEM slot that carries the
+Kyber public key (init) or ciphertext (response). The data path uses a
+separate, MTU-safe frame (<1280 B). Handshake messages are fragmented for
+transport; the data path is not.
+
+**Why 8192 and not 2048:** the original 2048 fit only the Ed25519 (64 B)
+signature. The hybrid signature is Ed25519 (64 B) + ML-DSA-65 (3309 B) =
+3373 B, which together with the Kyber public key in the KEM slot overflows
+2048. 8192 leaves comfortable headroom and keeps Init/Response/Confirm all
+the same size regardless of which signature scheme is in use — so the
+message size leaks neither the message type nor whether ML-DSA is enabled.
+This is exactly the growth anticipated in the first draft (see below).
+
+**Why fixed length with noise padding:** so that an observer cannot
+distinguish an init message from a response by size, and the padded tail
+has no recognizable structure. This is a first step toward making the
+handshake hard to fingerprint.
+
+**Why a single shared KEM slot:** the Kyber public key (1184 B) and
+ciphertext (1088 B) differ in size. Using one fixed-size slot for both,
+with the unused tail filled with noise, keeps the wire layout identical
+in shape between the two message types. Phase validation (is this a valid
+Kyber public key / ciphertext?) plus the transcript MAC ensure a noise
+field is never mistaken for real data.
+
+**Why handshake size forces fragmentation:** post-quantum keys are large.
+You cannot fit a Kyber-bearing handshake in a single MTU-safe datagram —
+this is inherent to PQ crypto, not a design flaw. The handshake is a
+once-per-session event, so a handful of fragments there cost nothing
+meaningful. The data path stays under the MTU. With the hybrid ML-DSA
+signature now integrated (§3), `HANDSHAKE_MSG_LEN` is 8192 and a message
+spans eight fragments — fine for a one-time handshake.
+
+**Data-path frame (improved, not yet obfuscated):** the data-path frame no
+longer carries a fixed magic value — a constant at offset 0 of every packet
+is a trivially matchable fingerprint, so it was removed, along with the
+redundant plaintext length field (the UDP datagram already delimits the
+payload). The remaining visible header fields (frame type, session_id,
+counter) are required to select the session key and nonce — like WireGuard,
+these stay in the clear — but they are now bound as AEAD **associated data**
+on the data path, so an active attacker cannot alter the header without
+breaking the authentication tag.
+
+**Honest limitation:** this reduces the fingerprint and authenticates the
+header; it is **not** full traffic-analysis resistance. The small type byte
+remains visible and timing/size patterns are unmasked. Obfuscated framing
+(obfs4-/Shadowsocks-style, where the whole packet looks random and the
+receiver trial-decrypts) is still future work, not a current property.
+
+---
+
+## 10. Transcript binding (downgrade & tamper resistance)
+
+**Decision:** a rolling SHA-256 transcript absorbs every handshake
+message (the meaningful fields, not the noise), and the final
+authentication signs and MACs that transcript hash.
+
+**Why:** it binds the entire handshake — protocol version, both public
+keys, the ciphertext — into one value. An active attacker who modifies any
+field, strips a message, or attempts to downgrade a negotiated parameter
+breaks the hash, and the signature/MAC verification fails. This is what
+makes future cipher-agility (§4) safe: any attempt to force the weaker
+option is caught because the choice is inside the bound transcript.
+
+---
+
+## 11. GPU bulk encryption (removed — the engine is CPU-only)
+
+**Decision:** there is no GPU path. The engine encrypts on the CPU, full
+stop. Earlier drafts carried a "GPU bulk" module behind a byte threshold,
+but it always fell back to computing on the CPU.
+
+**Why it was removed rather than kept as a stub:** shipping a module called
+`GpuBulk` that silently computes on the CPU is misleading — it advertises an
+acceleration that does not exist. The design-phase WGSL shader did ChaCha20
+only, without the Poly1305 tag, and was not constant-time; wiring it in
+would have been *false security* (a path that encrypts but does not
+authenticate is a hole, not a speed-up). Rather than maintain a stub that
+overstates the system, the honest move for a published crate is to remove it
+and state plainly that the data path is CPU-only.
+
+**Why the GPU is probably the wrong optimization anyway:** per-packet GPU
+encryption is slower than CPU because the round-trip latency (upload,
+dispatch, poll, read-back) dwarfs the few hundred nanoseconds ChaCha20
+takes on a CPU core. The GPU only pays off for huge batches where latency
+does not matter — and even then, a fast CPU cipher (or simply multiple
+cores) usually saturates the NIC first. If a GPU path is ever revisited it
+must be justified by measurement and must carry Poly1305 + constant-time
+guarantees; until then, its absence is a feature, not a gap.
+
+---
+
+## 12. CPU vs GPU, stated plainly
+
+For the record, because it is counter-intuitive: the heavy, once-per-
+connection mathematics (Kyber, ML-DSA, the signatures) belongs on the
+**CPU**, not the GPU — there is no volume to parallelize over. The simple,
+endlessly-repeated mathematics (per-packet AEAD) is the *only* GPU
+candidate, and even that wins only at extreme bulk. So the architecture
+keeps the CPU as the engine for everything; a GPU path would have to be
+justified by measurement, never by intuition, which is why none ships.
+
+---
+
+## Summary of honest limitations
+
+These are stated plainly so no one mistakes intent for proof:
+
+1. **No external security audit.** A self-built protocol is unproven
+   until reviewed by qualified cryptographers. This remains the single
+   most important caveat, and it is not something code changes can fix.
+2. **Single PQ KEM.** The key exchange is Kyber768 + X25519 (hybrid
+   classical/PQ), not a hybrid of two independent PQ KEMs.
+3. **No traffic-analysis resistance.** The data-path header is now
+   authenticated and magic-free (§9), but obfuscated framing and
+   timing/size masking are not implemented; only the handshake is
+   fixed-length and noise-padded.
+
+### Resolved since the first draft
+
+- **Mutual authentication.** The handshake was 1.5-RTT (responder-only
+  auth); it is now a 3-message, 2-RTT exchange where both peers prove
+  their identity and the responder withholds trust until the initiator's
+  Confirm is verified. See §3.
+- **PQ signatures integrated.** Peer authentication is now hybrid
+  Ed25519 + ML-DSA-65 via `HybridAuth` (all legs must verify), and the
+  handshake grew to 8192 B to carry it. See §3 and §9.
+- **GPU stub removed.** The misleading CPU-backed "GPU bulk" path is gone;
+  the engine is honestly CPU-only. See §11.
+- **Data-path frame hardened.** The static magic value and redundant length
+  field were removed, and the visible header is bound as AEAD associated
+  data. See §9.
+- **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
+  See §6.
