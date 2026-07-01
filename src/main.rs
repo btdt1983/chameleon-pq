@@ -21,6 +21,7 @@ use chameleon::config::{AppConfig, Cli, Command};
 use chameleon::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
 use chameleon::engine::{CryptoEngine, OutboundPacket};
 use chameleon::frame::{Frame, FrameType};
+use chameleon::hsobf;
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
 use chameleon::obf::PadPolicy;
 use chameleon::session::SessionManager;
@@ -88,12 +89,13 @@ async fn run_server(
     let socket = Arc::new(UdpSocket::bind(bind).await?);
     info!("server listening on {bind}");
 
-    let (session, peer) = run_handshake_responder(&socket, auth.as_ref()).await?;
+    let hs_obf = hs_obf_key_from_cfg(&cfg)?;
+    let (session, peer) = run_handshake_responder(&socket, auth.as_ref(), hs_obf.as_ref()).await?;
     info!("session {} established with {peer}", session.session_id);
 
     let tun = TunPair::create(&cfg.tun)?;
     let engine = build_engine(session, &cfg);
-    run_tunnel_loops(socket, engine, tun, peer, &cfg, auth.clone()).await;
+    run_tunnel_loops(socket, engine, tun, peer, &cfg, auth.clone(), hs_obf).await;
     Ok(())
 }
 
@@ -107,12 +109,13 @@ async fn run_client(
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     info!("connecting to {server}");
 
-    let session = run_handshake_initiator(&socket, server, auth.as_ref()).await?;
+    let hs_obf = hs_obf_key_from_cfg(&cfg)?;
+    let session = run_handshake_initiator(&socket, server, auth.as_ref(), hs_obf.as_ref()).await?;
     info!("session {} established with {server}", session.session_id);
 
     let tun = TunPair::create(&cfg.tun)?;
     let engine = build_engine(session, &cfg);
-    run_tunnel_loops(socket, engine, tun, server, &cfg, auth.clone()).await;
+    run_tunnel_loops(socket, engine, tun, server, &cfg, auth.clone(), hs_obf).await;
     Ok(())
 }
 
@@ -122,6 +125,24 @@ fn build_engine(session: chameleon::session::Session, cfg: &AppConfig) -> Arc<Cr
     let mgr = Arc::new(SessionManager::new(session));
     let pad_policy: PadPolicy = cfg.obfuscation.padding.into();
     Arc::new(CryptoEngine::new(mgr, cfg.obfuscation.enabled, pad_policy))
+}
+
+/// Leid de statische handshake-obfuscatiesleutel af uit de config (Fase 2).
+/// `None` als handshake-obfuscatie uit staat; dan valt de handshake terug op het
+/// klassieke cleartext-frame. De sleutel komt uit de voorgedeelde Ed25519-pubkeys
+/// (eigen afgeleid uit de seed, peer uit config) of, indien gezet, uit psk_hex.
+fn hs_obf_key_from_cfg(cfg: &AppConfig) -> anyhow::Result<Option<[u8; 32]>> {
+    if !cfg.obfuscation.handshake {
+        return Ok(None);
+    }
+    let own_pub = Ed25519Auth::derive_public(&cfg.identity.seed_bytes()?);
+    let peer_pub = cfg.identity.peer_pub_bytes()?;
+    let psk = cfg.obfuscation.psk_bytes()?;
+    Ok(Some(chameleon::hsobf::derive_hs_obf_key(
+        &own_pub,
+        &peer_pub,
+        psk.as_deref(),
+    )))
 }
 
 /// Bouw de peer-authenticator uit de config. Met ML-DSA-sleutels wordt het
@@ -163,6 +184,7 @@ async fn run_tunnel_loops(
     peer: SocketAddr,
     cfg: &AppConfig,
     auth: Arc<dyn Authenticator>,
+    hs_obf: Option<[u8; 32]>,
 ) {
     use chameleon::rekey::{
         handshake_channel, rekey_as_initiator, rekey_as_responder, rekey_responder_confirm,
@@ -225,7 +247,7 @@ async fn run_tunnel_loops(
                         // De rekey-driver leest GEEN socket; response komt via hs_rx.
                         let r = rekey_as_initiator(
                             &socket_out, peer_out, auth_out.as_ref(),
-                            engine_out.sessions(), new_id, &mut hs_rx,
+                            engine_out.sessions(), new_id, &mut hs_rx, hs_obf.as_ref(),
                         ).await;
                         match r {
                             Ok(()) => schedule_retire(engine_out.sessions().clone()),
@@ -263,6 +285,7 @@ async fn run_tunnel_loops(
                 _ = prune_tick.tick() => {
                     // State-Bloat-DoS-fix: ruim half-afgemaakte fragmenten op.
                     rekey_reasm.prune_old(Duration::from_secs(10));
+                    rekey_confirm_reasm.prune_old(Duration::from_secs(10));
                 }
                 recv = socket_in.recv_from(&mut buf) => {
                     let (n, src) = match recv {
@@ -286,9 +309,50 @@ async fn run_tunnel_loops(
                         continue;
                     }
 
-                    // 2) Anders: cleartext frame — handshake/rekey (deze fase altijd
-                    //    cleartext) of het klassieke datapad als de peer obfuscatie
-                    //    uit heeft staan.
+                    // 2) Handshake-obfuscatie AAN: alles wat geen data is, is een
+                    //    (rekey-)handshake-of-ruis. We vallen hier NOOIT terug op
+                    //    cleartext — een gemaskeerd byte mag niet per ongeluk als
+                    //    Close/KeepAlive worden gelezen (clean break).
+                    if let Some(k) = hs_obf {
+                        if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &buf[..n]) {
+                            last_recv_in.store(now_secs(), Ordering::Relaxed);
+                            if rekeying.load(Ordering::Acquire) {
+                                // Wij zijn rekey-initiator: geef de rauwe datagram door.
+                                let _ = hs_tx.send(Bytes::copy_from_slice(&buf[..n])).await;
+                            } else if pending_rekey.is_none() {
+                                // Peer initieert rekey, fase 1 (init).
+                                if let Ok(Some(blob)) = rekey_reasm.push_parts(mid, idx, tot, chunk) {
+                                    if let Ok(init_wire) = hsobf::open(&k, &blob) {
+                                        let new_id = chameleon::net::alloc_session_id();
+                                        match rekey_as_responder(
+                                            &socket_in, src, auth_in.as_ref(),
+                                            new_id, init_wire, Some(&k),
+                                        ).await {
+                                            Ok(hs) => { pending_rekey = Some((hs, new_id)); }
+                                            Err(e) => warn!("responder rekey (init) failed: {e}"),
+                                        }
+                                    }
+                                }
+                            } else if let Ok(Some(blob)) = rekey_confirm_reasm.push_parts(mid, idx, tot, chunk) {
+                                // Fase 2 (confirm).
+                                if let Ok(confirm_wire) = hsobf::open(&k, &blob) {
+                                    let (hs, new_id) = pending_rekey.take().unwrap();
+                                    if let Err(e) = rekey_responder_confirm(
+                                        hs, auth_in.as_ref(),
+                                        engine_in.sessions(), new_id, confirm_wire,
+                                    ) {
+                                        warn!("responder rekey (confirm) failed: {e}");
+                                    } else {
+                                        schedule_retire(engine_in.sessions().clone());
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // 3) Handshake-obfuscatie UIT: klassiek cleartext frame —
+                    //    handshake/rekey of het niet-geobfusceerde datapad.
                     let frame = match Frame::decode(Bytes::copy_from_slice(&buf[..n])) {
                         Ok(f)  => f,
                         Err(e) => { warn!("bad frame: {e}"); continue; }
@@ -308,42 +372,30 @@ async fn run_tunnel_loops(
                             }
                         }
                         FrameType::Handshake => {
-                            // Demux: hoort dit bij een lopende rekey die WIJ
-                            // initieerden (dan -> hs_tx), of is het een NIEUWE
-                            // rekey-init van de peer (dan zelf beantwoorden)?
+                            // Demux: lopende rekey die WIJ initieerden (-> hs_tx,
+                            // als rauwe datagram) of een NIEUWE rekey van de peer?
                             if rekeying.load(Ordering::Acquire) {
-                                // Wij zijn initiator: geef de response door.
-                                let _ = hs_tx.send(frame.payload).await;
-                            } else {
-                                // Peer initieert rekey (responder-kant), nu in
-                                // twee fasen vanwege wederzijdse auth.
-                                if pending_rekey.is_none() {
-                                    // Fase 1: dit is de init. Stuur response,
-                                    // bewaar de pending (nog niet vertrouwde) state.
-                                    if let Ok(Some(init_wire)) = rekey_reasm.push(&frame.payload) {
-                                        let new_id = chameleon::net::alloc_session_id();
-                                        match rekey_as_responder(
-                                            &socket_in, src, auth_in.as_ref(),
-                                            new_id, init_wire,
-                                        ).await {
-                                            Ok(hs) => { pending_rekey = Some((hs, new_id)); }
-                                            Err(e) => warn!("responder rekey (init) failed: {e}"),
-                                        }
+                                let _ = hs_tx.send(Bytes::copy_from_slice(&buf[..n])).await;
+                            } else if pending_rekey.is_none() {
+                                if let Ok(Some(init_wire)) = rekey_reasm.push(&frame.payload) {
+                                    let new_id = chameleon::net::alloc_session_id();
+                                    match rekey_as_responder(
+                                        &socket_in, src, auth_in.as_ref(),
+                                        new_id, init_wire, None,
+                                    ).await {
+                                        Ok(hs) => { pending_rekey = Some((hs, new_id)); }
+                                        Err(e) => warn!("responder rekey (init) failed: {e}"),
                                     }
+                                }
+                            } else if let Ok(Some(confirm_wire)) = rekey_confirm_reasm.push(&frame.payload) {
+                                let (hs, new_id) = pending_rekey.take().unwrap();
+                                if let Err(e) = rekey_responder_confirm(
+                                    hs, auth_in.as_ref(),
+                                    engine_in.sessions(), new_id, confirm_wire,
+                                ) {
+                                    warn!("responder rekey (confirm) failed: {e}");
                                 } else {
-                                    // Fase 2: dit is de Confirm. Authenticeer de
-                                    // initiator en installeer dan pas de sessie.
-                                    if let Ok(Some(confirm_wire)) = rekey_confirm_reasm.push(&frame.payload) {
-                                        let (hs, new_id) = pending_rekey.take().unwrap();
-                                        if let Err(e) = rekey_responder_confirm(
-                                            hs, auth_in.as_ref(),
-                                            engine_in.sessions(), new_id, confirm_wire,
-                                        ) {
-                                            warn!("responder rekey (confirm) failed: {e}");
-                                        } else {
-                                            schedule_retire(engine_in.sessions().clone());
-                                        }
-                                    }
+                                    schedule_retire(engine_in.sessions().clone());
                                 }
                             }
                         }

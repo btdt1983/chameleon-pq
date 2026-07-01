@@ -18,11 +18,15 @@ system — not as a production VPN.
 Known scope limits:
 - No external security audit has been performed — this remains the single
   most important caveat for any self-built cryptographic protocol
-- The **data path** is now obfuscated (QUIC-style header protection + length
-  padding — no visible type byte, session id or counter, and sizes are hidden),
-  but the **handshake envelope** is still sent as a cleartext frame and timing
-  masking / cover traffic are not implemented, so full traffic-analysis
-  resistance is not yet claimed
+- The **data path** (QUIC-style header protection + length padding) **and the
+  handshake envelope** (static-key wrap-then-fragment, size-jittered) are now
+  obfuscated — every datagram looks like uniform random bytes, with no visible
+  type byte, session id, counter or fragment structure. Residual: the ~8 KB
+  handshake volume and its 2-RTT burst *timing* stay observable, and the
+  handshake obfuscation key is derived from the pre-shared pubkeys by default
+  (an adversary holding both pubkeys could de-obfuscate — set
+  `[obfuscation].psk_hex` to close that). Timing masking / cover traffic are not
+  implemented, so full traffic-analysis resistance is still not claimed
 - ML-DSA is integrated for authentication, but the key exchange still pairs
   Kyber768 with X25519 (no second PQ KEM)
 
@@ -48,20 +52,28 @@ Known scope limits:
   from data. Configurable length padding (off / bucketed / full) hides packet
   sizes. Header integrity still comes from the AEAD (the recovered header is the
   associated data), exactly as before — the mask is confidentiality-only
+- Obfuscated handshake envelope (static-key, `hsobf.rs`): the handshake message
+  is wrapped in a ChaCha20-Poly1305 layer keyed from the pre-shared identities
+  (or an optional `psk_hex`) and split into size-jittered fragments with a
+  masked header — the handshake burst no longer shows a constant type byte or a
+  fixed fragment structure. The real handshake crypto is unchanged; this is a
+  pure outer obfuscation layer (no forward secrecy on the obf layer)
 - Per-direction keys; 2048-entry sliding-window replay protection
 - Rekey with anti-storm gate, retry on packet loss, current+previous session
   overlap so in-flight traffic survives the swap
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
-- 41 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 54 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
-  prune behaviour, and the obfuscated data path (round-trip on both ciphers,
+  prune behaviour, the obfuscated data path (round-trip on both ciphers,
   tamper rejection, trial-demux across current+previous sessions, length
-  padding, empty keepalives, and that a cleartext handshake frame is not
-  swallowed)
+  padding, empty keepalives, cleartext-handshake fall-through), and the
+  obfuscated handshake envelope (symmetric key derivation, wrap-then-fragment
+  round-trip with jitter, full mutual handshake, wrong-key/noise rejection,
+  reassembler cap + prune, and that a 0.1.x cleartext frame is not accepted)
 
 ## Build
 
@@ -121,6 +133,11 @@ to the binary.
   header masked with a keystream derived from an AEAD-tag sample), inner
   type framing (real frame type encrypted inside the payload), and
   configurable length padding
+- `hsobf.rs` — handshake-envelope obfuscation: a static key (derived from the
+  pre-shared Ed25519 pubkeys, or an optional PSK) wraps the whole handshake
+  message in ChaCha20-Poly1305 and splits it into size-jittered fragments with
+  a masked header (`derive_hs_obf_key` / `seal_and_fragment` / `unmask_fragment`
+  / `open`)
 - `engine.rs` — CPU encryption engine (constant-time, low-latency; no GPU
   path — see DESIGN.md §11–§12 for why)
 - `net.rs` — UDP loops; clear in/out API points to the TUN layer

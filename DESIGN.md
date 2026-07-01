@@ -324,14 +324,34 @@ the session by trial-decrypting over the small active set (current + previous
 during a rekey overlap, ≤2 attempts); a datagram that opens under neither key is
 dropped as noise.
 
-**Honest limitation:** the *data path* is now obfuscated, but the **handshake
-envelope** is still a cleartext frame (fixed-length and noise-padded in its
-body, but the frame type and fragment burst are visible), and **timing / size
-masking beyond padding** (cover traffic, constant-rate pacing) is not
+**Handshake envelope (now obfuscated too — `hsobf.rs`, Phase 2):** the data
+path could be keyed from the session secret, but the handshake has no session
+secret yet while it runs, so it needs a key from *pre-shared* material (obfs4's
+model). The static handshake-obfuscation key is derived by HKDF from the
+already-pre-shared Ed25519 public keys (byte-sorted so both sides agree), or
+from an optional `[obfuscation].psk_hex` for users who want a stronger secret.
+With that key the whole 8192-byte handshake message is sealed in an outer
+ChaCha20-Poly1305 layer (random nonce) and only *then* fragmented — so the
+fragment header travels inside the ciphertext. Each fragment carries a random
+`msg_id` (for blind reassembly) and a masked `index/total`; the fragments are
+cut to **randomised sizes** so the old fixed burst of eight ~1032-byte
+fragments is gone. The receiver reassembles blind on the `msg_id`, opens with
+the static key (the AEAD tag is what rejects noise), and then runs the
+unchanged `HandshakeMessage::decode`.
+
+**Why this is obfuscation, not extra security:** the static key gives no forward
+secrecy and no real authentication — the genuine handshake security (ephemeral
+Kyber+X25519, transcript signing, §2–§3) is untouched. It is a pure outer
+wrapper whose only job is to erase the wire fingerprint.
+
+**Honest limitation (what remains):** the handshake obfuscation key is derived
+from the pre-shared *public* keys by default, so an adversary who already holds
+both public keys can de-obfuscate (setting `psk_hex` closes this). And even with
+every static/structural fingerprint gone, the **~8 KB total handshake size** and
+its **2-RTT burst timing** are still observable, and a burst's fragments share a
+(random) `msg_id`. Timing masking / cover traffic / constant-rate pacing are not
 implemented. So this is a large step toward traffic-analysis resistance, not a
-completed claim. Obfuscating the handshake envelope with a pre-shared
-obfuscation key (bootstrapped from the already-pre-shared peer identities) is
-the natural next step (call it Phase 2).
+completed claim.
 
 ---
 
@@ -397,12 +417,13 @@ These are stated plainly so no one mistakes intent for proof:
    most important caveat, and it is not something code changes can fix.
 2. **Single PQ KEM.** The key exchange is Kyber768 + X25519 (hybrid
    classical/PQ), not a hybrid of two independent PQ KEMs.
-3. **Partial traffic-analysis resistance.** The **data path** is now
-   obfuscated — QUIC-style header protection makes every datagram look like
-   random bytes (no visible type, session_id or counter) and length padding
-   hides sizes (§9). Still open: the **handshake envelope** is a cleartext
-   frame, and timing masking / cover traffic are not implemented. So it is a
-   large step, not a completed property.
+3. **Partial traffic-analysis resistance.** The **data path** and the
+   **handshake envelope** are now obfuscated — every datagram looks like random
+   bytes, with no visible type, session_id, counter or fragment structure, and
+   sizes are padded/jittered (§9). Still open: the ~8 KB handshake volume and
+   the 2-RTT burst *timing* remain observable, the handshake obfuscation key is
+   pubkey-derived by default (an optional PSK closes that), and cover traffic /
+   pacing are not implemented. So it is a large step, not a completed property.
 
 ### Resolved since the first draft
 
@@ -421,7 +442,11 @@ These are stated plainly so no one mistakes intent for proof:
 - **Data path obfuscated.** QUIC-style header protection (`obf.rs`): the header
   is masked with a keystream derived from an AEAD-tag sample, the real frame
   type is encrypted inside the payload, and configurable length padding hides
-  sizes — every datagram now looks like random bytes. The handshake envelope
-  remains cleartext (Phase 2). See §9.
+  sizes — every datagram now looks like random bytes. See §9.
+- **Handshake envelope obfuscated.** Static-key wrap-then-fragment (`hsobf.rs`):
+  the whole handshake message is sealed under a key bootstrapped from the
+  pre-shared identities (or a PSK) and split into size-jittered fragments with a
+  masked header — the old constant type byte and fixed fragment burst are gone.
+  See §9.
 - **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
   See §6.

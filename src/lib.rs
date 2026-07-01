@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod frame;
+pub mod hsobf;
 pub mod net;
 pub mod obf;
 pub mod rekey;

@@ -21,9 +21,10 @@ For non-security bugs, regular GitHub issues are welcome.
 - No external audit has been performed
 - Authentication is hybrid (Ed25519 + ML-DSA-65), but the key exchange is
   Kyber768 + X25519 — a single PQ KEM, not a hybrid of two PQ KEMs
-- The data path is obfuscated (QUIC-style header protection + length padding:
-  no visible type byte, session id or counter, and sizes are hidden), but the
-  handshake envelope is still a cleartext frame, and timing masking / cover
-  traffic are not implemented — so full traffic-analysis resistance is not yet
-  claimed
+- The data path and the handshake envelope are both obfuscated (no visible type
+  byte, session id, counter or fragment structure; sizes padded/jittered), but
+  the ~8 KB handshake volume and its 2-RTT burst timing remain observable, the
+  handshake obfuscation key is derived from the pre-shared pubkeys by default
+  (optional psk_hex for a stronger secret), and timing masking / cover traffic
+  are not implemented — so full traffic-analysis resistance is not yet claimed
 - No protection against traffic analysis beyond the above

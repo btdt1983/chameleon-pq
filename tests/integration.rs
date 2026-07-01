@@ -2,6 +2,7 @@ use bytes::Bytes;
 use chameleon::aead::AeadAlgo;
 use chameleon::crypto::{Ed25519Auth, HybridAuth, MlDsaAuth};
 use chameleon::frame::{Frame, FrameType};
+use chameleon::hsobf;
 use chameleon::obf::PadPolicy;
 use chameleon::session::{Session, SessionManager};
 use chameleon::tunnel::{fragment, Handshake, Reassembler};
@@ -738,5 +739,193 @@ fn obf_replay_rejected() {
     assert!(
         rx.decrypt_obf(&wire).is_err(),
         "replay van hetzelfde datagram verworpen"
+    );
+}
+
+// ── Geobfusceerde handshake-envelope (hsobf.rs, Fase 2) ──────────────────────
+
+/// Seal een handshake-bericht, fragmenteer het, herassembleer blind via de
+/// Reassembler (zoals de wire-weg) en open het weer — de realistische obf-weg.
+fn hs_roundtrip(key: &[u8; 32], wire: &Bytes) -> Bytes {
+    let mut reasm = Reassembler::default();
+    let mut out = None;
+    for datagram in hsobf::seal_and_fragment(key, wire).unwrap() {
+        let (mid, idx, tot, chunk) =
+            hsobf::unmask_fragment(key, &datagram).expect("geldig fragment");
+        if let Some(blob) = reasm.push_parts(mid, idx, tot, chunk).unwrap() {
+            out = Some(hsobf::open(key, &blob).unwrap());
+        }
+    }
+    out.expect("reassembly compleet")
+}
+
+#[test]
+fn hs_obf_both_sides_derive_same_key() {
+    let init_pub = Ed25519Auth::derive_public(&[11u8; 32]);
+    let resp_pub = Ed25519Auth::derive_public(&[22u8; 32]);
+    // Beide kanten (own/peer omgewisseld) komen op dezelfde sleutel uit.
+    assert_eq!(
+        hsobf::derive_hs_obf_key(&init_pub, &resp_pub, None),
+        hsobf::derive_hs_obf_key(&resp_pub, &init_pub, None)
+    );
+    // Met PSK ook symmetrisch, en verschillend van de pubkey-afgeleide.
+    let psk = [0x5Au8; 32];
+    let k_psk = hsobf::derive_hs_obf_key(&init_pub, &resp_pub, Some(&psk));
+    assert_eq!(
+        k_psk,
+        hsobf::derive_hs_obf_key(&resp_pub, &init_pub, Some(&psk))
+    );
+    assert_ne!(k_psk, hsobf::derive_hs_obf_key(&init_pub, &resp_pub, None));
+}
+
+#[test]
+fn hs_obf_roundtrip_and_jitter() {
+    let key = [0x31u8; 32];
+    let wire = Bytes::from(vec![0xABu8; 8192]); // volle handshake-grootte
+    assert_eq!(&hs_roundtrip(&key, &wire)[..], &wire[..]);
+
+    // Aantal fragmenten varieert over runs (grootte-jitter tegen de burst-tell).
+    let mut counts = std::collections::HashSet::new();
+    for _ in 0..12 {
+        counts.insert(hsobf::seal_and_fragment(&key, &wire).unwrap().len());
+    }
+    assert!(counts.len() > 1, "fragment-aantal varieert per handshake");
+}
+
+#[test]
+fn hs_obf_full_mutual_handshake() {
+    // De volledige 3-berichten wederzijdse handshake, elk bericht via de
+    // geobfusceerde wrap-then-fragment weg i.p.v. het cleartext frame.
+    let init_seed = [11u8; 32];
+    let resp_seed = [22u8; 32];
+    let init_pub = Ed25519Auth::derive_public(&init_seed);
+    let resp_pub = Ed25519Auth::derive_public(&resp_seed);
+    let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
+    let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
+
+    // Beide kanten leiden dezelfde statische obf-sleutel af.
+    let key = hsobf::derive_hs_obf_key(&init_pub, &resp_pub, None);
+
+    let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
+    let init_rx = hs_roundtrip(&key, &init_wire);
+    let (hs_resp, resp_wire) = Handshake::respond(init_rx, 1, &resp_auth).unwrap();
+    let resp_rx = hs_roundtrip(&key, &resp_wire);
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, 1, &init_auth).unwrap();
+    let confirm_rx = hs_roundtrip(&key, &confirm_wire);
+    let hs_resp_done = hs_resp.confirm(confirm_rx, &resp_auth).unwrap();
+
+    let init_session = match hs_init_done {
+        Handshake::Established { session } => session,
+        _ => panic!("initiator niet Established"),
+    };
+    let resp_session = match hs_resp_done {
+        Handshake::Established { session } => session,
+        _ => panic!("responder niet Established"),
+    };
+    // Sleutels kloppen: data tunnelt beide kanten op.
+    let (c, ct) = init_session.encrypt(b"handshake obf werkt").unwrap();
+    assert_eq!(
+        &resp_session.decrypt(c, &ct).unwrap()[..],
+        b"handshake obf werkt"
+    );
+    let (c2, ct2) = resp_session.encrypt(b"en terug").unwrap();
+    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"en terug");
+}
+
+#[test]
+fn hs_obf_wrong_key_and_noise_rejected() {
+    let key = [0x41u8; 32];
+    let wire = Bytes::from(vec![0x5Au8; 4096]);
+    // Verzegel onder key, herassembleer, maar open met een ANDERE sleutel.
+    let mut reasm = Reassembler::default();
+    let mut blob = None;
+    for d in hsobf::seal_and_fragment(&key, &wire).unwrap() {
+        let (mid, idx, tot, chunk) = hsobf::unmask_fragment(&key, &d).unwrap();
+        if let Some(b) = reasm.push_parts(mid, idx, tot, chunk).unwrap() {
+            blob = Some(b);
+        }
+    }
+    assert!(
+        hsobf::open(&[0x42u8; 32], &blob.unwrap()).is_err(),
+        "verkeerde sleutel"
+    );
+
+    // Ruis: 200 willekeurige >= 8-byte datagrammen mogen nooit compleet-en-openen.
+    let mut r = Reassembler::default();
+    for i in 0..200u32 {
+        let noise: Vec<u8> = (0..40u32)
+            .map(|j| (i.wrapping_mul(31) ^ j.wrapping_mul(7)) as u8)
+            .collect();
+        if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&key, &noise) {
+            if let Ok(Some(b)) = r.push_parts(mid, idx, tot, chunk) {
+                assert!(hsobf::open(&key, &b).is_err(), "ruis opent niet");
+            }
+        }
+    }
+}
+
+#[test]
+fn hs_obf_cleartext_frame_not_accepted() {
+    // Een 0.1.2-peer stuurt cleartext Frame::new_handshake-fragmenten. Die mogen
+    // niet als geobfusceerde handshake worden geopend (schone breuk, geen
+    // cross-versie-verwarring).
+    let key = [0x51u8; 32];
+    let big = vec![0xABu8; 6000];
+    let mut reasm = Reassembler::default();
+    let mut opened = false;
+    for frag in fragment(7, &big) {
+        let datagram = Frame::new_handshake(frag).encode().unwrap();
+        if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&key, &datagram) {
+            if let Ok(Some(blob)) = reasm.push_parts(mid, idx, tot, chunk) {
+                opened |= hsobf::open(&key, &blob).is_ok();
+            }
+        }
+    }
+    assert!(
+        !opened,
+        "cleartext 0.1.2-frame wordt niet als obf-handshake geaccepteerd"
+    );
+}
+
+#[test]
+fn hs_obf_reassembler_cap_and_prune() {
+    use std::time::Duration;
+    // Cap: veel distinct msg_id-partials mogen het geheugen niet onbegrensd
+    // laten groeien (elk niet-data-datagram is nu een kandidaat-fragment).
+    let mut reasm = Reassembler::default();
+    for mid in 0..200u32 {
+        // Eén fragment van een (beweerd) 2-fragment-bericht -> blijft partial.
+        let _ = reasm.push_parts(mid, 0, 2, Bytes::from_static(b"x"));
+    }
+    assert!(
+        reasm.pending_count() <= 64,
+        "pending gecapt op 64, kreeg {}",
+        reasm.pending_count()
+    );
+
+    // Prune: een verse partial wordt door prune_old(0) verwijderd (DoS-fix).
+    let mut r2 = Reassembler::default();
+    let _ = r2.push_parts(1, 0, 2, Bytes::from_static(b"y"));
+    assert_eq!(r2.pending_count(), 1);
+    std::thread::sleep(Duration::from_millis(2));
+    r2.prune_old(Duration::from_millis(1));
+    assert_eq!(r2.pending_count(), 0, "stale partial verwijderd");
+}
+
+#[test]
+fn hs_obf_wire_looks_random() {
+    // Geen constant type-byte op de wire: byte 0 is de willekeurige msg_id en
+    // varieert breed over handshakes.
+    let key = [0x61u8; 32];
+    let wire = Bytes::from(vec![0u8; 8192]);
+    let mut first_bytes = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let frags = hsobf::seal_and_fragment(&key, &wire).unwrap();
+        first_bytes.insert(frags[0][0]);
+    }
+    assert!(
+        first_bytes.len() > 20,
+        "byte-0 varieert (geen vaste vingerafdruk), kreeg {} distinct",
+        first_bytes.len()
     );
 }
