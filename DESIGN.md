@@ -284,21 +284,54 @@ meaningful. The data path stays under the MTU. With the hybrid ML-DSA
 signature now integrated (§3), `HANDSHAKE_MSG_LEN` is 8192 and a message
 spans eight fragments — fine for a one-time handshake.
 
-**Data-path frame (improved, not yet obfuscated):** the data-path frame no
-longer carries a fixed magic value — a constant at offset 0 of every packet
-is a trivially matchable fingerprint, so it was removed, along with the
-redundant plaintext length field (the UDP datagram already delimits the
-payload). The remaining visible header fields (frame type, session_id,
-counter) are required to select the session key and nonce — like WireGuard,
-these stay in the clear — but they are now bound as AEAD **associated data**
-on the data path, so an active attacker cannot alter the header without
-breaking the authentication tag.
+**Data-path frame (now obfuscated — `obf.rs`):** the data path used to keep a
+small header in the clear (frame type, session_id, counter). Even without a
+magic value that is a strong fingerprint: the type byte is a constant `0x01`,
+the session_id is constant for the whole session, and the counter is a
+monotonic 8-byte value incrementing by one — a trivially matchable flow
+signature, and the packet length leaked the exact plaintext length. The data
+path is now obfuscated so that every datagram looks like uniform random bytes.
 
-**Honest limitation:** this reduces the fingerprint and authenticates the
-header; it is **not** full traffic-analysis resistance. The small type byte
-remains visible and timing/size patterns are unmasked. Obfuscated framing
-(obfs4-/Shadowsocks-style, where the whole packet looks random and the
-receiver trial-decrypts) is still future work, not a current property.
+The construction is **QUIC-style header protection** (RFC 9001 §5.4), adapted:
+
+- The inner AEAD / nonce / replay core is **unchanged**. The payload is sealed
+  exactly as before, with the logical header `H = type ‖ session_id ‖ counter`
+  as associated data.
+- A 16-byte `sample` is taken from the ciphertext tail (always inside the AEAD
+  tag — ≥16 bytes even for an empty keepalive), and a 13-byte mask is derived:
+  `mask = HMAC-SHA256(obf_key, sample)[..13]`, where `obf_key` is a per-direction
+  key derived from the session secret with its own HKDF label. The visible
+  header becomes `masked_H = H XOR mask`, and the wire datagram is
+  `masked_H ‖ ciphertext`.
+- **The real frame type is not on the wire at all.** Data / KeepAlive / Close
+  are folded into an *inner* framing `inner_type ‖ real_len ‖ plaintext ‖ pad`
+  that is sealed inside the AEAD, so every datagram is structurally identical
+  and a keepalive is indistinguishable from data (the old `session_id = 0`
+  keepalive tell is gone).
+- **Length padding** (config `[obfuscation].padding`: off / bucketed / full)
+  pads the inner framing before sealing, hiding the plaintext length. Bucketed
+  rounds up to size classes (the default); full pads every packet to the
+  MTU-safe maximum.
+
+**Why the mask comes from the tag, and why it is safe:** header integrity is
+*not* provided by the (malleable) XOR mask — it is provided by the AEAD, because
+the receiver feeds the *recovered* `H` back in as associated data. Tampering
+with `masked_H` yields a wrong counter/session (dropped, or the nonce is wrong
+→ tag fails); tampering with the ciphertext changes both the sample (→ a random
+recovered header) and the tag → it fails. This is exactly QUIC's split: the mask
+is confidentiality-only, the tag is the authentication. The receiver recovers
+the session by trial-decrypting over the small active set (current + previous
+during a rekey overlap, ≤2 attempts); a datagram that opens under neither key is
+dropped as noise.
+
+**Honest limitation:** the *data path* is now obfuscated, but the **handshake
+envelope** is still a cleartext frame (fixed-length and noise-padded in its
+body, but the frame type and fragment burst are visible), and **timing / size
+masking beyond padding** (cover traffic, constant-rate pacing) is not
+implemented. So this is a large step toward traffic-analysis resistance, not a
+completed claim. Obfuscating the handshake envelope with a pre-shared
+obfuscation key (bootstrapped from the already-pre-shared peer identities) is
+the natural next step (call it Phase 2).
 
 ---
 
@@ -364,10 +397,12 @@ These are stated plainly so no one mistakes intent for proof:
    most important caveat, and it is not something code changes can fix.
 2. **Single PQ KEM.** The key exchange is Kyber768 + X25519 (hybrid
    classical/PQ), not a hybrid of two independent PQ KEMs.
-3. **No traffic-analysis resistance.** The data-path header is now
-   authenticated and magic-free (§9), but obfuscated framing and
-   timing/size masking are not implemented; only the handshake is
-   fixed-length and noise-padded.
+3. **Partial traffic-analysis resistance.** The **data path** is now
+   obfuscated — QUIC-style header protection makes every datagram look like
+   random bytes (no visible type, session_id or counter) and length padding
+   hides sizes (§9). Still open: the **handshake envelope** is a cleartext
+   frame, and timing masking / cover traffic are not implemented. So it is a
+   large step, not a completed property.
 
 ### Resolved since the first draft
 
@@ -383,5 +418,10 @@ These are stated plainly so no one mistakes intent for proof:
 - **Data-path frame hardened.** The static magic value and redundant length
   field were removed, and the visible header is bound as AEAD associated
   data. See §9.
+- **Data path obfuscated.** QUIC-style header protection (`obf.rs`): the header
+  is masked with a keystream derived from an AEAD-tag sample, the real frame
+  type is encrypted inside the payload, and configurable length padding hides
+  sizes — every datagram now looks like random bytes. The handshake envelope
+  remains cleartext (Phase 2). See §9.
 - **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
   See §6.

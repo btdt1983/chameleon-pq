@@ -318,24 +318,57 @@ ML-DSA-Signatur (§3) ist `HANDSHAKE_MSG_LEN` 8192, und eine Nachricht
 erstreckt sich über acht Fragmente – für einen einmaligen Handshake
 unproblematisch.
 
-**Datenpfad-Frame (verbessert, noch nicht verschleiert):** Der
-Datenpfad-Frame trägt keinen festen Magic-Wert mehr – eine Konstante am
-Offset 0 jedes Pakets ist ein trivial matchbarer Fingerabdruck, also wurde
-sie entfernt, ebenso das redundante Klartext-Längenfeld (das UDP-Datagramm
-begrenzt die Nutzlast bereits). Die verbleibenden sichtbaren Header-Felder
-(Frame-Typ, session_id, Zähler) sind nötig, um Sessionschlüssel und Nonce zu
-wählen – wie bei WireGuard bleiben sie im Klartext – aber sie werden nun auf
-dem Datenpfad als AEAD **Associated Data** gebunden, sodass ein aktiver
-Angreifer den Header nicht ändern kann, ohne den Authentifizierungs-Tag zu
-brechen.
+**Datenpfad-Frame (jetzt verschleiert – `obf.rs`):** Früher hielt der
+Datenpfad einen kleinen Header im Klartext (Frame-Typ, session_id, Zähler).
+Auch ohne Magic-Wert ist das ein starker Fingerabdruck: Das Typ-Byte ist eine
+Konstante `0x01`, die session_id ist für die gesamte Session konstant, und der
+Zähler ist ein monotoner 8-Byte-Wert, der um eins hochzählt – eine trivial
+matchbare Flow-Signatur, und die Paketlänge verriet die exakte Klartextlänge.
+Der Datenpfad ist nun so verschleiert, dass jedes Datagramm wie gleichverteilte
+Zufallsbytes aussieht.
 
-**Ehrliche Einschränkung:** Das verkleinert den Fingerabdruck und
-authentifiziert den Header; es ist **keine** vollständige
-Verkehrsanalyse-Resistenz. Das kleine Typ-Byte bleibt sichtbar und
-Timing-/Größenmuster sind unmaskiert. Verschleiertes Framing
-(obfs4-/Shadowsocks-artig, bei dem das gesamte Paket zufällig aussieht und
-der Empfänger probeweise entschlüsselt) ist noch künftige Arbeit, keine
-aktuelle Eigenschaft.
+Die Konstruktion ist **QUIC-artiger Header-Schutz** (RFC 9001 §5.4), angepasst:
+
+- Der innere AEAD-/Nonce-/Replay-Kern bleibt **unverändert**. Die Payload wird
+  genau wie zuvor verschlüsselt, mit dem logischen Header
+  `H = Typ ‖ session_id ‖ Zähler` als Associated Data.
+- Eine 16-Byte-`sample` wird aus dem Ende der Ciphertext genommen (immer
+  innerhalb des AEAD-Tags – ≥16 Bytes selbst bei leerem Keepalive), und daraus
+  wird eine 13-Byte-Maske abgeleitet: `mask = HMAC-SHA256(obf_key, sample)[..13]`,
+  wobei `obf_key` ein richtungsabhängiger, aus dem Session-Secret mit eigenem
+  HKDF-Label abgeleiteter Schlüssel ist. Der sichtbare Header wird zu
+  `masked_H = H XOR mask`, und das Wire-Datagramm ist `masked_H ‖ Ciphertext`.
+- **Der echte Frame-Typ steht gar nicht auf der Leitung.** Data / KeepAlive /
+  Close stecken in einem *inneren* Framing `inner_type ‖ real_len ‖ Payload ‖
+  Pad`, das innerhalb des AEAD verschlüsselt wird, sodass jedes Datagramm
+  strukturell identisch ist und ein Keepalive nicht von Daten zu unterscheiden
+  ist (die alte `session_id = 0`-Keepalive-Signatur ist weg).
+- **Längen-Padding** (Config `[obfuscation].padding`: off / bucketed / full)
+  füllt das innere Framing vor dem Versiegeln auf und verbirgt so die Länge.
+  Bucketed rundet auf Größenklassen (Standard); full füllt jedes Paket auf das
+  MTU-sichere Maximum auf.
+
+**Warum die Maske aus dem Tag kommt und warum das sicher ist:** Die
+Header-Integrität kommt *nicht* von der (malleablen) XOR-Maske – sie kommt vom
+AEAD, weil der Empfänger den *zurückgewonnenen* `H` wieder als Associated Data
+einspeist. Manipulation an `masked_H` ergibt einen falschen Zähler/eine falsche
+Session (verworfen, oder die Nonce stimmt nicht → Tag scheitert); Manipulation
+an der Ciphertext ändert sowohl die Probe (→ zufälliger zurückgewonnener Header)
+als auch den Tag → sie scheitert. Das ist genau QUICs Aufteilung: Die Maske
+dient nur der Vertraulichkeit, der Tag der Authentifizierung. Der Empfänger
+gewinnt die Session per Trial-Entschlüsselung über die kleine aktive Menge
+zurück (aktuell + vorherige während einer Rekey-Überlappung, ≤2 Versuche); ein
+Datagramm, das unter keinem Schlüssel öffnet, wird als Rauschen verworfen.
+
+**Ehrliche Einschränkung:** Der *Datenpfad* ist nun verschleiert, aber die
+**Handshake-Hülle** ist weiterhin ein Klartext-Frame (im Körper längenfest und
+mit Rauschen aufgefüllt, aber Frame-Typ und Fragment-Burst sind sichtbar), und
+**Timing-/Größenmaskierung über das Padding hinaus** (Cover-Traffic,
+konstantes Pacing) ist nicht implementiert. Das ist also ein großer Schritt zur
+Verkehrsanalyse-Resistenz, keine abgeschlossene Behauptung. Das Verschleiern der
+Handshake-Hülle mit einem vorab geteilten Verschleierungsschlüssel (bootstrapped
+aus den bereits vorab geteilten Peer-Identitäten) ist der nächste Schritt
+(nennen wir es Phase 2).
 
 ---
 
@@ -409,10 +442,13 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
    beheben.
 2. **Einzelnes PQ-KEM.** Der Schlüsselaustausch ist Kyber768 + X25519
    (hybrid klassisch/PQ), kein Hybrid aus zwei unabhängigen PQ-KEMs.
-3. **Keine Verkehrsanalyse-Resistenz.** Der Datenpfad-Header ist nun
-   authentifiziert und Magic-frei (§9), aber verschleiertes Framing und
-   Timing-/Größen-Maskierung sind nicht implementiert; nur der Handshake ist
-   längenfest und mit Rauschen aufgefüllt.
+3. **Teilweise Verkehrsanalyse-Resistenz.** Der **Datenpfad** ist nun
+   verschleiert – QUIC-artiger Header-Schutz lässt jedes Datagramm wie
+   Zufallsbytes aussehen (kein sichtbarer Typ, keine session_id, kein Zähler),
+   und Längen-Padding verbirgt die Größen (§9). Noch offen: Die
+   **Handshake-Hülle** ist ein Klartext-Frame, und Timing-Maskierung /
+   Cover-Traffic sind nicht implementiert. Es ist also ein großer Schritt, keine
+   abgeschlossene Eigenschaft.
 
 ### Seit dem ersten Entwurf gelöst
 
@@ -429,5 +465,10 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
 - **Datenpfad-Frame gehärtet.** Der statische Magic-Wert und das redundante
   Längenfeld wurden entfernt, und der sichtbare Header ist als AEAD
   Associated Data gebunden. Siehe §9.
+- **Datenpfad verschleiert.** QUIC-artiger Header-Schutz (`obf.rs`): Der Header
+  wird mit einem Keystream aus einer AEAD-Tag-Probe maskiert, der echte
+  Frame-Typ wird in der Payload verschlüsselt, und konfigurierbares
+  Längen-Padding verbirgt die Größen – jedes Datagramm sieht jetzt wie
+  Zufallsbytes aus. Die Handshake-Hülle bleibt Klartext (Phase 2). Siehe §9.
 - **Replay-Fenster.** Von 64 auf 2048 Einträge erweitert (WireGuard-Maßstab).
   Siehe §6.

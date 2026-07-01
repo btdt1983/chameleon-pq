@@ -52,6 +52,16 @@ impl AeadAlgo {
         }
     }
 
+    /// AEAD-tag-lengte in bytes. De obfuscatie-laag (obf.rs) gebruikt dit om de
+    /// MTU-veilige padding-limiet te berekenen; de tag is ook de bron van de
+    /// header-protection sample (altijd >= SAMPLE_LEN = 16).
+    pub fn tag_len(self) -> usize {
+        match self {
+            AeadAlgo::ChaCha20Poly1305 => 16, // Poly1305 tag
+            AeadAlgo::Aegis256X2 => 32,       // 256-bit tag (zie AEGIS_TAG_LEN)
+        }
+    }
+
     /// De voorkeurskeuze voor DEZE machine. AEGIS alleen als de CPU AES-
     /// hardware heeft; anders de veilige, constant-time ChaCha20.
     ///

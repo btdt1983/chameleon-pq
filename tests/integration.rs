@@ -1,7 +1,9 @@
 use bytes::Bytes;
+use chameleon::aead::AeadAlgo;
 use chameleon::crypto::{Ed25519Auth, HybridAuth, MlDsaAuth};
-use chameleon::frame::Frame;
-use chameleon::session::Session;
+use chameleon::frame::{Frame, FrameType};
+use chameleon::obf::PadPolicy;
+use chameleon::session::{Session, SessionManager};
 use chameleon::tunnel::{fragment, Handshake, Reassembler};
 
 /// Fragmenteer en herassembleer een wire-bericht (de realistische wire-weg).
@@ -489,5 +491,252 @@ fn aegis_session_roundtrips_many_packets() {
     assert!(
         rx.decrypt(c0, &ct0).is_err(),
         "replay verworpen onder AEGIS"
+    );
+}
+
+// ── Geobfusceerd datapad (obf.rs, QUIC-stijl header-protection + padding) ─────
+
+/// Bouw een sessie met een expliciet AEAD-algoritme voor de obf-tests.
+fn obf_session(id: u32, shared: [u8; 32], is_initiator: bool, algo: AeadAlgo) -> Session {
+    Session::from_handshake_with_algo(id, zeroize::Zeroizing::new(shared), is_initiator, algo)
+        .unwrap()
+}
+
+const OBF_ALGOS: [AeadAlgo; 2] = [AeadAlgo::ChaCha20Poly1305, AeadAlgo::Aegis256X2];
+
+#[test]
+fn obf_roundtrip_both_ciphers() {
+    for algo in OBF_ALGOS {
+        let shared = [0x21u8; 32];
+        let tx = obf_session(1, shared, true, algo);
+        let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+        let wire = tx
+            .seal_obf(FrameType::Data as u8, b"hallo via obf", PadPolicy::Bucketed)
+            .unwrap();
+        // Op de wire geen zichtbaar 0x01-type-byte: de header is gemaskeerd.
+        // (De kans op toevallig 0x01 is ~1/256; dat is geen bug, dus we checken
+        //  de recovery, niet byte-0 hard.)
+        let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
+        assert_eq!(ft, FrameType::Data);
+        assert_eq!(&pt[..], b"hallo via obf");
+    }
+}
+
+#[test]
+fn obf_tamper_rejected() {
+    for algo in OBF_ALGOS {
+        let shared = [0x22u8; 32];
+        let tx = obf_session(1, shared, true, algo);
+        let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+        // (a) Knoei met de gemaskeerde header (session_id-veld).
+        let mut w = tx
+            .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
+            .unwrap()
+            .to_vec();
+        w[2] ^= 0xFF;
+        assert!(
+            rx.decrypt_obf(&w).is_err(),
+            "gemaskeerde header-tamper faalt"
+        );
+
+        // (b) Knoei met de ciphertext buiten de sample (eerste ct-byte). De
+        //     header komt correct terug, maar de AEAD-tag faalt.
+        let mut w = tx
+            .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
+            .unwrap()
+            .to_vec();
+        w[13] ^= 0xFF; // eerste byte ná de 13-byte header
+        assert!(rx.decrypt_obf(&w).is_err(), "ciphertext-tamper faalt");
+
+        // (c) Knoei met de sample-staart (laatste byte).
+        let mut w = tx
+            .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
+            .unwrap()
+            .to_vec();
+        let last = w.len() - 1;
+        w[last] ^= 0xFF;
+        assert!(rx.decrypt_obf(&w).is_err(), "sample-tamper faalt");
+    }
+}
+
+#[test]
+fn obf_trial_demux_current_and_previous() {
+    // Spiegelt session_manager_rekey_swap: een in-flight pakket op de OUDE sessie
+    // moet via 'previous' door de trial-demux worden geopend, nieuw verkeer via
+    // 'current', en na retire faalt de oude.
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let shared_old = [1u8; 32];
+    let shared_new = [2u8; 32];
+
+    let mgr = SessionManager::new(obf_session(1, shared_old, false, algo));
+    let peer_old = obf_session(1, shared_old, true, algo);
+    let wire_old = peer_old
+        .seal_obf(FrameType::Data as u8, b"old-path", PadPolicy::Bucketed)
+        .unwrap();
+
+    mgr.install_new_session(obf_session(2, shared_new, false, algo));
+    let peer_new = obf_session(2, shared_new, true, algo);
+    let wire_new = peer_new
+        .seal_obf(FrameType::Data as u8, b"new-path", PadPolicy::Bucketed)
+        .unwrap();
+
+    // Oud pakket via 'previous'.
+    let (ft, pt) = mgr.decrypt_obf(&wire_old).unwrap();
+    assert_eq!(ft, FrameType::Data);
+    assert_eq!(&pt[..], b"old-path");
+    // Nieuw pakket via 'current'.
+    assert_eq!(&mgr.decrypt_obf(&wire_new).unwrap().1[..], b"new-path");
+
+    // Na retire is de oude sessie weg.
+    mgr.retire_previous();
+    let wire_old2 = peer_old
+        .seal_obf(FrameType::Data as u8, b"too-late", PadPolicy::Bucketed)
+        .unwrap();
+    assert!(
+        mgr.decrypt_obf(&wire_old2).is_err(),
+        "na retire faalt de oude sessie"
+    );
+}
+
+#[test]
+fn obf_wrong_key_and_noise_dropped() {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let rx = SessionManager::new(obf_session(1, [7u8; 32], false, algo));
+
+    // Pakket verzegeld met een ANDER shared secret -> niet voor ons.
+    let alien = obf_session(1, [8u8; 32], true, algo);
+    let wire = alien
+        .seal_obf(FrameType::Data as u8, b"niet voor jou", PadPolicy::Off)
+        .unwrap();
+    assert!(rx.decrypt_obf(&wire).is_err(), "vreemde sleutel gedropt");
+
+    // 100 ruis-datagrammen (>= 29 bytes) -> geen enkele mag openen.
+    for i in 0..100u32 {
+        let noise: Vec<u8> = (0..40u32)
+            .map(|j| (i.wrapping_mul(7) ^ j.wrapping_mul(13)) as u8)
+            .collect();
+        assert!(rx.decrypt_obf(&noise).is_err(), "ruis gedropt");
+    }
+}
+
+#[test]
+fn obf_empty_keepalive_roundtrip() {
+    for algo in OBF_ALGOS {
+        let shared = [0x2Au8; 32];
+        let tx = obf_session(1, shared, true, algo);
+        let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+        let wire = tx
+            .seal_obf(FrameType::KeepAlive as u8, b"", PadPolicy::Bucketed)
+            .unwrap();
+        // Lege keepalive is nog steeds MTU-veilig en langer dan de minimumgrens.
+        assert!(wire.len() >= 13 + 16);
+        let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
+        assert_eq!(ft, FrameType::KeepAlive);
+        assert!(pt.is_empty());
+    }
+}
+
+#[test]
+fn obf_full_padding_hides_length() {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let shared = [0x2Bu8; 32];
+    let tx = obf_session(1, shared, true, algo);
+    let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+    let small = tx
+        .seal_obf(FrameType::Data as u8, b"x", PadPolicy::Full)
+        .unwrap();
+    let big = tx
+        .seal_obf(FrameType::Data as u8, &vec![0u8; 400], PadPolicy::Full)
+        .unwrap();
+    // Full padding -> beide datagrammen even lang (grootte verborgen).
+    assert_eq!(small.len(), big.len(), "Full padding verbergt de lengte");
+
+    // En beide payloads komen exact terug (padding correct gestript).
+    assert_eq!(&rx.decrypt_obf(&small).unwrap().1[..], b"x");
+    assert_eq!(rx.decrypt_obf(&big).unwrap().1.len(), 400);
+}
+
+#[test]
+fn obf_short_datagram_rejected() {
+    let rx = SessionManager::new(obf_session(1, [9u8; 32], false, AeadAlgo::ChaCha20Poly1305));
+    assert!(rx.decrypt_obf(&[0u8; 13]).is_err(), "te kort");
+    assert!(rx.decrypt_obf(&[0u8; 20]).is_err(), "onder 13+16");
+}
+
+#[test]
+fn obf_handshake_frame_falls_through() {
+    // Een echt (cleartext) handshake-frame mag NIET door de obf-open worden
+    // opgeslokt: decrypt_obf hoort te falen, zodat main.rs terugvalt op
+    // Frame::decode voor de rekey-demux.
+    let rx = SessionManager::new(obf_session(
+        1,
+        [0x0Au8; 32],
+        false,
+        AeadAlgo::ChaCha20Poly1305,
+    ));
+    let frag = fragment(1, &vec![0xABu8; 2000])[0].clone();
+    let hs_wire = Frame::new_handshake(frag).encode().unwrap();
+    assert!(
+        rx.decrypt_obf(&hs_wire).is_err(),
+        "handshake-frame valt door naar de cleartext-weg"
+    );
+    // En het is wél een geldig handshake-frame langs de klassieke weg.
+    assert_eq!(
+        Frame::decode(hs_wire).unwrap().frame_type,
+        FrameType::Handshake
+    );
+}
+
+#[test]
+fn obf_wire_header_looks_random() {
+    // De kernclaim: op de wire is er geen constant header-byte, geen zichtbaar
+    // session_id en geen zichtbare oplopende counter. We verzegelen veel
+    // pakketten op DEZELFDE sessie en controleren dat de gemaskeerde headers
+    // variëren i.p.v. een vaste vingerafdruk te vormen.
+    use std::collections::HashSet;
+    let tx = obf_session(0xABCD, [0x2Cu8; 32], true, AeadAlgo::ChaCha20Poly1305);
+
+    let mut headers = HashSet::new();
+    let mut first_bytes = HashSet::new();
+    for _ in 0..200 {
+        let w = tx
+            .seal_obf(FrameType::Data as u8, b"zelfde payload", PadPolicy::Off)
+            .unwrap();
+        headers.insert(w[..13].to_vec());
+        first_bytes.insert(w[0]);
+    }
+    // Elke gemaskeerde header is uniek (counter + tag-sample verschillen).
+    assert_eq!(
+        headers.len(),
+        200,
+        "gemaskeerde headers zijn allemaal uniek"
+    );
+    // Byte 0 is niet het constante 0x01 en varieert breed (≈uniform).
+    assert!(!first_bytes.contains(&0x01) || first_bytes.len() > 50);
+    assert!(
+        first_bytes.len() > 50,
+        "byte-0 varieert breed (geen vaste vingerafdruk), kreeg {} distinct",
+        first_bytes.len()
+    );
+}
+
+#[test]
+fn obf_replay_rejected() {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let shared = [0x0Bu8; 32];
+    let tx = obf_session(1, shared, true, algo);
+    let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+    let wire = tx
+        .seal_obf(FrameType::Data as u8, b"eenmalig", PadPolicy::Bucketed)
+        .unwrap();
+    assert!(rx.decrypt_obf(&wire).is_ok(), "eerste keer ok");
+    assert!(
+        rx.decrypt_obf(&wire).is_err(),
+        "replay van hetzelfde datagram verworpen"
     );
 }
