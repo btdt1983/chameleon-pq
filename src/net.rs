@@ -13,6 +13,7 @@ use crate::crypto::Authenticator;
 use crate::engine::{CryptoEngine, OutboundPacket};
 use crate::error::Result;
 use crate::frame::{Frame, FrameType};
+use crate::hsobf;
 use crate::tunnel::{fragment, Handshake, Reassembler};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -144,40 +145,94 @@ impl Tunnel {
 
 // ── Handshake-bedrading over UDP (met fragmentatie) ──────────────────────────
 
+/// Bouw de wire-klare datagrammen voor een handshake-bericht: geobfusceerd via
+/// hsobf (statische sleutel, wrap-then-fragment) als `hs_obf` gezet is, anders
+/// het klassieke cleartext `Frame::new_handshake`-pad. Los van het versturen,
+/// zodat een rekey-retry dezelfde datagrammen kan herverzenden.
+pub(crate) fn build_handshake_datagrams(
+    session_id: u32,
+    wire: &[u8],
+    hs_obf: Option<&[u8; 32]>,
+) -> Result<Vec<Bytes>> {
+    match hs_obf {
+        Some(k) => hsobf::seal_and_fragment(k, wire),
+        None => fragment(session_id, wire)
+            .into_iter()
+            .map(|frag| Frame::new_handshake(frag).encode())
+            .collect(),
+    }
+}
+
+/// Verstuur een handshake-bericht over de wire (obf of cleartext, zie
+/// `build_handshake_datagrams`).
+pub(crate) async fn send_handshake(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    session_id: u32,
+    wire: &[u8],
+    hs_obf: Option<&[u8; 32]>,
+) -> Result<()> {
+    for datagram in build_handshake_datagrams(session_id, wire, hs_obf)? {
+        socket.send_to(&datagram, peer).await?;
+    }
+    Ok(())
+}
+
+/// Push één binnengekomen datagram in de handshake-reassembler; geef het volledige
+/// bericht terug zodra compleet. Op het obf-pad is dit RUIS-TOLERANT: korte of
+/// onbekende datagrammen (en zelfs een compleet-maar-niet-openend blob) leveren
+/// `Ok(None)` op, zodat losse ruis de handshake nooit afbreekt.
+pub(crate) fn push_handshake(
+    reasm: &mut Reassembler,
+    raw: &[u8],
+    hs_obf: Option<&[u8; 32]>,
+) -> Result<Option<Bytes>> {
+    match hs_obf {
+        Some(k) => {
+            let (mid, idx, tot, chunk) = match hsobf::unmask_fragment(k, raw) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            match reasm.push_parts(mid, idx, tot, chunk) {
+                Ok(Some(blob)) => Ok(hsobf::open(k, &blob).ok()),
+                _ => Ok(None),
+            }
+        }
+        None => {
+            let frame = Frame::decode(Bytes::copy_from_slice(raw))?;
+            if frame.frame_type != FrameType::Handshake {
+                return Ok(None);
+            }
+            reasm.push(&frame.payload)
+        }
+    }
+}
+
 /// CLIENT/INITIATOR: voer de handshake uit en geef de Established sessie terug.
 pub async fn run_handshake_initiator(
     socket: &UdpSocket,
     peer: SocketAddr,
     auth: &dyn Authenticator,
+    hs_obf: Option<&[u8; 32]>,
 ) -> Result<crate::session::Session> {
     let session_id = next_session_id();
     let (hs, init_wire) = Handshake::start(auth)?;
 
-    // Fragmenteer + verstuur het init-bericht.
-    for frag in fragment(session_id, &init_wire) {
-        let frame = Frame::new_handshake(frag);
-        socket.send_to(&frame.encode()?, peer).await?;
-    }
+    // Verstuur het init-bericht (geobfusceerd of cleartext).
+    send_handshake(socket, peer, session_id, &init_wire, hs_obf).await?;
 
     // Wacht op de (gefragmenteerde) response.
     let mut reasm = Reassembler::default();
     let mut buf = vec![0u8; UDP_BUF];
     loop {
         let (n, _src) = socket.recv_from(&mut buf).await?;
-        let frame = Frame::decode(Bytes::copy_from_slice(&buf[..n]))?;
-        if frame.frame_type != FrameType::Handshake {
-            continue;
-        }
-        if let Some(resp_wire) = reasm.push(&frame.payload)? {
+        if let Some(resp_wire) = push_handshake(&mut reasm, &buf[..n], hs_obf)? {
             // finalize verifieert de responder EN geeft het Confirm-bericht terug.
             match hs.finalize(resp_wire, session_id, auth)? {
                 (Handshake::Established { session }, confirm_wire) => {
                     // Verstuur het Confirm-bericht zodat de responder óns
                     // kan authenticeren (wederzijdse auth).
-                    for frag in fragment(session_id, &confirm_wire) {
-                        let f = Frame::new_handshake(frag);
-                        socket.send_to(&f.encode()?, peer).await?;
-                    }
+                    send_handshake(socket, peer, session_id, &confirm_wire, hs_obf).await?;
                     info!("handshake complete (initiator, mutual), session {session_id}");
                     return Ok(session);
                 }
@@ -197,6 +252,7 @@ pub async fn run_handshake_initiator(
 pub async fn run_handshake_responder(
     socket: &UdpSocket,
     auth: &dyn Authenticator,
+    hs_obf: Option<&[u8; 32]>,
 ) -> Result<(crate::session::Session, SocketAddr)> {
     let session_id = next_session_id();
     let mut reasm = Reassembler::default();
@@ -205,16 +261,9 @@ pub async fn run_handshake_responder(
     // Fase 1: wacht op Init, stuur Response, ga naar SentResponse.
     let (mut hs, peer_addr) = loop {
         let (n, src) = socket.recv_from(&mut buf).await?;
-        let frame = Frame::decode(Bytes::copy_from_slice(&buf[..n]))?;
-        if frame.frame_type != FrameType::Handshake {
-            continue;
-        }
-        if let Some(init_wire) = reasm.push(&frame.payload)? {
+        if let Some(init_wire) = push_handshake(&mut reasm, &buf[..n], hs_obf)? {
             let (hs, resp_wire) = Handshake::respond(init_wire, session_id, auth)?;
-            for frag in fragment(session_id, &resp_wire) {
-                let f = Frame::new_handshake(frag);
-                socket.send_to(&f.encode()?, src).await?;
-            }
+            send_handshake(socket, src, session_id, &resp_wire, hs_obf).await?;
             break (hs, src);
         }
     };
@@ -228,11 +277,7 @@ pub async fn run_handshake_responder(
         if src != peer_addr {
             continue;
         }
-        let frame = Frame::decode(Bytes::copy_from_slice(&buf[..n]))?;
-        if frame.frame_type != FrameType::Handshake {
-            continue;
-        }
-        if let Some(confirm_wire) = confirm_reasm.push(&frame.payload)? {
+        if let Some(confirm_wire) = push_handshake(&mut confirm_reasm, &buf[..n], hs_obf)? {
             hs = hs.confirm(confirm_wire, auth)?;
             if let Handshake::Established { session } = hs {
                 info!("handshake complete (responder, mutual), session {session_id}");

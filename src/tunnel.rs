@@ -21,12 +21,19 @@ use x25519_dalek::{EphemeralSecret, PublicKey as XPub};
 // verraadt. Post-quantum sleutels zijn nu eenmaal groot; een handshake is een
 // eenmalige gebeurtenis, dus de extra fragmenten kosten niets wezenlijks.
 pub const HANDSHAKE_MSG_LEN: usize = 8192;
-// v2: het datapad is nu geobfusceerd (obf.rs, QUIC-stijl header-protection +
-// padding). Dit maakt het datapad-wireformat incompatibel met 0.1.0-peers; de
-// versie-bump zorgt dat een 0.1.0-handshake (version=1) hier meteen bij decode
-// faalt — een schone fout i.p.v. een succesvolle handshake gevolgd door stil
-// gedropte data. De handshake-envelope zelf blijft deze fase cleartext (Fase 2).
-pub const PROTO_VERSION: u8 = 2;
+// v3: naast het geobfusceerde datapad (v2, obf.rs) is nu ook de HANDSHAKE-
+// envelope geobfusceerd (hsobf.rs, statische-sleutel wrap-then-fragment). Dit
+// maakt het wireformat incompatibel met 0.1.x-peers; de versie-bump zorgt dat
+// een oudere handshake die tóch bij decode belandt meteen faalt — een schone
+// fout i.p.v. een succesvolle handshake gevolgd door stil gedropte data.
+pub const PROTO_VERSION: u8 = 3;
+
+/// Bovengrens op het aantal gelijktijdig onvoltooide berichten in één
+/// Reassembler. Sinds Fase 2 wordt (bij handshake-obfuscatie) elk niet-data-
+/// datagram een kandidaat-fragment, dus een msg_id-flood zou anders geheugen
+/// kunnen opblazen. Nieuwe msg_id's boven de cap worden genegeerd; samen met
+/// `prune_old` blijft het geheugen begrensd.
+const MAX_PENDING_MSGS: usize = 64;
 
 const X25519_PUB_LEN: usize = 32;
 const KYBER_PK_LEN: usize = 1184;
@@ -72,6 +79,8 @@ struct PartialMsg {
 }
 
 impl Reassembler {
+    /// Cleartext-pad: parse de 8-byte fragment-header en push de delen.
+    /// Gebruikt door de niet-geobfusceerde (fallback) handshake-weg.
     pub fn push(&mut self, raw: &[u8]) -> Result<Option<Bytes>> {
         if raw.len() < FRAG_HEADER_LEN {
             return Err(ChameleonError::PacketTooShort {
@@ -84,12 +93,29 @@ impl Reassembler {
         let index = hdr.get_u16_le();
         let total = hdr.get_u16_le();
         let payload = Bytes::copy_from_slice(&raw[FRAG_HEADER_LEN..]);
+        self.push_parts(msg_id, index, total, payload)
+    }
 
+    /// Push reeds-geparseerde fragment-delen. Gebruikt door de geobfusceerde
+    /// handshake-weg (hsobf.rs ontmaskert de header vóór deze aanroep). Zelfde
+    /// partial/complete-logica als `push`, met een cap tegen msg_id-floods.
+    pub fn push_parts(
+        &mut self,
+        msg_id: u32,
+        index: u16,
+        total: u16,
+        payload: Bytes,
+    ) -> Result<Option<Bytes>> {
         if total == 0 || index >= total {
             return Err(ChameleonError::Handshake {
                 state: "reassemble".into(),
                 msg: "invalid fragment index/total".into(),
             });
+        }
+        // DoS-cap: een NIEUW msg_id boven de grens wordt genegeerd, zodat een
+        // stroom willekeurige datagrammen het geheugen niet kan opblazen.
+        if !self.partials.contains_key(&msg_id) && self.partials.len() >= MAX_PENDING_MSGS {
+            return Ok(None);
         }
         let entry = self.partials.entry(msg_id).or_insert_with(|| PartialMsg {
             total,

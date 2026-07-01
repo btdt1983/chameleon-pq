@@ -19,12 +19,16 @@ ordnungsgemäß auditiertes System – nicht als Produktiv-VPN.
 Bekannte Einschränkungen des Geltungsbereichs:
 - Es wurde kein externes Sicherheitsaudit durchgeführt – das bleibt der mit
   Abstand wichtigste Vorbehalt für jedes selbst entwickelte Protokoll
-- Der **Datenpfad** ist jetzt verschleiert (QUIC-artiger Header-Schutz +
-  Längen-Padding – kein sichtbares Typ-Byte, keine session_id, kein Zähler,
-  und die Größen sind verborgen), aber die **Handshake-Hülle** wird weiterhin
-  als Klartext-Frame gesendet, und Timing-Maskierung / Cover-Traffic sind nicht
-  implementiert, sodass vollständige Verkehrsanalyse-Resistenz noch nicht
-  behauptet wird
+- Der **Datenpfad** (QUIC-artiger Header-Schutz + Längen-Padding) **und die
+  Handshake-Hülle** (statischer Schlüssel, Wrap-then-Fragment, größen-jitterte
+  Fragmente) sind jetzt verschleiert – jedes Datagramm sieht aus wie
+  Zufallsbytes, ohne sichtbares Typ-Byte, session_id, Zähler oder
+  Fragment-Struktur. Rest: die ~8 KB Handshake-Größe und ihr 2-RTT-Burst-*Timing*
+  bleiben beobachtbar, und der Handshake-Verschleierungsschlüssel wird
+  standardmäßig aus den vorab geteilten Pubkeys abgeleitet (ein Angreifer mit
+  beiden Pubkeys könnte de-verschleiern – `[obfuscation].psk_hex` schließt das).
+  Timing-Maskierung / Cover-Traffic sind nicht implementiert, vollständige
+  Verkehrsanalyse-Resistenz wird also noch nicht behauptet
 - ML-DSA ist für die Authentifizierung integriert, der Schlüsselaustausch
   kombiniert aber weiterhin Kyber768 mit X25519 (kein zweites PQ-KEM)
 
@@ -53,6 +57,13 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Paketgrößen. Die Header-Integrität kommt weiterhin vom AEAD (der
   zurückgewonnene Header ist die Associated Data) – die Maske dient nur der
   Vertraulichkeit
+- Verschleierte Handshake-Hülle (statischer Schlüssel, `hsobf.rs`): die
+  Handshake-Nachricht wird in einer ChaCha20-Poly1305-Schicht verpackt (Schlüssel
+  aus den vorab geteilten Identitäten oder einem optionalen `psk_hex`) und in
+  größen-jitterte Fragmente mit maskiertem Header aufgeteilt – der Handshake-Burst
+  zeigt kein konstantes Typ-Byte und keine feste Fragment-Struktur mehr. Die echte
+  Handshake-Krypto bleibt unverändert; reine äußere Verschleierung (keine Forward
+  Secrecy auf der Verschleierungsschicht)
 - Richtungsabhängige Schlüssel; Replay-Schutz per Sliding-Window mit 2048
   Einträgen
 - Rekey mit Anti-Storm-Sperre, Wiederholung bei Paketverlust und
@@ -62,14 +73,16 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Teilstücke
 - Keepalive / Erkennung toter Peers
 - Plattformübergreifendes TUN: Linux, macOS, Windows (Wintun)
-- 41 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 54 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
-  Richtungen), Rekey, Prune-Verhalten und den verschleierten Datenpfad
-  (Round-Trip mit beiden Ciphern, Ablehnung von Manipulation, Trial-Demux über
-  aktuelle + vorherige Session, Längen-Padding, leere Keepalives und dass ein
-  Klartext-Handshake-Frame nicht verschluckt wird) abdecken
+  Richtungen), Rekey, Prune-Verhalten, den verschleierten Datenpfad (Round-Trip
+  mit beiden Ciphern, Manipulations-Ablehnung, Trial-Demux über aktuelle +
+  vorherige Session, Längen-Padding, leere Keepalives) und die verschleierte
+  Handshake-Hülle (symmetrische Schlüsselableitung, Wrap-then-Fragment-Round-Trip
+  mit Jitter, vollständiger gegenseitiger Handshake, Ablehnung falscher
+  Schlüssel/Rauschen, Reassembler-Cap + Prune) abdecken
 
 ## Build
 
@@ -129,6 +142,11 @@ Unter Windows benötigen Sie zusätzlich `wintun.dll` von
   (13-Byte-Header maskiert mit einem Keystream aus einer AEAD-Tag-Probe),
   Inner-Type-Framing (echter Frame-Typ verschlüsselt in der Payload) und
   konfigurierbares Längen-Padding
+- `hsobf.rs` – Verschleierung der Handshake-Hülle: ein statischer Schlüssel (aus
+  den vorab geteilten Ed25519-Pubkeys oder einem optionalen PSK) verpackt die
+  ganze Handshake-Nachricht in ChaCha20-Poly1305 und teilt sie in größen-jitterte
+  Fragmente mit maskiertem Header (`derive_hs_obf_key` / `seal_and_fragment` /
+  `unmask_fragment` / `open`)
 - `engine.rs` – CPU-Verschlüsselungs-Engine (konstantzeitfähig, geringe
   Latenz; kein GPU-Pfad – siehe DESIGN.md §11–§12 zur Begründung)
 - `net.rs` – UDP-Schleifen; klare Ein-/Ausgangspunkte zur TUN-Schicht

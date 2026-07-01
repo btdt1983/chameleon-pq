@@ -175,6 +175,26 @@ pub struct ObfuscationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub padding: PaddingPolicy,
+    /// Obfusceer óók de handshake-envelope (Fase 2, hsobf.rs). Standaard aan;
+    /// wijzigt het wireformat, dus beide kanten moeten dit aan hebben staan.
+    #[serde(default = "default_hs_obf_enabled")]
+    pub handshake: bool,
+    /// Optioneel gedeeld obfuscatie-geheim (hex) voor de handshake. Afwezig =>
+    /// de handshake-obfuscatiesleutel wordt afgeleid uit de voorgedeelde
+    /// Ed25519-pubkeys (nul config). Aanwezig => sterker (een tegenstander die
+    /// alleen de pubkeys heeft kan dan niet de-obfusceren). Op beide kanten gelijk.
+    #[serde(default)]
+    pub psk_hex: Option<String>,
+}
+
+impl ObfuscationConfig {
+    /// Het optionele handshake-obfuscatie-geheim als bytes, indien gezet.
+    pub fn psk_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.psk_hex
+            .as_deref()
+            .map(|s| hex_to_vec(s, "obfuscation.psk_hex"))
+            .transpose()
+    }
 }
 
 impl Default for ObfuscationConfig {
@@ -182,6 +202,8 @@ impl Default for ObfuscationConfig {
         Self {
             enabled: default_obf_enabled(),
             padding: PaddingPolicy::default(),
+            handshake: default_hs_obf_enabled(),
+            psk_hex: None,
         }
     }
 }
@@ -207,6 +229,9 @@ fn default_linger() -> u64 {
     200
 }
 fn default_obf_enabled() -> bool {
+    true
+}
+fn default_hs_obf_enabled() -> bool {
     true
 }
 
@@ -254,6 +279,27 @@ impl AppConfig {
             return Err(ChameleonError::Handshake {
                 state: "config".into(),
                 msg: format!("tun.mtu {} is below minimum 576", self.tun.mtu),
+            });
+        }
+        // Optioneel handshake-obfuscatie-PSK: als gezet, moet hij parseren en
+        // niet absurd kort zijn (te weinig entropie zou de obfuscatie verzwakken).
+        if let Some(psk) = self.obfuscation.psk_bytes()? {
+            if psk.len() < 16 {
+                return Err(ChameleonError::Handshake {
+                    state: "config".into(),
+                    msg: format!(
+                        "obfuscation.psk_hex is only {} bytes; use at least 16",
+                        psk.len()
+                    ),
+                });
+            }
+        }
+        // Handshake-obfuscatie zonder datapad-obfuscatie is zinloos én breekt de
+        // demux (cleartext data zou als handshake-ruis worden gedropt).
+        if self.obfuscation.handshake && !self.obfuscation.enabled {
+            return Err(ChameleonError::Handshake {
+                state: "config".into(),
+                msg: "obfuscation.handshake requires obfuscation.enabled = true".into(),
             });
         }
         Ok(())

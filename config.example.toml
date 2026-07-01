@@ -43,3 +43,12 @@ enabled = true
 #   bucketed — pad naar grootteklassen (verbergt exacte lengte; aanbevolen)
 #   full     — pad elk pakket naar de MTU-veilige max (beste obfuscatie, duurst)
 padding = "bucketed"
+# Obfusceer óók de HANDSHAKE-envelope (geen zichtbaar type-byte/fragment-header,
+# wisselend-grote fragmenten). Standaard AAN — beide kanten moeten dit gelijk
+# hebben (incompatibel met 0.1.x-peers). Zet op false voor de klassieke handshake.
+handshake = true
+# Optioneel: gedeeld obfuscatie-geheim (hex, >= 16 bytes) voor de handshake.
+# Zonder dit wordt de handshake-obfuscatiesleutel afgeleid uit de voorgedeelde
+# Ed25519-pubkeys (nul config). Mét dit kan een tegenstander die alleen de
+# pubkeys heeft de handshake niet de-obfusceren. Zet op BEIDE kanten hetzelfde.
+#   psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

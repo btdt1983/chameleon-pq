@@ -360,15 +360,37 @@ gewinnt die Session per Trial-Entschlüsselung über die kleine aktive Menge
 zurück (aktuell + vorherige während einer Rekey-Überlappung, ≤2 Versuche); ein
 Datagramm, das unter keinem Schlüssel öffnet, wird als Rauschen verworfen.
 
-**Ehrliche Einschränkung:** Der *Datenpfad* ist nun verschleiert, aber die
-**Handshake-Hülle** ist weiterhin ein Klartext-Frame (im Körper längenfest und
-mit Rauschen aufgefüllt, aber Frame-Typ und Fragment-Burst sind sichtbar), und
-**Timing-/Größenmaskierung über das Padding hinaus** (Cover-Traffic,
-konstantes Pacing) ist nicht implementiert. Das ist also ein großer Schritt zur
-Verkehrsanalyse-Resistenz, keine abgeschlossene Behauptung. Das Verschleiern der
-Handshake-Hülle mit einem vorab geteilten Verschleierungsschlüssel (bootstrapped
-aus den bereits vorab geteilten Peer-Identitäten) ist der nächste Schritt
-(nennen wir es Phase 2).
+**Handshake-Hülle (jetzt ebenfalls verschleiert – `hsobf.rs`, Phase 2):** Der
+Datenpfad ließ sich aus dem Session-Secret ableiten, aber der Handshake hat noch
+kein Session-Secret, während er läuft, braucht also einen Schlüssel aus *vorab
+geteiltem* Material (obfs4s Modell). Der statische Handshake-Verschleierungs-
+schlüssel wird per HKDF aus den bereits vorab geteilten Ed25519-Pubkeys
+abgeleitet (byte-sortiert, damit beide Seiten übereinstimmen) oder aus einem
+optionalen `[obfuscation].psk_hex` für ein stärkeres Geheimnis. Damit wird die
+ganze 8192-Byte-Handshake-Nachricht in eine äußere ChaCha20-Poly1305-Schicht
+(zufällige Nonce) versiegelt und *erst dann* fragmentiert – der Fragment-Header
+reist also innerhalb der Ciphertext. Jedes Fragment trägt eine zufällige
+`msg_id` (für blindes Reassemblieren) und ein maskiertes `index/total`; die
+Fragmente werden auf **zufällige Größen** geschnitten, sodass der alte feste
+Burst aus acht ~1032-Byte-Fragmenten weg ist. Der Empfänger reassembliert blind
+über die `msg_id`, öffnet mit dem statischen Schlüssel (der AEAD-Tag lehnt
+Rauschen ab) und führt dann das unveränderte `HandshakeMessage::decode` aus.
+
+**Warum das Verschleierung ist, keine zusätzliche Sicherheit:** Der statische
+Schlüssel gibt keine Forward Secrecy und keine echte Authentifizierung – die
+eigentliche Handshake-Sicherheit (ephemeres Kyber+X25519, Transcript-Signierung,
+§2–§3) bleibt unberührt. Es ist eine reine äußere Hülle, deren einzige Aufgabe
+das Löschen des Wire-Fingerabdrucks ist.
+
+**Ehrliche Einschränkung (was bleibt):** Der Handshake-Verschleierungsschlüssel
+wird standardmäßig aus den vorab geteilten *öffentlichen* Schlüsseln abgeleitet,
+also kann ein Angreifer, der beide Pubkeys bereits besitzt, de-verschleiern
+(`psk_hex` schließt das). Und selbst wenn jeder statische/strukturelle
+Fingerabdruck weg ist, bleiben die **~8 KB Gesamt-Handshake-Größe** und ihr
+**2-RTT-Burst-Timing** beobachtbar, und die Fragmente eines Bursts teilen eine
+(zufällige) `msg_id`. Timing-Maskierung / Cover-Traffic / konstantes Pacing sind
+nicht implementiert. Das ist also ein großer Schritt zur Verkehrsanalyse-
+Resistenz, keine abgeschlossene Behauptung.
 
 ---
 
@@ -442,13 +464,14 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
    beheben.
 2. **Einzelnes PQ-KEM.** Der Schlüsselaustausch ist Kyber768 + X25519
    (hybrid klassisch/PQ), kein Hybrid aus zwei unabhängigen PQ-KEMs.
-3. **Teilweise Verkehrsanalyse-Resistenz.** Der **Datenpfad** ist nun
-   verschleiert – QUIC-artiger Header-Schutz lässt jedes Datagramm wie
-   Zufallsbytes aussehen (kein sichtbarer Typ, keine session_id, kein Zähler),
-   und Längen-Padding verbirgt die Größen (§9). Noch offen: Die
-   **Handshake-Hülle** ist ein Klartext-Frame, und Timing-Maskierung /
-   Cover-Traffic sind nicht implementiert. Es ist also ein großer Schritt, keine
-   abgeschlossene Eigenschaft.
+3. **Teilweise Verkehrsanalyse-Resistenz.** Der **Datenpfad** und die
+   **Handshake-Hülle** sind nun verschleiert – jedes Datagramm sieht wie
+   Zufallsbytes aus, ohne sichtbaren Typ, session_id, Zähler oder
+   Fragment-Struktur, und die Größen sind gepaddet/gejittert (§9). Noch offen:
+   die ~8 KB Handshake-Größe und das 2-RTT-Burst-*Timing* bleiben beobachtbar,
+   der Handshake-Schlüssel ist standardmäßig pubkey-abgeleitet (ein optionaler
+   PSK schließt das), und Cover-Traffic / Pacing sind nicht implementiert. Es ist
+   also ein großer Schritt, keine abgeschlossene Eigenschaft.
 
 ### Seit dem ersten Entwurf gelöst
 
@@ -465,6 +488,11 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
 - **Datenpfad-Frame gehärtet.** Der statische Magic-Wert und das redundante
   Längenfeld wurden entfernt, und der sichtbare Header ist als AEAD
   Associated Data gebunden. Siehe §9.
+- **Handshake-Hülle verschleiert.** Statische-Schlüssel Wrap-then-Fragment
+  (`hsobf.rs`): die ganze Handshake-Nachricht wird unter einem aus den vorab
+  geteilten Identitäten (oder einem PSK) gebootstrappten Schlüssel versiegelt und
+  in größen-gejitterte Fragmente mit maskiertem Header aufgeteilt – das alte
+  konstante Typ-Byte und der feste Fragment-Burst sind weg. Siehe §9.
 - **Datenpfad verschleiert.** QUIC-artiger Header-Schutz (`obf.rs`): Der Header
   wird mit einem Keystream aus einer AEAD-Tag-Probe maskiert, der echte
   Frame-Typ wird in der Payload verschlüsselt, und konfigurierbares

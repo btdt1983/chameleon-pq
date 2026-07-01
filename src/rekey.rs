@@ -14,9 +14,9 @@
 
 use crate::crypto::Authenticator;
 use crate::error::Result;
-use crate::frame::Frame;
+use crate::net::{build_handshake_datagrams, push_handshake, send_handshake};
 use crate::session::SessionManager;
-use crate::tunnel::{fragment, Handshake, Reassembler};
+use crate::tunnel::{Handshake, Reassembler};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,9 +46,13 @@ pub async fn rekey_as_initiator(
     sessions: &SessionManager,
     new_session_id: u32,
     hs_rx: &mut HandshakeFrameRx,
+    hs_obf: Option<&[u8; 32]>,
 ) -> Result<()> {
     let (hs, init_wire) = Handshake::start(auth)?;
-    let frags: Vec<_> = fragment(new_session_id, &init_wire);
+    // Bouw de init-datagrammen één keer (obf of cleartext) en herverzend
+    // dezelfde bytes per retry, zodat een verloren fragment door een latere
+    // poging alsnog compleet kan worden.
+    let init_datagrams = build_handshake_datagrams(new_session_id, &init_wire, hs_obf)?;
 
     // Retry-lus: stuur init, wacht op response; bij timeout opnieuw sturen.
     // De Reassembler wordt per poging vers opgezet zodat een halve oude
@@ -60,16 +64,14 @@ pub async fn rekey_as_initiator(
 
     for attempt in 1..=MAX_REKEY_RETRIES {
         // (Her)verstuur het init-bericht.
-        for frag in &frags {
-            socket
-                .send_to(&Frame::new_handshake(frag.clone()).encode()?, peer)
-                .await?;
+        for datagram in &init_datagrams {
+            socket.send_to(datagram, peer).await?;
         }
 
         let mut reasm = Reassembler::default();
         let attempt_result = timeout(PER_ATTEMPT_TIMEOUT, async {
-            while let Some(frag_payload) = hs_rx.recv().await {
-                if let Some(resp_wire) = reasm.push(&frag_payload)? {
+            while let Some(raw) = hs_rx.recv().await {
+                if let Some(resp_wire) = push_handshake(&mut reasm, &raw, hs_obf)? {
                     return Ok(Some(resp_wire));
                 }
             }
@@ -83,11 +85,7 @@ pub async fn rekey_as_initiator(
                 return match hs.finalize(resp_wire, new_session_id, auth)? {
                     (Handshake::Established { session }, confirm_wire) => {
                         // Verstuur Confirm zodat de responder ons authenticeert.
-                        for frag in fragment(new_session_id, &confirm_wire) {
-                            socket
-                                .send_to(&Frame::new_handshake(frag).encode()?, peer)
-                                .await?;
-                        }
+                        send_handshake(socket, peer, new_session_id, &confirm_wire, hs_obf).await?;
                         sessions.install_new_session(session);
                         info!(
                             "rekey complete after {attempt} attempt(s), mutual — \
@@ -144,14 +142,11 @@ pub async fn rekey_as_responder(
     auth: &dyn Authenticator,
     new_session_id: u32,
     init_wire: Bytes,
+    hs_obf: Option<&[u8; 32]>,
 ) -> Result<Handshake> {
     match Handshake::respond(init_wire, new_session_id, auth)? {
         (hs @ Handshake::SentResponse { .. }, resp_wire) => {
-            for frag in fragment(new_session_id, &resp_wire) {
-                socket
-                    .send_to(&Frame::new_handshake(frag).encode()?, peer)
-                    .await?;
-            }
+            send_handshake(socket, peer, new_session_id, &resp_wire, hs_obf).await?;
             info!(
                 "rekey (responder) response sent — awaiting confirm for session {new_session_id}"
             );
