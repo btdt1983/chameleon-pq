@@ -21,8 +21,9 @@ For non-security bugs, regular GitHub issues are welcome.
 - No external audit has been performed
 - Authentication is hybrid (Ed25519 + ML-DSA-65), but the key exchange is
   Kyber768 + X25519 — a single PQ KEM, not a hybrid of two PQ KEMs
-- The data-path frame header is authenticated and carries no static magic,
-  but full traffic-analysis resistance (obfuscated framing, timing/size
-  masking) is not implemented — only the handshake is fixed-length and
-  noise-padded
+- The data path is obfuscated (QUIC-style header protection + length padding:
+  no visible type byte, session id or counter, and sizes are hidden), but the
+  handshake envelope is still a cleartext frame, and timing masking / cover
+  traffic are not implemented — so full traffic-analysis resistance is not yet
+  claimed
 - No protection against traffic analysis beyond the above

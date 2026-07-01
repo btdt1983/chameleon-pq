@@ -73,6 +73,8 @@ pub struct AppConfig {
     pub tun: TunConfig,
     #[serde(default)]
     pub engine: EngineConfig,
+    #[serde(default)]
+    pub obfuscation: ObfuscationConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +148,44 @@ pub struct EngineConfig {
     pub batch_linger_us: u64,
 }
 
+// ── Obfuscatie (verkeersanalyse-weerstand op het datapad) ────────────────────
+
+/// Padding-beleid voor het geobfusceerde datapad. Verbergt de pakketgrootte
+/// (die anders exact de plaintext-lengte lekt) ten koste van bandbreedte.
+/// Wordt afgebeeld op `obf::PadPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaddingPolicy {
+    /// Geen padding — laagste overhead, grootte lekt de lengte.
+    Off,
+    /// Pad naar grootteklassen — verbergt de exacte lengte, matige overhead.
+    #[default]
+    Bucketed,
+    /// Pad elk pakket naar de MTU-veilige maximumgrootte — beste obfuscatie,
+    /// hoogste bandbreedte-kost.
+    Full,
+}
+
+/// `[obfuscation]`-sectie. Standaard AAN met bucketed padding (clean break t.o.v.
+/// 0.1.0; zie ook de PROTO_VERSION-bump). Zet `enabled = false` voor het
+/// klassieke, niet-geobfusceerde datapad-frame (bv. voor debugging).
+#[derive(Debug, Deserialize)]
+pub struct ObfuscationConfig {
+    #[serde(default = "default_obf_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub padding: PaddingPolicy,
+}
+
+impl Default for ObfuscationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_obf_enabled(),
+            padding: PaddingPolicy::default(),
+        }
+    }
+}
+
 // ── defaults ─────────────────────────────────────────────────────────────────
 
 fn default_bind() -> SocketAddr {
@@ -165,6 +205,9 @@ fn default_mtu() -> u16 {
 }
 fn default_linger() -> u64 {
     200
+}
+fn default_obf_enabled() -> bool {
+    true
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────

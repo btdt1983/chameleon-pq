@@ -30,3 +30,16 @@ mtu     = 1400                  # laat ruimte voor VPN-header boven de 1280-MTU
 # 200 µs is veilig voor gaming; verhoog voor hogere throughput.
 # Het datapad draait volledig op de CPU (constant-time, low-latency).
 batch_linger_us = 200
+
+[obfuscation]
+# Verkeersanalyse-weerstand op het DATApad (QUIC-stijl header-protection):
+# geen zichtbaar type-byte, session_id of counter, en padding tegen grootte-
+# lekkage. Standaard AAN — dit maakt het datapad incompatibel met 0.1.0-peers
+# (beide kanten moeten deze build draaien). Zet op false voor het klassieke,
+# niet-geobfusceerde frame (bv. voor debugging).
+enabled = true
+# Padding-beleid: "off" | "bucketed" | "full".
+#   off      — geen padding (grootte lekt de plaintext-lengte)
+#   bucketed — pad naar grootteklassen (verbergt exacte lengte; aanbevolen)
+#   full     — pad elk pakket naar de MTU-veilige max (beste obfuscatie, duurst)
+padding = "bucketed"

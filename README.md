@@ -18,9 +18,11 @@ system — not as a production VPN.
 Known scope limits:
 - No external security audit has been performed — this remains the single
   most important caveat for any self-built cryptographic protocol
-- The data-path frame no longer carries a static magic value and its header
-  is authenticated, but full traffic-analysis resistance (obfs4/Shadowsocks-
-  style framing, timing/size masking) is still future work
+- The **data path** is now obfuscated (QUIC-style header protection + length
+  padding — no visible type byte, session id or counter, and sizes are hidden),
+  but the **handshake envelope** is still sent as a cleartext frame and timing
+  masking / cover traffic are not implemented, so full traffic-analysis
+  resistance is not yet claimed
 - ML-DSA is integrated for authentication, but the key exchange still pairs
   Kyber768 with X25519 (no second PQ KEM)
 
@@ -38,20 +40,28 @@ Known scope limits:
   the universal default) and AEGIS-256X2 (CAESAR winner, faster on CPUs
   with AES hardware), chosen by hardware-aware negotiation with the choice
   bound in the transcript against downgrade
-- Magic-free data-path frame: no static fingerprint byte, and the visible
-  header (type / session_id / counter) is bound as AEAD associated data, so
-  tampering with it breaks the tag
+- Obfuscated data path (QUIC-style header protection): every data datagram
+  looks like uniform random bytes — no static type byte, no visible session_id,
+  no visible monotonic counter. The header is masked with a keystream derived
+  (via HMAC-SHA256) from a sample of the AEAD tag, and the real frame type is
+  carried *inside* the encrypted payload, so keepalives are indistinguishable
+  from data. Configurable length padding (off / bucketed / full) hides packet
+  sizes. Header integrity still comes from the AEAD (the recovered header is the
+  associated data), exactly as before — the mask is confidentiality-only
 - Per-direction keys; 2048-entry sliding-window replay protection
 - Rekey with anti-storm gate, retry on packet loss, current+previous session
   overlap so in-flight traffic survives the swap
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
-- 23 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 41 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
-  path, replay (incl. wide reordering), MITM (both directions), rekey, and
-  prune behaviour
+  path, replay (incl. wide reordering), MITM (both directions), rekey,
+  prune behaviour, and the obfuscated data path (round-trip on both ciphers,
+  tamper rejection, trial-demux across current+previous sessions, length
+  padding, empty keepalives, and that a cleartext handshake frame is not
+  swallowed)
 
 ## Build
 
@@ -105,7 +115,12 @@ to the binary.
 - `tunnel.rs` — 8192-byte handshake (single KEM slot, noise-padded; sized
   for the hybrid PQ signature), fragmentation/reassembly, state machine with
   transcript signing
-- `frame.rs` — MTU-safe, magic-free data-path frame (<1280 B)
+- `frame.rs` — MTU-safe, magic-free frame (<1280 B) for the handshake
+  envelope and the legacy (obfuscation-off) data path
+- `obf.rs` — data-path obfuscation: QUIC-style header protection (13-byte
+  header masked with a keystream derived from an AEAD-tag sample), inner
+  type framing (real frame type encrypted inside the payload), and
+  configurable length padding
 - `engine.rs` — CPU encryption engine (constant-time, low-latency; no GPU
   path — see DESIGN.md §11–§12 for why)
 - `net.rs` — UDP loops; clear in/out API points to the TUN layer

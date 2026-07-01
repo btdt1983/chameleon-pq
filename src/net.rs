@@ -37,6 +37,12 @@ fn next_session_id() -> u32 {
 }
 
 /// Het lopende geheel zodra een sessie tot stand is gekomen.
+///
+/// LEGACY/ONGEBRUIKT: de binary draait zijn eigen in/outbound-loops in
+/// `main.rs::run_tunnel_loops`; dáár leeft de obfuscatie-integratie (obf.rs).
+/// Deze struct is een oudere parallelle variant die niet is bedraad. Behouden
+/// als referentie; `run_inbound` hieronder gebruikt nog het klassieke
+/// (niet-geobfusceerde) pad.
 pub struct Tunnel {
     socket: Arc<UdpSocket>,
     engine: Arc<CryptoEngine>,
@@ -88,16 +94,10 @@ impl Tunnel {
     async fn flush(&self, pending: &mut Vec<OutboundPacket>) {
         let batch = std::mem::take(pending);
         match self.engine.encrypt_batch(batch) {
-            Ok(encrypted) => {
-                for ep in encrypted {
-                    let frame = Frame::new_data(ep.session_id, ep.counter, ep.ciphertext);
-                    match frame.encode() {
-                        Ok(wire) => {
-                            if let Err(e) = self.socket.send_to(&wire, self.peer).await {
-                                error!("udp send error: {e}");
-                            }
-                        }
-                        Err(e) => error!("frame encode error: {e}"),
+            Ok(wires) => {
+                for wire in wires {
+                    if let Err(e) = self.socket.send_to(&wire, self.peer).await {
+                        error!("udp send error: {e}");
                     }
                 }
             }

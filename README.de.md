@@ -19,10 +19,12 @@ ordnungsgemäß auditiertes System – nicht als Produktiv-VPN.
 Bekannte Einschränkungen des Geltungsbereichs:
 - Es wurde kein externes Sicherheitsaudit durchgeführt – das bleibt der mit
   Abstand wichtigste Vorbehalt für jedes selbst entwickelte Protokoll
-- Der Frame des Datenpfads trägt keinen statischen Magic-Wert mehr und sein
-  Header ist authentifiziert, aber vollständige Verkehrsanalyse-Resistenz
-  (obfs4-/Shadowsocks-artiges Framing, Timing-/Größen-Maskierung) ist noch
-  Zukunftsarbeit
+- Der **Datenpfad** ist jetzt verschleiert (QUIC-artiger Header-Schutz +
+  Längen-Padding – kein sichtbares Typ-Byte, keine session_id, kein Zähler,
+  und die Größen sind verborgen), aber die **Handshake-Hülle** wird weiterhin
+  als Klartext-Frame gesendet, und Timing-Maskierung / Cover-Traffic sind nicht
+  implementiert, sodass vollständige Verkehrsanalyse-Resistenz noch nicht
+  behauptet wird
 - ML-DSA ist für die Authentifizierung integriert, der Schlüsselaustausch
   kombiniert aber weiterhin Kyber768 mit X25519 (kein zweites PQ-KEM)
 
@@ -41,9 +43,16 @@ Bekannte Einschränkungen des Geltungsbereichs:
   (CAESAR-Gewinner, schneller auf CPUs mit AES-Hardware), gewählt durch
   hardwarebewusste Aushandlung, wobei die Wahl im Transcript gegen Downgrade
   gebunden ist
-- Magic-freier Datenpfad-Frame: kein statisches Fingerprint-Byte, und der
-  sichtbare Header (Typ / session_id / Zähler) ist als AEAD Associated Data
-  gebunden, sodass Manipulation den Tag bricht
+- Verschleierter Datenpfad (QUIC-artiger Header-Schutz): jedes Daten-Datagramm
+  sieht aus wie gleichverteilte Zufallsbytes – kein statisches Typ-Byte, keine
+  sichtbare session_id, kein sichtbarer monotoner Zähler. Der Header wird mit
+  einem Keystream maskiert, der (per HMAC-SHA256) aus einer Probe des AEAD-Tags
+  abgeleitet wird, und der echte Frame-Typ steckt *innerhalb* der
+  verschlüsselten Payload, sodass Keepalives nicht von Daten zu unterscheiden
+  sind. Konfigurierbares Längen-Padding (off / bucketed / full) verbirgt die
+  Paketgrößen. Die Header-Integrität kommt weiterhin vom AEAD (der
+  zurückgewonnene Header ist die Associated Data) – die Maske dient nur der
+  Vertraulichkeit
 - Richtungsabhängige Schlüssel; Replay-Schutz per Sliding-Window mit 2048
   Einträgen
 - Rekey mit Anti-Storm-Sperre, Wiederholung bei Paketverlust und
@@ -53,11 +62,14 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Teilstücke
 - Keepalive / Erkennung toter Peers
 - Plattformübergreifendes TUN: Linux, macOS, Windows (Wintun)
-- 23 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 41 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
-  Richtungen), Rekey und Prune-Verhalten abdecken
+  Richtungen), Rekey, Prune-Verhalten und den verschleierten Datenpfad
+  (Round-Trip mit beiden Ciphern, Ablehnung von Manipulation, Trial-Demux über
+  aktuelle + vorherige Session, Längen-Padding, leere Keepalives und dass ein
+  Klartext-Handshake-Frame nicht verschluckt wird) abdecken
 
 ## Build
 
@@ -111,7 +123,12 @@ Unter Windows benötigen Sie zusätzlich `wintun.dll` von
 - `tunnel.rs` – 8192-Byte-Handshake (einzelner KEM-Slot, mit Rauschen
   aufgefüllt; dimensioniert für die hybride PQ-Signatur),
   Fragmentierung/Reassemblierung, Zustandsmaschine mit Transcript-Signierung
-- `frame.rs` – MTU-sicherer, Magic-freier Frame für den Datenpfad (<1280 B)
+- `frame.rs` – MTU-sicherer, Magic-freier Frame (<1280 B) für die
+  Handshake-Hülle und den Legacy-Datenpfad (bei ausgeschalteter Verschleierung)
+- `obf.rs` – Verschleierung des Datenpfads: QUIC-artiger Header-Schutz
+  (13-Byte-Header maskiert mit einem Keystream aus einer AEAD-Tag-Probe),
+  Inner-Type-Framing (echter Frame-Typ verschlüsselt in der Payload) und
+  konfigurierbares Längen-Padding
 - `engine.rs` – CPU-Verschlüsselungs-Engine (konstantzeitfähig, geringe
   Latenz; kein GPU-Pfad – siehe DESIGN.md §11–§12 zur Begründung)
 - `net.rs` – UDP-Schleifen; klare Ein-/Ausgangspunkte zur TUN-Schicht

@@ -21,7 +21,12 @@ use x25519_dalek::{EphemeralSecret, PublicKey as XPub};
 // verraadt. Post-quantum sleutels zijn nu eenmaal groot; een handshake is een
 // eenmalige gebeurtenis, dus de extra fragmenten kosten niets wezenlijks.
 pub const HANDSHAKE_MSG_LEN: usize = 8192;
-pub const PROTO_VERSION: u8 = 1;
+// v2: het datapad is nu geobfusceerd (obf.rs, QUIC-stijl header-protection +
+// padding). Dit maakt het datapad-wireformat incompatibel met 0.1.0-peers; de
+// versie-bump zorgt dat een 0.1.0-handshake (version=1) hier meteen bij decode
+// faalt — een schone fout i.p.v. een succesvolle handshake gevolgd door stil
+// gedropte data. De handshake-envelope zelf blijft deze fase cleartext (Fase 2).
+pub const PROTO_VERSION: u8 = 2;
 
 const X25519_PUB_LEN: usize = 32;
 const KYBER_PK_LEN: usize = 1184;

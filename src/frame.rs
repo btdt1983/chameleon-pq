@@ -31,7 +31,7 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    fn from_u8(v: u8) -> Result<Self> {
+    pub fn from_u8(v: u8) -> Result<Self> {
         match v {
             0x01 => Ok(Self::Data),
             0x02 => Ok(Self::Handshake),

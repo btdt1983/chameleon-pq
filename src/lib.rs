@@ -5,6 +5,7 @@ pub mod engine;
 pub mod error;
 pub mod frame;
 pub mod net;
+pub mod obf;
 pub mod rekey;
 pub mod session;
 pub mod tun_iface;

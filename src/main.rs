@@ -8,8 +8,13 @@
 //!  │         │ ◄───────────── │              │ ◄───────────────── │          │
 //!  └─────────┘   plaintext    └──────────────┘  encrypted frame   └──────────┘
 //!
-//!  TUN ─► engine.encrypt_batch() ─► frame.encode() ─► socket.send_to()
-//!  socket.recv_from() ─► frame.decode() ─► sessions.decrypt() ─► TUN
+//!  TUN ─► engine.encrypt_batch() ─► (obf wire) ─► socket.send_to()
+//!  socket.recv_from() ─► sessions.decrypt_obf()  ─► TUN
+//!                         └─(bij mislukking)─► frame.decode() ─► handshake/rekey
+//!
+//! Het datapad is standaard geobfusceerd (obf.rs, QUIC-stijl header-protection):
+//! de inbound-loop probeert eerst decrypt_obf() en valt alleen terug op het
+//! cleartext-frame voor de (nog cleartext) handshake/rekey-berichten.
 
 use bytes::Bytes;
 use chameleon::config::{AppConfig, Cli, Command};
@@ -17,6 +22,7 @@ use chameleon::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
 use chameleon::engine::{CryptoEngine, OutboundPacket};
 use chameleon::frame::{Frame, FrameType};
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
+use chameleon::obf::PadPolicy;
 use chameleon::session::SessionManager;
 use chameleon::tun_iface::TunPair;
 use clap::Parser;
@@ -86,7 +92,7 @@ async fn run_server(
     info!("session {} established with {peer}", session.session_id);
 
     let tun = TunPair::create(&cfg.tun)?;
-    let engine = build_engine(session);
+    let engine = build_engine(session, &cfg);
     run_tunnel_loops(socket, engine, tun, peer, &cfg, auth.clone()).await;
     Ok(())
 }
@@ -105,16 +111,17 @@ async fn run_client(
     info!("session {} established with {server}", session.session_id);
 
     let tun = TunPair::create(&cfg.tun)?;
-    let engine = build_engine(session);
+    let engine = build_engine(session, &cfg);
     run_tunnel_loops(socket, engine, tun, server, &cfg, auth.clone()).await;
     Ok(())
 }
 
 // ── Gedeelde tunnel-loops ────────────────────────────────────────────────────
 
-fn build_engine(session: chameleon::session::Session) -> Arc<CryptoEngine> {
+fn build_engine(session: chameleon::session::Session, cfg: &AppConfig) -> Arc<CryptoEngine> {
     let mgr = Arc::new(SessionManager::new(session));
-    Arc::new(CryptoEngine::new(mgr))
+    let pad_policy: PadPolicy = cfg.obfuscation.padding.into();
+    Arc::new(CryptoEngine::new(mgr, cfg.obfuscation.enabled, pad_policy))
 }
 
 /// Bouw de peer-authenticator uit de config. Met ML-DSA-sleutels wordt het
@@ -262,6 +269,26 @@ async fn run_tunnel_loops(
                         Ok(v)  => v,
                         Err(e) => { error!("UDP recv: {e}"); continue; }
                     };
+                    // 1) Geobfusceerd datapad EERST (data/keepalive/close). Slaagt
+                    //    dit, dan is het pakket vóór ons en geauthenticeerd; het
+                    //    echte type komt uit de inner framing.
+                    if let Ok((ft, plain)) = engine_in.sessions().decrypt_obf(&buf[..n]) {
+                        last_recv_in.store(now_secs(), Ordering::Relaxed);
+                        match ft {
+                            FrameType::Data => {
+                                debug!("inbound {} bytes -> TUN", plain.len());
+                                if to_tun.send(plain).await.is_err() { break; }
+                            }
+                            FrameType::KeepAlive => debug!("keepalive (obf) received"),
+                            FrameType::Close => { info!("peer closed session"); break; }
+                            FrameType::Handshake => {} // niet verwacht via het obf-pad
+                        }
+                        continue;
+                    }
+
+                    // 2) Anders: cleartext frame — handshake/rekey (deze fase altijd
+                    //    cleartext) of het klassieke datapad als de peer obfuscatie
+                    //    uit heeft staan.
                     let frame = match Frame::decode(Bytes::copy_from_slice(&buf[..n])) {
                         Ok(f)  => f,
                         Err(e) => { warn!("bad frame: {e}"); continue; }
@@ -334,6 +361,9 @@ async fn run_tunnel_loops(
     let socket_ka = socket.clone();
     let last_recv_ka = last_recv.clone();
     let peer_ka = peer;
+    let engine_ka = engine.clone();
+    let obf_enabled_ka = cfg.obfuscation.enabled;
+    let pad_policy_ka: PadPolicy = cfg.obfuscation.padding.into();
     let keepalive = tokio::spawn(async move {
         let mut ka_tick = interval(KEEPALIVE_INTERVAL);
         loop {
@@ -344,13 +374,24 @@ async fn run_tunnel_loops(
                 break;
             }
             // Stuur een keepalive zodat de andere kant óók weet dat wij leven.
-            let ka = Frame {
-                frame_type: FrameType::KeepAlive,
-                session_id: 0,
-                sequence: 0,
-                payload: Bytes::new(),
+            // Geobfusceerd (zodat de keepalive niet als klein vast pakket
+            // opvalt) tenzij obfuscatie uit staat; dan het klassieke frame.
+            let wire = if obf_enabled_ka {
+                engine_ka
+                    .sessions()
+                    .seal_obf(FrameType::KeepAlive as u8, b"", pad_policy_ka)
+                    .ok()
+            } else {
+                Frame {
+                    frame_type: FrameType::KeepAlive,
+                    session_id: 0,
+                    sequence: 0,
+                    payload: Bytes::new(),
+                }
+                .encode()
+                .ok()
             };
-            if let Ok(wire) = ka.encode() {
+            if let Some(wire) = wire {
                 let _ = socket_ka.send_to(&wire, peer_ka).await;
             }
         }
@@ -373,16 +414,10 @@ async fn flush_outbound(
     let batch = std::mem::take(pending);
     let count = batch.len();
     match engine.encrypt_batch(batch) {
-        Ok(encrypted) => {
-            for ep in encrypted {
-                let frame = Frame::new_data(ep.session_id, ep.counter, ep.ciphertext);
-                match frame.encode() {
-                    Ok(wire) => {
-                        if let Err(e) = socket.send_to(&wire, peer).await {
-                            error!("UDP send: {e}");
-                        }
-                    }
-                    Err(e) => error!("frame encode: {e}"),
+        Ok(wires) => {
+            for wire in wires {
+                if let Err(e) = socket.send_to(&wire, peer).await {
+                    error!("UDP send: {e}");
                 }
             }
             debug!("flushed {} pkts", count);

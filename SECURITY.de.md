@@ -23,8 +23,9 @@ willkommen.
 - Die Authentifizierung ist hybrid (Ed25519 + ML-DSA-65), aber der
   Schlüsselaustausch ist Kyber768 + X25519 – ein einzelnes PQ-KEM, kein
   Hybrid aus zwei PQ-KEMs
-- Der Header des Datenpfad-Frames ist authentifiziert und trägt keinen
-  statischen Magic-Wert mehr, aber vollständige Verkehrsanalyse-Resistenz
-  (verschleiertes Framing, Timing-/Größen-Maskierung) ist nicht
-  implementiert – nur der Handshake ist längenfest und mit Rauschen aufgefüllt
+- Der Datenpfad ist verschleiert (QUIC-artiger Header-Schutz + Längen-Padding:
+  kein sichtbares Typ-Byte, keine session_id, kein Zähler, und die Größen sind
+  verborgen), aber die Handshake-Hülle ist weiterhin ein Klartext-Frame, und
+  Timing-Maskierung / Cover-Traffic sind nicht implementiert – vollständige
+  Verkehrsanalyse-Resistenz wird also noch nicht behauptet
 - Kein Schutz gegen Verkehrsanalyse über das oben Genannte hinaus

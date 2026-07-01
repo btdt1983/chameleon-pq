@@ -3,6 +3,8 @@
 
 use crate::aead::{make_directional, AeadAlgo, DirectionalAead};
 use crate::error::{ChameleonError, Result};
+use crate::frame::FrameType;
+use crate::obf::{self, PadPolicy};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -136,6 +138,12 @@ pub struct Session {
     rx_salt: [u8; 4],
     rekey_at: u64,
     replay: Mutex<ReplayWindow>,
+    /// Per-richting header-protection sleutels voor de obfuscatie-laag (obf.rs).
+    /// Los van de AEAD-sleutels, afgeleid uit hetzelfde shared secret met eigen
+    /// HKDF-labels. Als plain [u8;32] opgeslagen, net als de AEGIS-sleutel in
+    /// aead.rs (dezelfde hygiëne-afweging).
+    tx_obf_key: [u8; 32],
+    rx_obf_key: [u8; 32],
 }
 
 impl Session {
@@ -163,6 +171,8 @@ impl Session {
         let tx_aead = make_directional(algo, &tx_bytes)?;
         let rx_aead = make_directional(algo, &rx_bytes)?;
 
+        let (tx_obf_key, rx_obf_key) = derive_obf_keys(&shared, is_initiator)?;
+
         let (tx_salt, rx_salt) = if is_initiator {
             ([0x01, 0, 0, 0], [0x02, 0, 0, 0])
         } else {
@@ -179,6 +189,8 @@ impl Session {
             rx_salt,
             rekey_at: 1 << 48,
             replay: Mutex::new(ReplayWindow::new()),
+            tx_obf_key,
+            rx_obf_key,
         })
     }
 
@@ -246,6 +258,53 @@ impl Session {
         aad[5..13].copy_from_slice(&counter.to_le_bytes());
         aad
     }
+
+    // ── Geobfusceerd datapad (obf.rs-laag bovenop de AEAD-kern) ──────────────
+
+    /// Verzegel een uitgaand datapad-datagram met obfuscatie: verpak het echte
+    /// `inner_type` + de plaintext in de inner framing (met padding), versleutel
+    /// dat via de ONGEWIJZIGDE AEAD-kern, en maskeer de header. Geeft het
+    /// wire-klare datagram terug (masked_header ‖ ct).
+    pub fn seal_obf(&self, inner_type: u8, plaintext: &[u8], policy: PadPolicy) -> Result<Bytes> {
+        let max_framed = obf::max_framed(self.algo.tag_len());
+        let framed = obf::pack_inner(inner_type, plaintext, policy, max_framed);
+        let (counter, ct) = self.encrypt(&framed)?;
+        Ok(obf::seal_wire(
+            &self.tx_obf_key,
+            self.session_id,
+            counter,
+            &ct,
+        ))
+    }
+
+    /// Probeer een inkomend datagram als geobfusceerd datapad-pakket voor DEZE
+    /// sessie te openen. Geeft:
+    ///   • Ok(Some((type, plaintext))) — geopend en geauthenticeerd voor ons;
+    ///   • Ok(None)                    — niet voor deze sessie (te kort, ander
+    ///                                    session_id, of AEAD-open faalt) → de
+    ///                                    aanroeper probeert een andere kandidaat;
+    ///   • Err(..)                     — geauthenticeerd maar de inner framing is
+    ///                                    corrupt/onbekend (protocolfout).
+    fn try_open_obf(&self, datagram: &[u8]) -> Result<Option<(FrameType, Bytes)>> {
+        let rec = match obf::unmask(&self.rx_obf_key, datagram) {
+            Some(r) => r,
+            None => return Ok(None), // te kort / ruis
+        };
+        // Goedkope voorfilter: het session_id moet matchen. Dit is een
+        // performance-poort, niet de veiligheidsgrens — die is de AEAD-tag.
+        if rec.session_id != self.session_id {
+            return Ok(None);
+        }
+        match self.decrypt(rec.counter, obf::ct_slice(datagram)) {
+            Ok(framed) => {
+                let (inner_type, pt) = obf::unpack_inner(&framed)?;
+                Ok(Some((FrameType::from_u8(inner_type)?, pt)))
+            }
+            // Tag-mismatch/replay: niet (meer) voor ons — laat de aanroeper de
+            // volgende kandidaat proberen; anders wordt het uiteindelijk gedropt.
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 /// Per-richting sleutelpaar (tx, rx), beide zeroized bij drop.
@@ -262,6 +321,28 @@ fn derive_directional_keys(shared: &[u8; 32], is_initiator: bool) -> Result<Dire
     hk.expand(b"key-B->A", b.as_mut())
         .map_err(|_| ChameleonError::Kdf("B".into()))?;
     // Initiator stuurt op A->B en ontvangt op B->A; responder omgekeerd.
+    if is_initiator {
+        Ok((a, b))
+    } else {
+        Ok((b, a))
+    }
+}
+
+/// Per-richting header-protection sleutels voor de obfuscatie-laag. Uit
+/// hetzelfde shared secret en dezelfde HKDF-context als de AEAD-sleutels, maar
+/// met EIGEN info-labels — HKDF-Expand met verschillende `info` levert
+/// onafhankelijke sleutels, dus schone domeinscheiding t.o.v. `key-A->B`/`B->A`.
+fn derive_obf_keys(shared: &[u8; 32], is_initiator: bool) -> Result<([u8; 32], [u8; 32])> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let hk = Hkdf::<Sha256>::new(Some(b"Chameleon-PQ-v1-directional"), shared);
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    hk.expand(b"obf-A->B", &mut a)
+        .map_err(|_| ChameleonError::Kdf("obf-A".into()))?;
+    hk.expand(b"obf-B->A", &mut b)
+        .map_err(|_| ChameleonError::Kdf("obf-B".into()))?;
+    // Zelfde richting-swap als de AEAD-sleutels: (tx_obf, rx_obf).
     if is_initiator {
         Ok((a, b))
     } else {
@@ -324,6 +405,33 @@ impl SessionManager {
         if let Some(p) = prev.as_ref() {
             if p.session_id == session_id {
                 return p.decrypt(counter, ct);
+            }
+        }
+        Err(ChameleonError::DecryptionFailed)
+    }
+
+    // ── Geobfusceerd datapad ─────────────────────────────────────────────────
+
+    /// Verzegel een uitgaand datapad-datagram met obfuscatie op de HUIDIGE
+    /// sessie. `inner_type` is het echte frame-type (Data/KeepAlive/Close).
+    pub fn seal_obf(&self, inner_type: u8, plaintext: &[u8], policy: PadPolicy) -> Result<Bytes> {
+        let sess = self.current.read().clone();
+        sess.seal_obf(inner_type, plaintext, policy)
+    }
+
+    /// Open een inkomend geobfusceerd datagram via trial-decryptie over de
+    /// actieve sessies (huidige eerst, dan de vorige tijdens een rekey-overlap).
+    /// De trial-set is ≤2; een pakket dat bij geen van beide opent, wordt
+    /// gedropt (ziet er uit als ruis). Geeft (echt frame-type, plaintext).
+    pub fn decrypt_obf(&self, datagram: &[u8]) -> Result<(FrameType, Bytes)> {
+        let current = self.current.read().clone();
+        if let Some(res) = current.try_open_obf(datagram)? {
+            return Ok(res);
+        }
+        let previous = self.previous.read().clone();
+        if let Some(p) = previous {
+            if let Some(res) = p.try_open_obf(datagram)? {
+                return Ok(res);
             }
         }
         Err(ChameleonError::DecryptionFailed)
