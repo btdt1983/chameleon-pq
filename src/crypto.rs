@@ -244,6 +244,18 @@ pub fn derive_shared(x_ss: &[u8], kyber_ss: &[u8]) -> Zeroizing<[u8; 32]> {
     okm
 }
 
+/// Bind een transcript-handtekening aan een ROL (initiator vs responder) via
+/// domeinscheiding. Zonder dit tekenen beide kanten exact dezelfde transcript-
+/// hash `th`, wat een gereflecteerde handtekening zou toelaten als de peers ooit
+/// een identiteitssleutel delen. Door per rol een eigen label vóór `th` te
+/// hashen gaan de twee handtekeningen aantoonbaar over verschillende berichten.
+pub fn role_bound_hash(label: &[u8], transcript_hash: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(label);
+    h.update(transcript_hash);
+    h.finalize().into()
+}
+
 pub fn mac_key_from(shared: &[u8; 32]) -> [u8; 32] {
     use hkdf::Hkdf;
     let hk = Hkdf::<Sha256>::new(Some(b"Chameleon-PQ-v1-mac"), shared);

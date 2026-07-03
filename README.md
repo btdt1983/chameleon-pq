@@ -86,7 +86,7 @@ Known scope limits:
   path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
   on (default) the configured rate caps throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 69 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 72 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -98,9 +98,12 @@ Known scope limits:
   reassembler cap + prune, and that a 0.1.x cleartext frame is not accepted),
   timing/cover traffic (the pure pacer scheduler's CBR/Adaptive/cooldown logic,
   that a cover packet round-trips as `Padding`, and that cover and data are
-  equal-length + header-distinct under `Full` padding), and parallel crypto
+  equal-length + header-distinct under `Full` padding), parallel crypto
   (parallel-sealed packets all decrypt with unique counters, and
-  `decrypt_batch_par` classifies data vs noise)
+  `decrypt_batch_par` classifies data vs noise), role-separated handshake
+  signatures (a reflected responder signature is rejected as a Confirm, even
+  under a shared identity key), and the bounded UDP handshake (mutual completion
+  over real sockets + a clean timeout when no responder answers)
 
 ## Build
 
