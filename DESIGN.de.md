@@ -388,9 +388,51 @@ also kann ein Angreifer, der beide Pubkeys bereits besitzt, de-verschleiern
 (`psk_hex` schließt das). Und selbst wenn jeder statische/strukturelle
 Fingerabdruck weg ist, bleiben die **~8 KB Gesamt-Handshake-Größe** und ihr
 **2-RTT-Burst-Timing** beobachtbar, und die Fragmente eines Bursts teilen eine
-(zufällige) `msg_id`. Timing-Maskierung / Cover-Traffic / konstantes Pacing sind
-nicht implementiert. Das ist also ein großer Schritt zur Verkehrsanalyse-
-Resistenz, keine abgeschlossene Behauptung.
+(zufällige) `msg_id`. Die *Datenpfad*-Timing-Dimension wird unten behandelt
+(§9a); der initiale Handshake-Burst bleibt ein Rest, da er vor dem Pacer liegt.
+
+### 9a. Timing / Cover-Traffic (`pacer.rs`, Phase 3)
+
+Phasen 1–2 ließen jedes Datagramm zufällig aussehen und verbargen seine Größe,
+aber ein passiver Beobachter konnte noch sehen, WANN Daten flossen – Bursts,
+Idle-Lücken, die Gesamthülle. Phase 3 fügt **Constant-Rate-Shaping** hinzu: der
+Sender sendet auf einem **festen Takt** und füllt leere Slots mit **Cover-(Dummy-)
+Paketen**, die der Empfänger stillschweigend verwirft, sodass Bursts und
+Aktiv-vs-Idle in einem gleichmäßigen Strom aufgehen.
+
+**Mechanismus.** Ein Cover-Paket ist ein gewöhnliches obfusziertes
+Datenpfad-Datagramm, dessen *innerer* Typ zu einem neuen `FrameType::Padding`
+entschlüsselt – `decrypt_obf` gibt `Padding` zurück und die Inbound-Schleife
+verwirft es (zählt aber als Lebenszeichen). Keine neue Krypto und **keine
+Wire-/Proto-Änderung**: `PROTO_VERSION` lebt im Handshake, nicht im Datenpfad,
+also erhält ein Peer, der Phase 3 nicht kennt, einfach `UnknownFrameType` und
+verwirft das Cover-Paket – echte Daten fließen weiter, und Pacing kann sogar pro
+Richtung **asymmetrisch** sein, ohne Aushandlung. Die Outbound-Schleife (`main.rs`)
+ersetzt den Batch-Linger-Flush durch einen festen Ticker, der pro Slot `burst`
+Datagramme über den reinen `pacer::Pacer`-Scheduler sendet: jedes Slot nimmt ein
+echtes Paket aus der Warteschlange, sonst ein Cover-Paket (CBR /
+Adaptive-innerhalb-Cooldown) oder nichts (Adaptive-Idle). Jedes gepacte Datagramm
+– echt wie Cover – wird auf eine **konstante Größe** (`Full`) gepaddet, sodass
+Rate *und* Größe konstant sind. Eine begrenzte Warteschlange verwirft echte
+Pakete per Tail-Drop, wenn die Last die Rate übersteigt (TCP erholt sich).
+
+**Modi & Kosten (Config `[traffic]`, standardmäßig an im Adaptive-Modus):**
+**Adaptive** (Standard) pact nur während Aktivität plus Cooldown und wird still,
+wenn echt idle – keine Bandbreite in Ruhe, aber grobes Aktiv-vs-Idle taucht
+wieder auf. **CBR** sendet mit der konfigurierten Rate rund um die Uhr – am
+stärksten, aber die Rate ist dann eine konstante Bandbreiten-Untergrenze *und*
+das Durchsatz-Limit. In beiden Modi ist die Rate das Durchsatz-Limit (Verkehr
+darüber wird verworfen); die MTU ist begrenzt, sodass Paket + Overhead in ein
+Datagramm passen (wie WireGuard die Tunnel-MTU an den Pfad anpasst).
+
+**Ehrliche Einschränkung (was bleibt):** Timing-Shaping verbirgt die *Form* des
+Verkehrs, nicht die **Existenz** der Tunnel (die Endpunkte sind bekannt,
+Site-to-Site) oder ihre **Gesamtdauer**; der **initiale Handshake-Burst** liegt
+vor dem Pacer und bleibt sichtbar (Rekey-Pacing ist ein dokumentierter
+Nachfolger); CBR kostet konstante Bandbreite und fügt bis zu ~`1/Rate` Latenz pro
+Paket hinzu; und im Adaptive-Modus leckt grobes Volumen-über-Zeit weiter. Das
+schließt also die Timing-Dimension für den Datenpfad unter CBR, aber
+„vollständige Verkehrsanalyse-Resistenz“ bleibt eine qualifizierte Behauptung.
 
 ---
 
@@ -464,14 +506,14 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
    beheben.
 2. **Einzelnes PQ-KEM.** Der Schlüsselaustausch ist Kyber768 + X25519
    (hybrid klassisch/PQ), kein Hybrid aus zwei unabhängigen PQ-KEMs.
-3. **Teilweise Verkehrsanalyse-Resistenz.** Der **Datenpfad** und die
-   **Handshake-Hülle** sind nun verschleiert – jedes Datagramm sieht wie
-   Zufallsbytes aus, ohne sichtbaren Typ, session_id, Zähler oder
-   Fragment-Struktur, und die Größen sind gepaddet/gejittert (§9). Noch offen:
-   die ~8 KB Handshake-Größe und das 2-RTT-Burst-*Timing* bleiben beobachtbar,
-   der Handshake-Schlüssel ist standardmäßig pubkey-abgeleitet (ein optionaler
-   PSK schließt das), und Cover-Traffic / Pacing sind nicht implementiert. Es ist
-   also ein großer Schritt, keine abgeschlossene Eigenschaft.
+3. **Teilweise Verkehrsanalyse-Resistenz.** Der Datenpfad, die Handshake-Hülle
+   und (optional) das Paket-*Timing* sind nun verschleiert – zufällig aussehende
+   Datagramme, verborgene Größen und Constant-Rate-Cover-Traffic, der Bursts und
+   Aktiv-vs-Idle auflöst (§9, §9a). Noch offen: Existenz und Gesamtdauer der
+   Tunnel sind einer festen Verbindung inhärent, der initiale Handshake-Burst
+   liegt vor dem Pacer, der Handshake-Schlüssel ist standardmäßig
+   pubkey-abgeleitet (ein optionaler PSK schließt das), und Constant-Rate kostet
+   Bandbreite/Latenz. Ein großer Schritt, keine abgeschlossene Eigenschaft.
 
 ### Seit dem ersten Entwurf gelöst
 
@@ -493,6 +535,11 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
   geteilten Identitäten (oder einem PSK) gebootstrappten Schlüssel versiegelt und
   in größen-gejitterte Fragmente mit maskiertem Header aufgeteilt – das alte
   konstante Typ-Byte und der feste Fragment-Burst sind weg. Siehe §9.
+- **Timing / Cover-Traffic.** Constant-Rate-Shaping (`pacer.rs`): der Sender
+  sendet auf einem festen Takt und füllt leere Slots mit Cover-Paketen (ein
+  verschlüsselter `Padding`-Inner-Type, den der Empfänger verwirft), sodass
+  Bursts und Aktiv-vs-Idle aufgehen. Keine Wire-/Proto-Änderung; standardmäßig an
+  im Adaptive-Modus. Siehe §9a.
 - **Datenpfad verschleiert.** QUIC-artiger Header-Schutz (`obf.rs`): Der Header
   wird mit einem Keystream aus einer AEAD-Tag-Probe maskiert, der echte
   Frame-Typ wird in der Payload verschlüsselt, und konfigurierbares

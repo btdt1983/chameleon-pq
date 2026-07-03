@@ -43,6 +43,20 @@ impl CryptoEngine {
         &self.sessions
     }
 
+    /// Bouw een wire-klaar COVER/dummy-datagram (constante grootte via `Full`),
+    /// voor de constant-rate pacer (Fase 3).
+    pub fn cover_datagram(&self) -> Result<Bytes> {
+        self.sessions.seal_cover(PadPolicy::Full)
+    }
+
+    /// Verzegel één ECHT datapad-pakket met constante grootte (`Full`), voor het
+    /// gepacede pad — daar moeten echt én cover dezelfde vaste grootte hebben,
+    /// anders lekt de grootte-histogram wat de constante rate juist verbergt.
+    pub fn seal_data_full(&self, plaintext: &[u8]) -> Result<Bytes> {
+        self.sessions
+            .seal_obf(FrameType::Data as u8, plaintext, PadPolicy::Full)
+    }
+
     /// Versleutel een batch uitgaande pakketten tot WIRE-KLARE datagrammen.
     /// De obf-seal gebeurt in `SessionManager::seal_obf` onder één sessie-lock,
     /// zodat de counter en de header-protection-sleutel altijd bij elkaar horen

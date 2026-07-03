@@ -75,6 +75,8 @@ pub struct AppConfig {
     pub engine: EngineConfig,
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
+    #[serde(default)]
+    pub traffic: TrafficConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +210,56 @@ impl Default for ObfuscationConfig {
     }
 }
 
+// ── Traffic shaping (timing-/cover-traffic-obfuscatie, Fase 3) ───────────────
+
+/// Vorm-modus voor de constant-rate pacer. Afgebeeld op `pacer::ShapeMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrafficMode {
+    /// Constant bit-rate: altijd op tempo, ook idle. Sterkste timing-verberging,
+    /// maar constante bandbreedtekost 24/7 (ook wanneer er niets stroomt).
+    Cbr,
+    /// Adaptief: pace tijdens activiteit + cooldown, stil wanneer echt idle.
+    /// De STANDAARD: geen bandbreedte in rust, wél burst-verberging tijdens
+    /// activiteit. Grof actief-vs-idle lekt weer (bewuste afweging vs. CBR).
+    #[default]
+    Adaptive,
+}
+
+/// `[traffic]`-sectie: constant-rate pacing + cover-traffic tegen timing-analyse.
+/// Standaard AAN met CBR. Dit voegt cover-pakketten toe (constante bandbreedte)
+/// en vertraagt echte pakketten tot slot-grenzen. De geconfigureerde rate
+/// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte ALS het
+/// doorvoerplafond — stem 'm af op je link.
+#[derive(Debug, Deserialize)]
+pub struct TrafficConfig {
+    #[serde(default = "default_traffic_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: TrafficMode,
+    /// Emissie-slots per seconde (het tempo van de ticker).
+    #[serde(default = "default_rate_pps")]
+    pub rate_pps: u32,
+    /// Pakketten per slot (token-bucket-diepte). Constante rate = rate_pps × burst.
+    #[serde(default = "default_burst")]
+    pub burst: u16,
+    /// Adaptive: hoelang na het laatste echte pakket cover blijft doorlopen (ms).
+    #[serde(default = "default_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+impl Default for TrafficConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_traffic_enabled(),
+            mode: TrafficMode::default(),
+            rate_pps: default_rate_pps(),
+            burst: default_burst(),
+            cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
 // ── defaults ─────────────────────────────────────────────────────────────────
 
 fn default_bind() -> SocketAddr {
@@ -223,7 +275,10 @@ fn default_netmask() -> String {
     "255.255.255.0".into()
 }
 fn default_mtu() -> u16 {
-    1400
+    // MTU-veilig voor het geobfusceerde datapad: pakket + obf-overhead moet in
+    // één ≤1280-byte datagram passen (zie SAFE_TUN_MTU in validate). Net als
+    // WireGuard (tunnel-MTU = pad − overhead) sturen we niet groter dan past.
+    1200
 }
 fn default_linger() -> u64 {
     200
@@ -233,6 +288,18 @@ fn default_obf_enabled() -> bool {
 }
 fn default_hs_obf_enabled() -> bool {
     true
+}
+fn default_traffic_enabled() -> bool {
+    true
+}
+fn default_rate_pps() -> u32 {
+    256
+}
+fn default_burst() -> u16 {
+    2
+}
+fn default_cooldown_ms() -> u64 {
+    500
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────
@@ -281,6 +348,23 @@ impl AppConfig {
                 msg: format!("tun.mtu {} is below minimum 576", self.tun.mtu),
             });
         }
+        // Bovengrens voor het geobfusceerde datapad: een IP-pakket + de
+        // obf-overhead moet in één MTU-veilig datagram (1280) passen, anders
+        // fragmenteert IP — dat breekt de constante grootte én is zelf een
+        // vingerafdruk. 1280 − header(13) − max AEAD-tag(32, AEGIS) − inner(3)
+        // = 1232. (WireGuard doet hetzelfde: tunnel-MTU nooit groter dan past.)
+        const SAFE_TUN_MTU: u16 = 1232;
+        if self.obfuscation.enabled && self.tun.mtu > SAFE_TUN_MTU {
+            return Err(ChameleonError::Handshake {
+                state: "config".into(),
+                msg: format!(
+                    "tun.mtu {} exceeds the obfuscation-safe maximum {}: a larger \
+                     MTU would fragment the obfuscated data path (breaking the \
+                     constant-size property and adding a fingerprint). Lower tun.mtu.",
+                    self.tun.mtu, SAFE_TUN_MTU
+                ),
+            });
+        }
         // Optioneel handshake-obfuscatie-PSK: als gezet, moet hij parseren en
         // niet absurd kort zijn (te weinig entropie zou de obfuscatie verzwakken).
         if let Some(psk) = self.obfuscation.psk_bytes()? {
@@ -301,6 +385,22 @@ impl AppConfig {
                 state: "config".into(),
                 msg: "obfuscation.handshake requires obfuscation.enabled = true".into(),
             });
+        }
+        // Traffic shaping (Fase 3): cover-pakketten rijden op het geobfusceerde
+        // datapad, dus vereist obfuscation.enabled; rate/burst moeten >= 1.
+        if self.traffic.enabled {
+            if !self.obfuscation.enabled {
+                return Err(ChameleonError::Handshake {
+                    state: "config".into(),
+                    msg: "traffic.enabled requires obfuscation.enabled = true".into(),
+                });
+            }
+            if self.traffic.rate_pps < 1 || self.traffic.burst < 1 {
+                return Err(ChameleonError::Handshake {
+                    state: "config".into(),
+                    msg: "traffic.rate_pps and traffic.burst must both be >= 1".into(),
+                });
+            }
         }
         Ok(())
     }

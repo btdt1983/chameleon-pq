@@ -929,3 +929,248 @@ fn hs_obf_wire_looks_random() {
         first_bytes.len()
     );
 }
+
+// ── Cover-traffic / Padding inner-type (pacer, Fase 3) ───────────────────────
+
+#[test]
+fn cover_packet_roundtrips_as_padding() {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let shared = [0x70u8; 32];
+    let tx = SessionManager::new(obf_session(1, shared, true, algo));
+    let rx = SessionManager::new(obf_session(1, shared, false, algo));
+
+    let wire = tx.seal_cover(PadPolicy::Full).unwrap();
+    let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
+    assert_eq!(ft, FrameType::Padding, "cover pakket = inner-type Padding");
+    assert!(pt.is_empty(), "cover heeft lege payload");
+}
+
+#[test]
+fn cover_indistinguishable_from_data_under_full() {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let shared = [0x71u8; 32];
+    let tx = SessionManager::new(obf_session(1, shared, true, algo));
+
+    // Een echt Data-pakket en een cover-pakket, beide Full-gepad (zoals de pacer).
+    let data = tx
+        .seal_obf(FrameType::Data as u8, b"echte payload", PadPolicy::Full)
+        .unwrap();
+    let cover = tx.seal_cover(PadPolicy::Full).unwrap();
+
+    // Zelfde lengte op de wire -> de grootte verraadt echt-vs-cover niet.
+    assert_eq!(
+        data.len(),
+        cover.len(),
+        "cover en data even lang onder Full"
+    );
+    // Maar de gemaskeerde headers verschillen (geen vaste vingerafdruk).
+    assert_ne!(&data[..13], &cover[..13]);
+}
+
+// ── Micro-benchmarks (voor het snelheidswerk) ────────────────────────────────
+// Draai met:  cargo test --release bench -- --ignored --nocapture
+// #[ignore] zodat ze niet in de gewone suite meelopen.
+
+#[test]
+#[ignore]
+fn bench_crypto_throughput() {
+    use std::time::Instant;
+
+    let pt = vec![0x5Au8; 1200]; // typische MTU-payload
+    let n: usize = 1_000_000;
+    println!(
+        "\n=== crypto microbench ({n} pakketten x {} B, release, 1 core) ===",
+        pt.len()
+    );
+
+    let rate = |ops: usize, dt: f64, bytes: usize| {
+        format!(
+            "{:.2} Mpps  {:.2} Gbit/s",
+            ops as f64 / dt / 1e6,
+            ops as f64 * bytes as f64 * 8.0 / dt / 1e9
+        )
+    };
+
+    // Rauwe AEAD (per cipher), zonder obf-laag.
+    for (name, algo) in [
+        ("ChaCha20-Poly1305", AeadAlgo::ChaCha20Poly1305),
+        ("AEGIS-256X2", AeadAlgo::Aegis256X2),
+    ] {
+        let tx = obf_session(1, [0x42u8; 32], true, algo);
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..n {
+            sink = sink.wrapping_add(tx.encrypt(&pt).unwrap().1.len());
+        }
+        let dt = t.elapsed().as_secs_f64();
+        println!(
+            "  raw AEAD encrypt [{name:18}]: {}  (sink {sink})",
+            rate(n, dt, pt.len())
+        );
+    }
+
+    // Volledig obf-seal-pad (ChaCha, Full padding zoals de pacer gebruikt).
+    let mgr = SessionManager::new(obf_session(
+        1,
+        [0x43u8; 32],
+        true,
+        AeadAlgo::ChaCha20Poly1305,
+    ));
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..n {
+        sink = sink.wrapping_add(
+            mgr.seal_obf(FrameType::Data as u8, &pt, PadPolicy::Full)
+                .unwrap()
+                .len(),
+        );
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "  obf seal  [ChaCha Full, in ]: {}  (sink {sink})",
+        rate(n, dt, pt.len())
+    );
+
+    // Volledig obf-open-pad: seal M distinct, dan time decrypt_obf.
+    let m: usize = 200_000;
+    let shared = [0x44u8; 32];
+    let txm = SessionManager::new(obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305));
+    let rxm = SessionManager::new(obf_session(1, shared, false, AeadAlgo::ChaCha20Poly1305));
+    let sealed: Vec<Bytes> = (0..m)
+        .map(|_| {
+            txm.seal_obf(FrameType::Data as u8, &pt, PadPolicy::Full)
+                .unwrap()
+        })
+        .collect();
+    let t = Instant::now();
+    let mut ok = 0usize;
+    for w in &sealed {
+        if rxm.decrypt_obf(w).is_ok() {
+            ok += 1;
+        }
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "  obf open  [ChaCha, out]: {}  ({ok}/{m} ok)",
+        rate(m, dt, pt.len())
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_udp_sendto() {
+    use std::net::UdpSocket;
+    use std::time::Instant;
+
+    let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let rx_addr = rx.local_addr().unwrap();
+    let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let buf = vec![0u8; 1280];
+    let n: usize = 1_000_000;
+
+    let t = Instant::now();
+    let mut sent = 0usize;
+    for _ in 0..n {
+        // Eén syscall per pakket — dit is de rate die GSO/sendmmsg zou verhogen.
+        if tx.send_to(&buf, rx_addr).is_ok() {
+            sent += 1;
+        }
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "\n=== UDP send_to microbench (loopback, {} B, 1 thread) ===",
+        buf.len()
+    );
+    println!(
+        "  raw send_to (1 syscall/pkt): {:.2} Mpps  {:.2} Gbit/s  ({sent}/{n} ok)",
+        n as f64 / dt / 1e6,
+        n as f64 * buf.len() as f64 * 8.0 / dt / 1e9
+    );
+}
+
+// ── Gebatchte UDP-I/O (quinn-udp GSO/GRO) ────────────────────────────────────
+
+/// Correctheidsgate voor de syscall-laag: een batch datagrammen die via
+/// `batch_send` (GSO waar mogelijk) de deur uit gaat, moet via `batch_recv`
+/// (GRO of per-pakket) compleet en intact terugkomen.
+#[tokio::test]
+async fn udp_batch_roundtrip() {
+    use tokio::net::UdpSocket;
+
+    let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let rx_addr = rx.local_addr().unwrap();
+    let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tx_state = chameleon::udp::socket_state(&tx).unwrap();
+    let rx_state = chameleon::udp::socket_state(&rx).unwrap();
+
+    // 5 gelijk-grote datagrammen (elk uniform gevuld met zijn index).
+    let dg: Vec<Bytes> = (0..5u8).map(|i| Bytes::from(vec![i; 1280])).collect();
+    chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280)
+        .await
+        .unwrap();
+
+    let (mut storage, mut metas) = chameleon::udp::recv_buffers();
+    let mut fills: Vec<u8> = Vec::new();
+    while fills.len() < dg.len() {
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            chameleon::udp::batch_recv(&rx, &rx_state, &mut storage, &mut metas),
+        )
+        .await
+        .expect("recv timeout")
+        .unwrap();
+        for (_src, d) in chameleon::udp::iter_datagrams(&storage, &metas, n) {
+            assert_eq!(d.len(), 1280, "datagram intact van lengte");
+            assert!(d.iter().all(|&b| b == d[0]), "datagram uniform gevuld");
+            fills.push(d[0]);
+        }
+    }
+    // Alle 5 aangekomen (volgorde-onafhankelijk).
+    fills.sort_unstable();
+    assert_eq!(fills, vec![0, 1, 2, 3, 4]);
+}
+
+/// Micro-benchmark: batch_send-doorvoer t.o.v. de per-pakket send_to-baseline.
+/// Draai met:  cargo test --release bench_udp_gso -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn bench_udp_gso() {
+    use std::time::Instant;
+    use tokio::net::UdpSocket;
+
+    let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let rx_addr = rx.local_addr().unwrap();
+    let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let rx_state = chameleon::udp::socket_state(&rx).unwrap();
+    let tx_state = chameleon::udp::socket_state(&tx).unwrap();
+
+    // Drain-taak zodat de rx-buffer niet vol loopt.
+    let drain = tokio::spawn(async move {
+        let (mut st, mut mt) = chameleon::udp::recv_buffers();
+        while chameleon::udp::batch_recv(&rx, &rx_state, &mut st, &mut mt)
+            .await
+            .is_ok()
+        {}
+    });
+
+    let n = 1_000_000usize;
+    let batch = 64usize;
+    let dg: Vec<Bytes> = (0..batch)
+        .map(|_| Bytes::from(vec![0x5Au8; 1280]))
+        .collect();
+
+    let t = Instant::now();
+    let mut sent = 0usize;
+    while sent < n {
+        let _ = chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280).await;
+        sent += batch;
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "\n=== GSO batch_send microbench (loopback, 1280 B, batch {batch}) ===\n  \
+         batch_send: {:.2} Mpps  {:.2} Gbit/s  ({sent} pkts) — vs per-pakket ~0.18 Mpps",
+        sent as f64 / dt / 1e6,
+        sent as f64 * 1280.0 * 8.0 / dt / 1e9
+    );
+    drain.abort();
+}

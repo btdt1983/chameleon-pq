@@ -7,9 +7,11 @@ pub mod frame;
 pub mod hsobf;
 pub mod net;
 pub mod obf;
+pub mod pacer;
 pub mod rekey;
 pub mod session;
 pub mod tun_iface;
 pub mod tunnel;
+pub mod udp;
 
 pub use error::{ChameleonError, Result};

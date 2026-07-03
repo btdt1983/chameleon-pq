@@ -23,12 +23,12 @@ willkommen.
 - Die Authentifizierung ist hybrid (Ed25519 + ML-DSA-65), aber der
   Schlüsselaustausch ist Kyber768 + X25519 – ein einzelnes PQ-KEM, kein
   Hybrid aus zwei PQ-KEMs
-- Der Datenpfad und die Handshake-Hülle sind beide verschleiert (kein sichtbares
-  Typ-Byte, keine session_id, kein Zähler, keine Fragment-Struktur; Größen
-  gepaddet/gejittert), aber die ~8 KB Handshake-Größe und ihr 2-RTT-Burst-Timing
-  bleiben beobachtbar, der Handshake-Verschleierungsschlüssel wird standardmäßig
-  aus den vorab geteilten Pubkeys abgeleitet (optionales psk_hex für ein
-  stärkeres Geheimnis), und Timing-Maskierung / Cover-Traffic sind nicht
-  implementiert – vollständige Verkehrsanalyse-Resistenz wird also noch nicht
+- Der Datenpfad, die Handshake-Hülle und (optional) das Paket-Timing sind
+  verschleiert – Zufallsbytes-Datagramme, verborgene Größen und Constant-Rate-
+  Cover-Traffic, der Bursts und Aktiv-vs-Idle verbirgt. Aber Existenz und
+  Gesamtdauer der Tunnel sind einer festen Verbindung inhärent, der initiale
+  Handshake-Burst liegt vor dem Pacer, der Handshake-Schlüssel ist standardmäßig
+  pubkey-abgeleitet (optionales psk_hex), und Constant-Rate kostet
+  Bandbreite/Latenz – vollständige Verkehrsanalyse-Resistenz wird also nicht
   behauptet
 - Kein Schutz gegen Verkehrsanalyse über das oben Genannte hinaus

@@ -419,6 +419,15 @@ impl SessionManager {
         sess.seal_obf(inner_type, plaintext, policy)
     }
 
+    /// Verzegel een cover/dummy-datagram (Fase 3): een geobfusceerd datapad-
+    /// pakket met inner-type Padding en lege payload. De ontvanger gooit het
+    /// stil weg (telt wél als teken van leven). Vult lege slots in de
+    /// constant-rate pacer, zodat burst-/idle-patronen verdwijnen.
+    pub fn seal_cover(&self, policy: PadPolicy) -> Result<Bytes> {
+        let sess = self.current.read().clone();
+        sess.seal_obf(FrameType::Padding as u8, b"", policy)
+    }
+
     /// Open een inkomend geobfusceerd datagram via trial-decryptie over de
     /// actieve sessies (huidige eerst, dan de vorige tijdens een rekey-overlap).
     /// De trial-set is ≤2; een pakket dat bij geen van beide opent, wordt

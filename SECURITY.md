@@ -21,10 +21,11 @@ For non-security bugs, regular GitHub issues are welcome.
 - No external audit has been performed
 - Authentication is hybrid (Ed25519 + ML-DSA-65), but the key exchange is
   Kyber768 + X25519 — a single PQ KEM, not a hybrid of two PQ KEMs
-- The data path and the handshake envelope are both obfuscated (no visible type
-  byte, session id, counter or fragment structure; sizes padded/jittered), but
-  the ~8 KB handshake volume and its 2-RTT burst timing remain observable, the
-  handshake obfuscation key is derived from the pre-shared pubkeys by default
-  (optional psk_hex for a stronger secret), and timing masking / cover traffic
-  are not implemented — so full traffic-analysis resistance is not yet claimed
+- The data path, the handshake envelope, and (optionally) packet timing are
+  obfuscated — random-looking datagrams, hidden sizes, and constant-rate cover
+  traffic that hides bursts and idle-vs-active. But the tunnel's existence and
+  total duration are inherent to a fixed link, the initial handshake burst
+  precedes the pacer, the handshake obfuscation key is pubkey-derived by default
+  (optional psk_hex for a stronger secret), and constant-rate shaping costs
+  bandwidth/latency — so full traffic-analysis resistance is not claimed
 - No protection against traffic analysis beyond the above
