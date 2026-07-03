@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = AppConfig::load(&cli.config)?;
+    if !cfg.obfuscation.enabled {
+        warn!(
+            "obfuscation.enabled = false: het datapad is ONGEOBFUSCEERD én de \
+             control-frames (KeepAlive/Close/Handshake) zijn ONGEAUTHENTICEERD. Een \
+             peer-spoofende of on-path aanvaller kan frames injecteren. Gebruik \
+             obf-off alleen voor debugging op een vertrouwd netwerk (L-7)."
+        );
+    }
     let auth = build_auth(&cfg)?;
     init_rayon_pool(&cfg);
 
@@ -546,7 +554,14 @@ async fn run_tunnel_loops(
                                 }
                             }
                             FrameType::KeepAlive => debug!("keepalive received"),
-                            FrameType::Close     => { info!("peer closed session"); break 'inbound; }
+                            // L-7: een cleartext Close (obf uit) is ONGEAUTHENTICEERD;
+                            // niet afbreken op injectie. Een echte peer-exit wordt door
+                            // de dode-peer-detectie opgevangen. (De geobfusceerde,
+                            // geauthenticeerde Close hierboven breekt wél af.)
+                            FrameType::Close => warn!(
+                                "cleartext Close genegeerd (obf uit = ongeauthenticeerd); \
+                                 tunnel blijft staan"
+                            ),
                             FrameType::Padding => {}
                         }
                     }

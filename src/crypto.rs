@@ -17,6 +17,15 @@ pub trait Authenticator: Send + Sync {
     fn verify(&self, transcript_hash: &[u8; 32], signature: &[u8]) -> Result<()>;
     fn signature_len(&self) -> usize;
     fn scheme(&self) -> &'static str;
+
+    /// Een SYMMETRISCHE binding aan de identiteiten van beide partijen (eigen +
+    /// peer, byte-lexicografisch gesorteerd zodat initiator en responder dezelfde
+    /// waarde afleiden). Wordt in het transcript geabsorbeerd (L-6) zodat de
+    /// handtekeningen niet alleen de ephemeral sleutels binden maar ook WIE er
+    /// tekent — dat sluit unknown-key-share af. Mag leeg zijn voor een leg die
+    /// geen symmetrische binding kan leveren (bv. ML-DSA, dat de eigen pub niet
+    /// bewaart); een andere leg draagt de binding dan.
+    fn identity_binding(&self) -> Vec<u8>;
 }
 
 // ── Ed25519 via ring ─────────────────────────────────────────────────────────
@@ -77,6 +86,22 @@ impl Authenticator for Ed25519Auth {
     }
     fn scheme(&self) -> &'static str {
         "ed25519"
+    }
+
+    fn identity_binding(&self) -> Vec<u8> {
+        // Sorteer eigen + peer Ed25519-pubkey zodat beide kanten dezelfde binding
+        // afleiden (symmetrisch: initiator en responder hebben own/peer omgekeerd).
+        let own: &[u8] = self.public_key();
+        let peer: &[u8] = &self.peer_pub;
+        let (lo, hi) = if own <= peer {
+            (own, peer)
+        } else {
+            (peer, own)
+        };
+        let mut v = Vec::with_capacity(ED25519_PUB_LEN * 2);
+        v.extend_from_slice(lo);
+        v.extend_from_slice(hi);
+        v
     }
 }
 
@@ -151,6 +176,14 @@ impl Authenticator for MlDsaAuth {
     fn scheme(&self) -> &'static str {
         "ml-dsa-65"
     }
+
+    fn identity_binding(&self) -> Vec<u8> {
+        // ML-DSA bewaart alleen de eigen SECRET key (de config levert geen eigen
+        // pub, en pqcrypto leidt 'm niet uit de secret af), dus deze leg kan geen
+        // symmetrische binding leveren. De Ed25519-leg draagt de identiteitsbinding;
+        // beide identiteiten zijn hoe dan ook gepind en worden geverifieerd.
+        Vec::new()
+    }
 }
 
 // ── HybridAuth: combineert N legs, eist dat ALLE valideren ───────────────────
@@ -199,6 +232,16 @@ impl Authenticator for HybridAuth {
     }
     fn scheme(&self) -> &'static str {
         "hybrid"
+    }
+
+    fn identity_binding(&self) -> Vec<u8> {
+        // Concateneer de bindingen van alle legs (in vaste volgorde). In de
+        // praktijk draagt de Ed25519-leg de binding en levert ML-DSA een lege.
+        let mut v = Vec::new();
+        for leg in &self.legs {
+            v.extend_from_slice(&leg.identity_binding());
+        }
+        v
     }
 }
 

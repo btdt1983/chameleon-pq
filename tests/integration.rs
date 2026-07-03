@@ -113,10 +113,13 @@ fn wrong_peer_identity_fails_auth() {
         "MITM responder had moeten falen bij finalize"
     );
 
-    // Scenario 2: de INITIATOR is niet wie de responder verwacht.
-    // De sleutels kloppen zo dat de initiator de responder WEL accepteert,
-    // maar de responder verwacht een andere initiator-identiteit -> de Confirm
-    // moet falen. Dit is precies wat wederzijdse auth toevoegt.
+    // Scenario 2: de INITIATOR is niet wie de responder verwacht. Sinds L-6
+    // absorbeert het transcript de identiteiten van BEIDE kanten, dus de
+    // responder mengt zijn (verkeerde) verwachting van de initiator erin: de
+    // transcripts divergeren en de initiator faalt al bij finalize (nog vóór de
+    // Confirm). Een identiteits-mismatch aan ELKE kant laat de handshake dus
+    // schoon falen. (De Confirm-laag zelf — dat een ongeldig initiator-bewijs
+    // wordt afgewezen — wordt door de reflectie-test gedekt.)
     let init_real_seed = [3u8; 32];
     let resp_real_seed = [4u8; 32];
     let resp_real_pub = Ed25519Auth::derive_public(&resp_real_seed);
@@ -126,16 +129,10 @@ fn wrong_peer_identity_fails_auth() {
     let resp_wrong_expect = Ed25519Auth::new(&resp_real_seed, [0x77u8; 32]).unwrap();
 
     let (hs_init2, init_wire2) = Handshake::start(&init_ok).unwrap();
-    let (hs_resp2, resp_wire2) = Handshake::respond(init_wire2, 1, &resp_wrong_expect).unwrap();
-    // De initiator accepteert de responder (die identiteit klopt) en bouwt Confirm.
-    let (_hs_init_done2, confirm_wire2) = hs_init2
-        .finalize(resp_wire2, 1, &init_ok)
-        .expect("initiator accepteert correcte responder");
-    // Maar de responder verwacht een andere initiator -> confirm moet falen.
-    let confirm_result = hs_resp2.confirm(confirm_wire2, &resp_wrong_expect);
+    let (_hs_resp2, resp_wire2) = Handshake::respond(init_wire2, 1, &resp_wrong_expect).unwrap();
     assert!(
-        confirm_result.is_err(),
-        "MITM initiator had moeten falen bij confirm (wederzijdse auth)"
+        hs_init2.finalize(resp_wire2, 1, &init_ok).is_err(),
+        "verkeerde initiator-verwachting poison't het transcript -> finalize faalt (L-6)"
     );
 }
 
@@ -1441,4 +1438,53 @@ async fn handshake_initiator_times_out_without_responder() {
         "handshake moet bounded falen, niet oneindig hangen"
     );
     drop(dead);
+}
+
+// ── L-6: identiteiten gebonden in het transcript ─────────────────────────────
+
+#[test]
+fn identity_binding_is_symmetric_and_peer_dependent() {
+    use chameleon::crypto::Authenticator;
+    let i = [1u8; 32];
+    let r = [9u8; 32];
+    let x = [5u8; 32];
+    let i_pub = Ed25519Auth::derive_public(&i);
+    let r_pub = Ed25519Auth::derive_public(&r);
+    let x_pub = Ed25519Auth::derive_public(&x);
+
+    let init = Ed25519Auth::new(&i, r_pub).unwrap(); // own I, peer R
+    let resp = Ed25519Auth::new(&r, i_pub).unwrap(); // own R, peer I
+                                                     // Beide kanten leiden dezelfde binding af — noodzakelijk voor een geldige
+                                                     // handshake (anders divergeren de transcripts).
+    assert_eq!(
+        init.identity_binding(),
+        resp.identity_binding(),
+        "identity_binding moet symmetrisch zijn (own/peer omgewisseld)"
+    );
+    // Een andere peer -> een andere binding (de binding hangt van beide af).
+    let init_to_x = Ed25519Auth::new(&i, x_pub).unwrap();
+    assert_ne!(
+        init.identity_binding(),
+        init_to_x.identity_binding(),
+        "een andere peer moet een andere binding geven"
+    );
+}
+
+// ── L-9: low-order / all-zero X25519 wordt geweigerd ─────────────────────────
+
+#[test]
+fn respond_rejects_low_order_x25519_point() {
+    let init_auth = Ed25519Auth::new(&[1u8; 32], Ed25519Auth::derive_public(&[9u8; 32])).unwrap();
+    let resp_auth = Ed25519Auth::new(&[9u8; 32], Ed25519Auth::derive_public(&[1u8; 32])).unwrap();
+
+    let (_hs, init_wire) = Handshake::start(&init_auth).unwrap();
+    let mut init_msg = HandshakeMessage::decode(init_wire).unwrap();
+    // All-zero = de X25519 identity (een low-order punt): de DH-uitkomst is 0.
+    init_msg.x25519_pub = [0u8; 32];
+    let tampered = init_msg.encode().unwrap();
+
+    assert!(
+        Handshake::respond(tampered, 1, &resp_auth).is_err(),
+        "low-order/all-zero X25519-punt moet worden geweigerd (L-9)"
+    );
 }

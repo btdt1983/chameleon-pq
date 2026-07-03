@@ -24,10 +24,13 @@ pub const HANDSHAKE_MSG_LEN: usize = 8192;
 // v3: naast het geobfusceerde datapad (v2, obf.rs) is nu ook de HANDSHAKE-
 // envelope geobfusceerd (hsobf.rs, statische-sleutel wrap-then-fragment).
 // v4: de twee transcript-handtekeningen zijn ROL-gebonden (SIG_LABEL_*), zodat
-// responder en initiator niet langer over identieke bytes tekenen (L-5). Dat
-// verandert de handshake-auth; de versie-bump laat een peer met een oudere
-// handshake meteen schoon falen i.p.v. met een verwarrende MAC-fout.
-pub const PROTO_VERSION: u8 = 4;
+// responder en initiator niet langer over identieke bytes tekenen (L-5).
+// v5: het transcript absorbeert nu ook de IDENTITEITEN van beide partijen
+// (auth.identity_binding(), L-6), zodat de handtekeningen binden wie er tekent
+// (unknown-key-share-afweer). Elke versie-bump verandert de handshake-auth; een
+// peer met een oudere handshake faalt daardoor meteen schoon i.p.v. met een
+// verwarrende MAC-fout.
+pub const PROTO_VERSION: u8 = 5;
 
 /// Rol-labels voor de domeinscheiding van de transcript-handtekeningen (L-5):
 /// de responder tekent de Response, de initiator de Confirm — nooit over
@@ -434,6 +437,8 @@ impl Handshake {
             AeadAlgo::preferred().as_u8(),
         )?;
         let mut transcript = Transcript::new();
+        // L-6: bind de identiteiten (eigen + peer, symmetrisch) vóór de rest.
+        transcript.absorb(&auth.identity_binding());
         transcript.absorb(&msg.transcript_bytes());
         let wire = msg.encode()?;
         Ok((
@@ -464,6 +469,8 @@ impl Handshake {
         })?;
 
         let mut transcript = Transcript::new();
+        // L-6: bind de identiteiten (eigen + peer, symmetrisch) vóór de rest.
+        transcript.absorb(&auth.identity_binding());
         transcript.absorb(&init.transcript_bytes());
 
         // Onderhandel de cipher: initiator-voorstel vs. onze eigen voorkeur.
@@ -476,6 +483,14 @@ impl Handshake {
         let x_pub = XPub::from(&eph_x);
         let peer_x = XPub::from(init.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
+        // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
+        // Gemitigeerd door de hybride Kyber-leg, maar we falen hier expliciet.
+        if x_ss.as_bytes().iter().all(|&b| b == 0) {
+            return Err(ChameleonError::Handshake {
+                state: "respond".into(),
+                msg: "X25519 shared secret is all-zero (low-order/non-contributory point)".into(),
+            });
+        }
         let shared = derive_shared(x_ss.as_bytes(), kyber_ss.as_bytes());
 
         let mut resp = HandshakeMessage::new_response(
@@ -544,6 +559,13 @@ impl Handshake {
         let kyber_ss = kyber768::decapsulate(&ct, &eph_kyber_sk);
         let peer_x = XPub::from(resp.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
+        // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
+        if x_ss.as_bytes().iter().all(|&b| b == 0) {
+            return Err(ChameleonError::Handshake {
+                state: "finalize".into(),
+                msg: "X25519 shared secret is all-zero (low-order/non-contributory point)".into(),
+            });
+        }
         let shared = derive_shared(x_ss.as_bytes(), kyber_ss.as_bytes());
 
         transcript.absorb(&resp.transcript_bytes());
