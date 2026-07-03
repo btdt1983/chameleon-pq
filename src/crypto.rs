@@ -275,11 +275,11 @@ impl Default for Transcript {
 
 // ── Key derivation ───────────────────────────────────────────────────────────
 
-pub fn derive_shared(x_ss: &[u8], kyber_ss: &[u8]) -> Zeroizing<[u8; 32]> {
+pub fn derive_shared(x_ss: &[u8], mlkem_ss: &[u8]) -> Zeroizing<[u8; 32]> {
     use hkdf::Hkdf;
     let mut ikm = Zeroizing::new(Vec::new());
     ikm.extend_from_slice(x_ss);
-    ikm.extend_from_slice(kyber_ss);
+    ikm.extend_from_slice(mlkem_ss);
     let hk = Hkdf::<Sha256>::new(Some(b"Chameleon-PQ-v1-salt"), &ikm);
     let mut okm = Zeroizing::new([0u8; 32]);
     hk.expand(b"chameleon-pq hybrid session key", okm.as_mut())
@@ -297,6 +297,19 @@ pub fn role_bound_hash(label: &[u8], transcript_hash: &[u8; 32]) -> [u8; 32] {
     h.update(label);
     h.update(transcript_hash);
     h.finalize().into()
+}
+
+/// Leid een GEDEELD session_id af uit het gedeelde geheim (I-13). Beide kanten
+/// hebben na de handshake hetzelfde `shared` en komen dus op hetzelfde id uit —
+/// geen proces-globale teller meer die kan desyncen. Vers per handshake
+/// (ephemeral shared), dus uniek over rekeys. Niet-geheim: puur een demux-tag,
+/// net als WireGuards receiver-index; de veiligheid is de AEAD-tag.
+pub fn derive_session_id(shared: &[u8; 32]) -> u32 {
+    let mut h = Sha256::new();
+    h.update(b"Chameleon-PQ-v1 session-id");
+    h.update(shared);
+    let d = h.finalize();
+    u32::from_le_bytes([d[0], d[1], d[2], d[3]])
 }
 
 pub fn mac_key_from(shared: &[u8; 32]) -> [u8; 32] {

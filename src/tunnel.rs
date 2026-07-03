@@ -3,11 +3,13 @@
 //! transcript-ondertekening (Ed25519 via de Authenticator-trait).
 
 use crate::aead::AeadAlgo;
-use crate::crypto::{derive_shared, mac_key_from, role_bound_hash, Authenticator, Transcript};
+use crate::crypto::{
+    derive_session_id, derive_shared, mac_key_from, role_bound_hash, Authenticator, Transcript,
+};
 use crate::error::{ChameleonError, Result};
 use crate::session::Session;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use pqcrypto_kyber::kyber768;
+use pqcrypto_mlkem::mlkem768;
 use pqcrypto_traits::kem::{Ciphertext, PublicKey, SharedSecret};
 use rand::RngCore;
 use ring::hmac;
@@ -15,7 +17,7 @@ use std::collections::HashMap;
 use x25519_dalek::{EphemeralSecret, PublicKey as XPub};
 
 // Vaste berichtgrootte, ruim genoeg voor de HYBRIDE handtekening
-// (Ed25519 64 B + ML-DSA-65 3309 B = 3373 B) bovenop de Kyber-pubkey/ct in het
+// (Ed25519 64 B + ML-DSA-65 3309 B = 3373 B) bovenop de ML-KEM-pubkey/ct in het
 // KEM-slot. Init/Response/Confirm zijn allemaal even groot en met ruis gepad,
 // zodat de berichtgrootte niets over het type of het gekozen auth-schema
 // verraadt. Post-quantum sleutels zijn nu eenmaal groot; een handshake is een
@@ -27,10 +29,13 @@ pub const HANDSHAKE_MSG_LEN: usize = 8192;
 // responder en initiator niet langer over identieke bytes tekenen (L-5).
 // v5: het transcript absorbeert nu ook de IDENTITEITEN van beide partijen
 // (auth.identity_binding(), L-6), zodat de handtekeningen binden wie er tekent
-// (unknown-key-share-afweer). Elke versie-bump verandert de handshake-auth; een
+// (unknown-key-share-afweer).
+// v6: de KEM is nu FIPS 203 ML-KEM-768 (pqcrypto-mlkem) i.p.v. het pre-standaard
+// Kyber768 (I-11). Zelfde key/ct-groottes (1184/1088) maar een ander algoritme,
+// dus niet interoperabel met v5. Elke versie-bump verandert de handshake; een
 // peer met een oudere handshake faalt daardoor meteen schoon i.p.v. met een
 // verwarrende MAC-fout.
-pub const PROTO_VERSION: u8 = 5;
+pub const PROTO_VERSION: u8 = 6;
 
 /// Rol-labels voor de domeinscheiding van de transcript-handtekeningen (L-5):
 /// de responder tekent de Response, de initiator de Confirm — nooit over
@@ -46,9 +51,9 @@ const SIG_LABEL_INITIATOR: &[u8] = b"Chameleon-PQ-v1 initiator proof";
 const MAX_PENDING_MSGS: usize = 64;
 
 const X25519_PUB_LEN: usize = 32;
-const KYBER_PK_LEN: usize = 1184;
-const KYBER_CT_LEN: usize = 1088;
-const KEM_SLOT_LEN: usize = KYBER_PK_LEN; // grootste van pub/ct
+const MLKEM_PK_LEN: usize = 1184;
+const MLKEM_CT_LEN: usize = 1088;
+const KEM_SLOT_LEN: usize = MLKEM_PK_LEN; // grootste van pub/ct
 const MAC_LEN: usize = 32;
 
 const FRAG_PAYLOAD: usize = 1024;
@@ -220,18 +225,18 @@ impl HandshakeMessage {
 
     pub fn new_init(
         x25519_pub: [u8; X25519_PUB_LEN],
-        kyber_pub: &[u8],
+        mlkem_pub: &[u8],
         sig_len: usize,
         aead_algo: u8,
     ) -> Result<Self> {
-        if kyber_pub.len() != KYBER_PK_LEN {
+        if mlkem_pub.len() != MLKEM_PK_LEN {
             return Err(ChameleonError::Handshake {
                 state: "encode".into(),
-                msg: "bad kyber pub len".into(),
+                msg: "bad ML-KEM pub len".into(),
             });
         }
         let mut kem = [0u8; KEM_SLOT_LEN];
-        kem.copy_from_slice(kyber_pub);
+        kem.copy_from_slice(mlkem_pub);
         let mut sig = vec![0u8; sig_len];
         Self::fill_noise(&mut sig);
         let mut mac = [0u8; MAC_LEN];
@@ -249,19 +254,19 @@ impl HandshakeMessage {
 
     pub fn new_response(
         x25519_pub: [u8; X25519_PUB_LEN],
-        kyber_ct: &[u8],
+        mlkem_ct: &[u8],
         sig_len: usize,
         aead_algo: u8,
     ) -> Result<Self> {
-        if kyber_ct.len() != KYBER_CT_LEN {
+        if mlkem_ct.len() != MLKEM_CT_LEN {
             return Err(ChameleonError::Handshake {
                 state: "encode".into(),
-                msg: "bad kyber ct len".into(),
+                msg: "bad ML-KEM ct len".into(),
             });
         }
         let mut kem = [0u8; KEM_SLOT_LEN];
-        kem[..KYBER_CT_LEN].copy_from_slice(kyber_ct);
-        Self::fill_noise(&mut kem[KYBER_CT_LEN..]);
+        kem[..MLKEM_CT_LEN].copy_from_slice(mlkem_ct);
+        Self::fill_noise(&mut kem[MLKEM_CT_LEN..]);
         Ok(Self {
             version: PROTO_VERSION,
             msg_type: HandshakeType::Response,
@@ -273,11 +278,11 @@ impl HandshakeMessage {
         })
     }
 
-    pub fn kyber_pub(&self) -> &[u8] {
-        &self.kem[..KYBER_PK_LEN]
+    pub fn mlkem_pub(&self) -> &[u8] {
+        &self.kem[..MLKEM_PK_LEN]
     }
-    pub fn kyber_ct(&self) -> &[u8] {
-        &self.kem[..KYBER_CT_LEN]
+    pub fn mlkem_ct(&self) -> &[u8] {
+        &self.kem[..MLKEM_CT_LEN]
     }
 
     /// Confirm-bericht: draagt alleen de initiator-handtekening (+ MAC).
@@ -373,11 +378,11 @@ impl HandshakeMessage {
         match self.msg_type {
             HandshakeType::Init => {
                 b.put_u8(self.aead_algo); // bind voorgestelde cipher
-                b.put_slice(self.kyber_pub());
+                b.put_slice(self.mlkem_pub());
             }
             HandshakeType::Response => {
                 b.put_u8(self.aead_algo); // bind onderhandelde cipher
-                b.put_slice(self.kyber_ct());
+                b.put_slice(self.mlkem_ct());
             }
             // Confirm voegt geen sleutelmateriaal toe: het transcript is na
             // de Response bevroren, en Confirm ondertekent juist dat transcript.
@@ -406,9 +411,9 @@ pub enum Handshake {
     /// Initiator: init verstuurd, wacht op response.
     SentInit {
         eph_x: EphemeralSecret,
-        // Geboxed: de Kyber-secret-key is ~2.4 KB; los gehouden zou hij elke
+        // Geboxed: de ML-KEM-secret-key is ~2.4 KB; los gehouden zou hij elke
         // Handshake-variant (en dus elke move) onnodig groot maken.
-        eph_kyber_sk: Box<kyber768::SecretKey>,
+        eph_mlkem_sk: Box<mlkem768::SecretKey>,
         transcript: Transcript,
     },
     /// Responder: response verstuurd, wacht op confirm. Houdt de (nog niet
@@ -428,11 +433,11 @@ impl Handshake {
     pub fn start(auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
         let eph_x = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let x_pub = XPub::from(&eph_x);
-        let (eph_kyber_pk, eph_kyber_sk) = kyber768::keypair();
+        let (eph_mlkem_pk, eph_mlkem_sk) = mlkem768::keypair();
 
         let msg = HandshakeMessage::new_init(
             x_pub.to_bytes(),
-            eph_kyber_pk.as_bytes(),
+            eph_mlkem_pk.as_bytes(),
             auth.signature_len(),
             AeadAlgo::preferred().as_u8(),
         )?;
@@ -444,7 +449,7 @@ impl Handshake {
         Ok((
             Handshake::SentInit {
                 eph_x,
-                eph_kyber_sk: Box::new(eph_kyber_sk),
+                eph_mlkem_sk: Box::new(eph_mlkem_sk),
                 transcript,
             },
             wire,
@@ -453,7 +458,7 @@ impl Handshake {
 
     /// RESPONDER stap 1: verwerk Init, bouw Response. Gaat naar SentResponse
     /// (nog NIET Established — de initiator moet zich eerst bewijzen).
-    pub fn respond(raw: Bytes, session_id: u32, auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
+    pub fn respond(raw: Bytes, auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
         let init = HandshakeMessage::decode(raw)?;
         if init.msg_type != HandshakeType::Init {
             return Err(ChameleonError::Handshake {
@@ -461,10 +466,10 @@ impl Handshake {
                 msg: "expected Init".into(),
             });
         }
-        let peer_kyber_pk = kyber768::PublicKey::from_bytes(init.kyber_pub()).map_err(|_| {
+        let peer_mlkem_pk = mlkem768::PublicKey::from_bytes(init.mlkem_pub()).map_err(|_| {
             ChameleonError::Handshake {
                 state: "respond".into(),
-                msg: "kem slot is not a valid Kyber public key".into(),
+                msg: "kem slot is not a valid ML-KEM public key".into(),
             }
         })?;
 
@@ -478,24 +483,24 @@ impl Handshake {
         let peer_pref = AeadAlgo::from_u8(init.aead_algo).unwrap_or(AeadAlgo::ChaCha20Poly1305);
         let chosen = AeadAlgo::negotiate(AeadAlgo::preferred(), peer_pref);
 
-        let (kyber_ss, kyber_ct) = kyber768::encapsulate(&peer_kyber_pk);
+        let (mlkem_ss, mlkem_ct) = mlkem768::encapsulate(&peer_mlkem_pk);
         let eph_x = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let x_pub = XPub::from(&eph_x);
         let peer_x = XPub::from(init.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
         // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
-        // Gemitigeerd door de hybride Kyber-leg, maar we falen hier expliciet.
+        // Gemitigeerd door de hybride ML-KEM-leg, maar we falen hier expliciet.
         if x_ss.as_bytes().iter().all(|&b| b == 0) {
             return Err(ChameleonError::Handshake {
                 state: "respond".into(),
                 msg: "X25519 shared secret is all-zero (low-order/non-contributory point)".into(),
             });
         }
-        let shared = derive_shared(x_ss.as_bytes(), kyber_ss.as_bytes());
+        let shared = derive_shared(x_ss.as_bytes(), mlkem_ss.as_bytes());
 
         let mut resp = HandshakeMessage::new_response(
             x_pub.to_bytes(),
-            kyber_ct.as_bytes(),
+            mlkem_ct.as_bytes(),
             auth.signature_len(),
             chosen.as_u8(),
         )?;
@@ -509,6 +514,9 @@ impl Handshake {
         resp.mac.copy_from_slice(tag.as_ref());
 
         let wire = resp.encode()?;
+        // I-13: het session_id komt uit het gedeelde geheim; beide kanten leiden
+        // hetzelfde af, dus geen proces-globale teller die kan desyncen.
+        let session_id = derive_session_id(&shared);
         let session = Session::from_handshake_with_algo(session_id, shared, false, chosen)?;
         // Bewaar de transcript-hash zodat we straks de Confirm kunnen verifiëren.
         Ok((
@@ -524,18 +532,13 @@ impl Handshake {
     /// De initiator wordt Established (heeft de responder geauthenticeerd) EN
     /// produceert het Confirm-bericht dat hij terugstuurt zodat de responder
     /// óók de initiator kan authenticeren.
-    pub fn finalize(
-        self,
-        raw: Bytes,
-        session_id: u32,
-        auth: &dyn Authenticator,
-    ) -> Result<(Self, Bytes)> {
-        let (eph_x, eph_kyber_sk, mut transcript) = match self {
+    pub fn finalize(self, raw: Bytes, auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
+        let (eph_x, eph_mlkem_sk, mut transcript) = match self {
             Handshake::SentInit {
                 eph_x,
-                eph_kyber_sk,
+                eph_mlkem_sk,
                 transcript,
-            } => (eph_x, eph_kyber_sk, transcript),
+            } => (eph_x, eph_mlkem_sk, transcript),
             _ => {
                 return Err(ChameleonError::Handshake {
                     state: "finalize".into(),
@@ -550,13 +553,13 @@ impl Handshake {
                 msg: "expected Response".into(),
             });
         }
-        let ct = kyber768::Ciphertext::from_bytes(resp.kyber_ct()).map_err(|_| {
+        let ct = mlkem768::Ciphertext::from_bytes(resp.mlkem_ct()).map_err(|_| {
             ChameleonError::Handshake {
                 state: "finalize".into(),
-                msg: "kem slot is not a valid Kyber ciphertext".into(),
+                msg: "kem slot is not a valid ML-KEM ciphertext".into(),
             }
         })?;
-        let kyber_ss = kyber768::decapsulate(&ct, &eph_kyber_sk);
+        let mlkem_ss = mlkem768::decapsulate(&ct, &eph_mlkem_sk);
         let peer_x = XPub::from(resp.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
         // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
@@ -566,7 +569,7 @@ impl Handshake {
                 msg: "X25519 shared secret is all-zero (low-order/non-contributory point)".into(),
             });
         }
-        let shared = derive_shared(x_ss.as_bytes(), kyber_ss.as_bytes());
+        let shared = derive_shared(x_ss.as_bytes(), mlkem_ss.as_bytes());
 
         transcript.absorb(&resp.transcript_bytes());
         let th = transcript.hash();
@@ -592,6 +595,8 @@ impl Handshake {
         // Response. Die keuze zit in het transcript, dus als een aanvaller 'm
         // had veranderd faalt de MAC-verificatie hierboven al.
         let chosen = AeadAlgo::from_u8(resp.aead_algo)?;
+        // I-13: hetzelfde afgeleide session_id als de responder (uit `shared`).
+        let session_id = derive_session_id(&shared);
         let session = Session::from_handshake_with_algo(session_id, shared, true, chosen)?;
         Ok((Handshake::Established { session }, wire))
     }

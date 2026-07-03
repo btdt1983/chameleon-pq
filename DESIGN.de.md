@@ -44,7 +44,7 @@ Handshakes hinaus sowie Schutz gegen einen kompromittierten Endpunkt.
 
 ## 2. Hybrider Post-Quanten-Schlüsselaustausch
 
-**Entscheidung:** X25519 (klassisches ECDH) mit Kyber768 (Post-Quanten-KEM)
+**Entscheidung:** X25519 (klassisches ECDH) mit ML-KEM-768 (Post-Quanten-KEM)
 kombinieren, beide ephemer, und den Sessionschlüssel aus *beiden* gemeinsamen
 Geheimnissen ableiten, verkettet über HKDF.
 
@@ -52,8 +52,8 @@ Geheimnissen ableiten, verkettet über HKDF.
 sind jung. Ihre mathematischen Annahmen haben weit weniger Jahre der Prüfung
 hinter sich als klassisches ECDH. Durch die Kombination beider bleibt die
 Session sicher, solange *einer* der beiden Teile hält. Ein Bruch allein von
-Kyber bricht die Session nicht (X25519 schützt sie weiterhin); ein
-Quantencomputer, der X25519 bricht, bricht die Session nicht (Kyber schützt
+ML-KEM bricht die Session nicht (X25519 schützt sie weiterhin); ein
+Quantencomputer, der X25519 bricht, bricht die Session nicht (ML-KEM schützt
 sie weiterhin). Verwundbar ist man nur, wenn beide gleichzeitig fallen. Das
 ist eindeutig sicherer, als auf einen allein zu setzen.
 
@@ -108,7 +108,7 @@ ist eine Struktur, die den Trait implementiert, neben `Ed25519Auth` in
 für die Folge bezüglich der Nachrichtengröße, die nun eingetreten ist.)
 
 **Warum gerade ML-DSA-65:** Es zielt auf die ~192-Bit-Kategorie (NIST
-Level 3), die übliche mittlere Wahl, passend zum Niveau von Kyber768 im KEM.
+Level 3), die übliche mittlere Wahl, passend zum Niveau von ML-KEM-768 im KEM.
 Schlüssel und Signaturen sind groß (öffentlicher Schlüssel ~1952 B, Signatur
 ~3309 B), was genau der Grund ist, weshalb der Handshake wachsen musste (§9).
 ML-DSA-Schlüssel sind nicht aus einem kurzen Seed ableitbar, daher gibt
@@ -184,7 +184,7 @@ des monotonen Zählers (§5) für beide gilt.
 Quantenresistenz hinzu. Symmetrische Chiffren mit 256-Bit-Schlüsseln (sowohl
 ChaCha20-Poly1305 als auch AEGIS-256) behalten gegenüber Grovers Algorithmus
 bereits ~128 Bit Stärke. Der Post-Quanten-Schutz liegt vollständig im
-Kyber-Schlüsselaustausch (§2), unabhängig davon, welches AEAD gewählt wird.
+ML-KEM-Schlüsselaustausch (§2), unabhängig davon, welches AEAD gewählt wird.
 AEGIS bringt Geschwindigkeit und ein stärkeres AEAD, nicht zusätzliche
 Quantensicherheit.
 
@@ -280,14 +280,14 @@ einen Channel gespeist wird, wird die Race Condition beseitigt.
 
 **Entscheidung:** Handshake-Nachrichten sind feste 8192 Byte, aufgefüllt mit
 kryptografisch zufälligem Rauschen, mit einem einzigen KEM-Slot, der den
-öffentlichen Kyber-Schlüssel (Init) oder den Chiffretext (Response) trägt.
+öffentlichen ML-KEM-Schlüssel (Init) oder den Chiffretext (Response) trägt.
 Der Datenpfad verwendet einen separaten, MTU-sicheren Frame (<1280 B).
 Handshake-Nachrichten werden für den Transport fragmentiert; der Datenpfad
 nicht.
 
 **Warum 8192 und nicht 2048:** Die ursprünglichen 2048 fassten nur die
 Ed25519-Signatur (64 B). Die hybride Signatur ist Ed25519 (64 B) + ML-DSA-65
-(3309 B) = 3373 B, was zusammen mit dem öffentlichen Kyber-Schlüssel im
+(3309 B) = 3373 B, was zusammen mit dem öffentlichen ML-KEM-Schlüssel im
 KEM-Slot 2048 überschreitet. 8192 lässt bequemen Spielraum und hält
 Init/Response/Confirm alle gleich groß, unabhängig davon, welches
 Signaturverfahren genutzt wird – so verrät die Nachrichtengröße weder den
@@ -300,16 +300,16 @@ und der aufgefüllte Schwanz keine erkennbare Struktur hat. Dies ist ein
 erster Schritt, um den Handshake schwer per Fingerprinting erkennbar zu
 machen.
 
-**Warum ein einzelner gemeinsamer KEM-Slot:** Der öffentliche Kyber-Schlüssel
+**Warum ein einzelner gemeinsamer KEM-Slot:** Der öffentliche ML-KEM-Schlüssel
 (1184 B) und der Chiffretext (1088 B) unterscheiden sich in der Größe. Einen
 einzigen Slot fester Größe für beide zu verwenden, mit dem ungenutzten
 Schwanz voller Rauschen, hält das Wire-Layout in der Form zwischen den beiden
 Nachrichtentypen identisch. Phasenvalidierung (ist dies ein gültiger
-öffentlicher Kyber-Schlüssel / Chiffretext?) plus der Transcript-MAC stellen
+öffentlicher ML-KEM-Schlüssel / Chiffretext?) plus der Transcript-MAC stellen
 sicher, dass ein Rauschfeld nie mit echten Daten verwechselt wird.
 
 **Warum die Handshake-Größe Fragmentierung erzwingt:**
-Post-Quanten-Schlüssel sind groß. Man kann einen Kyber-tragenden Handshake
+Post-Quanten-Schlüssel sind groß. Man kann einen ML-KEM-tragenden Handshake
 nicht in ein einzelnes MTU-sicheres Datagramm packen – das ist der PQ-Krypto
 inhärent, kein Designfehler. Der Handshake ist ein einmaliges Ereignis pro
 Session, daher kosten dort einige Fragmente nichts Nennenswertes. Der
@@ -378,7 +378,7 @@ Rauschen ab) und führt dann das unveränderte `HandshakeMessage::decode` aus.
 
 **Warum das Verschleierung ist, keine zusätzliche Sicherheit:** Der statische
 Schlüssel gibt keine Forward Secrecy und keine echte Authentifizierung – die
-eigentliche Handshake-Sicherheit (ephemeres Kyber+X25519, Transcript-Signierung,
+eigentliche Handshake-Sicherheit (ephemeres ML-KEM+X25519, Transcript-Signierung,
 §2–§3) bleibt unberührt. Es ist eine reine äußere Hülle, deren einzige Aufgabe
 das Löschen des Wire-Fingerabdrucks ist.
 
@@ -486,7 +486,7 @@ keine Lücke.
 ## 12. CPU vs. GPU, klar gesagt
 
 Fürs Protokoll, weil es kontraintuitiv ist: Die schwere, einmal pro
-Verbindung anfallende Mathematik (Kyber, die Signaturen) gehört auf die
+Verbindung anfallende Mathematik (ML-KEM, die Signaturen) gehört auf die
 **CPU**, nicht auf die GPU – es gibt kein Volumen, über das parallelisiert
 werden könnte. Die einfache, endlos wiederholte Mathematik (AEAD pro Paket)
 ist der *einzige* GPU-Kandidat, und selbst der gewinnt nur bei extremem
@@ -504,7 +504,7 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
    unbewiesen, bis es von qualifizierten Kryptografen geprüft wurde. Dies
    bleibt der wichtigste Vorbehalt und lässt sich nicht durch Code-Änderungen
    beheben.
-2. **Einzelnes PQ-KEM.** Der Schlüsselaustausch ist Kyber768 + X25519
+2. **Einzelnes PQ-KEM.** Der Schlüsselaustausch ist ML-KEM-768 + X25519
    (hybrid klassisch/PQ), kein Hybrid aus zwei unabhängigen PQ-KEMs.
 3. **Teilweise Verkehrsanalyse-Resistenz.** Der Datenpfad, die Handshake-Hülle
    und (optional) das Paket-*Timing* sind nun verschleiert – zufällig aussehende

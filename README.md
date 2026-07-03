@@ -2,7 +2,7 @@
 
 *🇬🇧 English | [🇩🇪 Deutsch](README.de.md)*
 
-Experimental hybrid post-quantum VPN written in Rust. Combines Kyber768 (KEM)
+Experimental hybrid post-quantum VPN written in Rust. Combines ML-KEM-768 (KEM)
 with X25519 for key agreement and a hybrid Ed25519 + ML-DSA-65 (FIPS 204)
 signature for peer authentication, over UDP with a TUN interface on
 Linux/macOS/Windows.
@@ -31,11 +31,11 @@ Known scope limits:
   and the
   throughput ceiling
 - ML-DSA is integrated for authentication, but the key exchange still pairs
-  Kyber768 with X25519 (no second PQ KEM)
+  ML-KEM-768 with X25519 (no second PQ KEM)
 
 ## What works
 
-- Hybrid post-quantum handshake (Kyber768 + X25519, both ephemeral → PFS)
+- Hybrid post-quantum handshake (ML-KEM-768 + X25519, both ephemeral → PFS)
 - Mutual authentication: 3-message (2-RTT) handshake where both peers sign
   the transcript; the responder withholds trust until the initiator's
   Confirm verifies
@@ -86,7 +86,7 @@ Known scope limits:
   path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
   on (default) the configured rate caps throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 74 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 75 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,

@@ -32,7 +32,7 @@ use zeroize::Zeroizing;
 #[command(
     name    = "chameleon-pq",
     version = env!("CARGO_PKG_VERSION"),
-    about   = "Hybrid post-quantum VPN (Kyber768 + X25519 + Ed25519)",
+    about   = "Hybrid post-quantum VPN (ML-KEM-768 + X25519 + Ed25519)",
 )]
 pub struct Cli {
     /// Pad naar config.toml

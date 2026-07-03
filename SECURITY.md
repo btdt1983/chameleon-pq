@@ -20,7 +20,7 @@ For non-security bugs, regular GitHub issues are welcome.
 
 - No external audit has been performed
 - Authentication is hybrid (Ed25519 + ML-DSA-65), but the key exchange is
-  Kyber768 + X25519 — a single PQ KEM, not a hybrid of two PQ KEMs
+  ML-KEM-768 + X25519 — a single PQ KEM, not a hybrid of two PQ KEMs
 - The data path, the handshake envelope, and (optionally) packet timing are
   obfuscated — random-looking datagrams, hidden sizes, and constant-rate cover
   traffic that hides bursts and idle-vs-active. But the tunnel's existence and

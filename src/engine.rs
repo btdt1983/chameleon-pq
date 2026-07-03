@@ -4,7 +4,7 @@
 //! constant-time en low-latency is. Er is BEWUST geen GPU-tak: per-pakket
 //! GPU-encryptie verliest het van de CPU omdat de upload/dispatch/read-back-
 //! latency de paar honderd nanoseconden AEAD-werk ruim overstijgt, en de
-//! zware once-per-connection wiskunde (Kyber, handtekeningen) heeft geen
+//! zware once-per-connection wiskunde (ML-KEM, handtekeningen) heeft geen
 //! volume om over te parallelliseren. Zie DESIGN.md §11–§12.
 //!
 //! De engine levert WIRE-KLARE datagrammen. Met obfuscatie aan (standaard) is

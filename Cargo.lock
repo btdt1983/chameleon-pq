@@ -150,7 +150,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chameleon-pq"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "aegis",
  "anyhow",
@@ -158,8 +158,8 @@ dependencies = [
  "clap",
  "hkdf",
  "parking_lot",
- "pqcrypto-kyber",
  "pqcrypto-mldsa",
+ "pqcrypto-mlkem",
  "pqcrypto-traits",
  "quinn-udp",
  "rand",
@@ -599,19 +599,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pqcrypto-kyber"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15c00293cf898859d0c771455388054fd69ab712263c73fdc7f287a39b1ba000"
-dependencies = [
- "cc",
- "glob",
- "libc",
- "pqcrypto-internals",
- "pqcrypto-traits",
-]
-
-[[package]]
 name = "pqcrypto-mldsa"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -621,6 +608,19 @@ dependencies = [
  "glob",
  "libc",
  "paste",
+ "pqcrypto-internals",
+ "pqcrypto-traits",
+]
+
+[[package]]
+name = "pqcrypto-mlkem"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb14d207f3749e8a59a026c22ceaa72d70fff931cfbf4c8d9b08f3fc56dc6e60"
+dependencies = [
+ "cc",
+ "glob",
+ "libc",
  "pqcrypto-internals",
  "pqcrypto-traits",
 ]
