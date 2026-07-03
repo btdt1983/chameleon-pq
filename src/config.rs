@@ -144,10 +144,24 @@ pub struct TunConfig {
     pub mtu: u16,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct EngineConfig {
     #[serde(default = "default_linger")]
     pub batch_linger_us: u64,
+    /// Aantal crypto-worker-threads voor parallelle seal/open (Fase C).
+    /// 0 = automatisch = alle logische cores. Verlaag om cores vrij te houden
+    /// voor de reactor/TUN. Alleen van invloed op het snelle (unpaced) pad.
+    #[serde(default)]
+    pub workers: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            batch_linger_us: default_linger(),
+            workers: 0,
+        }
+    }
 }
 
 // ── Obfuscatie (verkeersanalyse-weerstand op het datapad) ────────────────────

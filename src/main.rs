@@ -40,6 +40,10 @@ const MAX_BATCH: usize = 256;
 /// nieuwste TUN-pakket getaild-dropt (TCP herstelt); ongebonden bufferen zou de
 /// constante rate breken en latency opstapelen.
 const MAX_QUEUE: usize = 1024;
+/// Batch-drempel voor het parallelle crypto-pad (Fase C): onder deze grootte
+/// verzegelen/ontsleutelen we sequentieel om de spawn_blocking+rayon-overhead
+/// bij licht verkeer te vermijden.
+const PAR_THRESHOLD: usize = 16;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = AppConfig::load(&cli.config)?;
     let auth = build_auth(&cfg)?;
+    init_rayon_pool(&cfg);
 
     match &cli.command {
         Command::Server { bind } => {
@@ -129,6 +134,26 @@ fn build_engine(session: chameleon::session::Session, cfg: &AppConfig) -> Arc<Cr
     let mgr = Arc::new(SessionManager::new(session));
     let pad_policy: PadPolicy = cfg.obfuscation.padding.into();
     Arc::new(CryptoEngine::new(mgr, cfg.obfuscation.enabled, pad_policy))
+}
+
+/// Initialiseer de globale rayon-thread-pool voor parallelle crypto (Fase C).
+/// `workers = 0` => automatisch alle logische cores. Eenmalig per proces; een
+/// tweede aanroep (bv. rayon al lazily geïnitialiseerd) faalt stil.
+fn init_rayon_pool(cfg: &AppConfig) {
+    let workers = if cfg.engine.workers > 0 {
+        cfg.engine.workers
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    };
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build_global()
+    {
+        Ok(()) => info!("crypto worker pool: {workers} thread(s)"),
+        Err(e) => warn!("rayon pool already initialised ({e}); using existing"),
+    }
 }
 
 /// Leid de statische handshake-obfuscatiesleutel af uit de config (Fase 2).
@@ -371,9 +396,36 @@ async fn run_tunnel_loops(
                             .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
                             .collect();
 
-                    for (src, datagram) in datagrams {
-                        // 1) Geobfusceerd datapad EERST (data/keepalive/close).
-                        if let Ok((ft, plain)) = engine_in.sessions().decrypt_obf(&datagram) {
+                    // Ontsleutel de batch PARALLEL over alle cores bij voldoende
+                    // volume; bij een kleine batch sequentieel (vermijd overhead).
+                    // Alleen de datapad-decrypt is parallel; de (zeldzame)
+                    // handshake/rekey-demux blijft serieel op deze coördinator.
+                    let results: Vec<chameleon::engine::DecryptResult> = if datagrams.len()
+                        >= PAR_THRESHOLD
+                    {
+                        let engine = engine_in.clone();
+                        match tokio::task::spawn_blocking(move || engine.decrypt_batch_par(&datagrams))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("decrypt task join error: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        datagrams
+                            .into_iter()
+                            .map(|(src, dg)| {
+                                let r = engine_in.sessions().decrypt_obf(&dg);
+                                (src, dg, r)
+                            })
+                            .collect()
+                    };
+
+                    for (src, datagram, result) in results {
+                        // 1) Datapad (parallel ontsleuteld): direct afhandelen.
+                        if let Ok((ft, plain)) = result {
                             last_recv_in.store(now_secs(), Ordering::Relaxed);
                             match ft {
                                 FrameType::Data => {
@@ -388,8 +440,9 @@ async fn run_tunnel_loops(
                             continue;
                         }
 
-                        // 2) Handshake-obfuscatie AAN: alles wat geen data is, is een
-                        //    (rekey-)handshake-of-ruis; nooit cleartext-fallback.
+                        // Geen datapad → handshake-fragment of ruis: SERIEEL op de
+                        // coördinator (rekey-state blijft op één thread).
+                        // 2) Handshake-obfuscatie AAN.
                         if let Some(k) = hs_obf {
                             if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &datagram) {
                                 last_recv_in.store(now_secs(), Ordering::Relaxed);
@@ -538,7 +591,7 @@ async fn run_tunnel_loops(
 }
 
 async fn flush_outbound(
-    engine: &CryptoEngine,
+    engine: &Arc<CryptoEngine>,
     socket: &UdpSocket,
     state: &quinn_udp::UdpSocketState,
     pending: &mut Vec<OutboundPacket>,
@@ -546,7 +599,21 @@ async fn flush_outbound(
 ) {
     let batch = std::mem::take(pending);
     let count = batch.len();
-    match engine.encrypt_batch(batch) {
+    // Kleine batch: sequentieel (vermijd de spawn_blocking+rayon-overhead).
+    // Grote batch: verzegel PARALLEL over alle cores via één spawn_blocking-hop.
+    let sealed = if count < PAR_THRESHOLD {
+        engine.encrypt_batch(batch)
+    } else {
+        let engine = engine.clone();
+        match tokio::task::spawn_blocking(move || engine.encrypt_batch_par(batch)).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("seal task join error: {e}");
+                return;
+            }
+        }
+    };
+    match sealed {
         Ok(wires) => {
             // Verstuur gelijk-grote runs in zo min mogelijk syscalls (GSO waar
             // mogelijk). Onder Full is de hele batch één run → één GSO-call.

@@ -31,6 +31,10 @@ mtu     = 1200                  # MTU-veilig voor het geobf. datapad (max 1232);
 # 200 µs is veilig voor gaming; verhoog voor hogere throughput.
 # Het datapad draait volledig op de CPU (constant-time, low-latency).
 batch_linger_us = 200
+# Aantal crypto-worker-threads (parallelle seal/open over cores). 0 = auto = alle
+# cores. Alleen van invloed op het SNELLE pad (traffic.enabled = false); met
+# timing-shaping aan capt de rate de doorvoer, dus dan is dit niet de bottleneck.
+workers = 0
 
 [obfuscation]
 # Verkeersanalyse-weerstand op het DATApad (QUIC-stijl header-protection):

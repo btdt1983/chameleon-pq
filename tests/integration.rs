@@ -1174,3 +1174,160 @@ async fn bench_udp_gso() {
     );
     drain.abort();
 }
+
+// ── Parallelle crypto over cores (Fase C) ────────────────────────────────────
+
+use chameleon::engine::{CryptoEngine, OutboundPacket};
+use std::sync::Arc;
+
+fn obf_engine(shared: [u8; 32], is_initiator: bool, policy: PadPolicy) -> CryptoEngine {
+    let algo = AeadAlgo::ChaCha20Poly1305;
+    let mgr = Arc::new(SessionManager::new(obf_session(
+        1,
+        shared,
+        is_initiator,
+        algo,
+    )));
+    CryptoEngine::new(mgr, true, policy)
+}
+
+/// Parallel verzegelde pakketten moeten geldig zijn: unieke counters (geen
+/// nonce-botsing) en allemaal correct te ontsleutelen. (Byte-gelijkheid met de
+/// sequentiële variant kan NIET: parallelle counter-toewijzing is niet-
+/// deterministisch, en de padding is willekeurig — maar élk pakket opent.)
+#[test]
+fn encrypt_batch_par_produces_decryptable_packets() {
+    let shared = [0x80u8; 32];
+    let tx = obf_engine(shared, true, PadPolicy::Bucketed);
+    let rx = SessionManager::new(obf_session(1, shared, false, AeadAlgo::ChaCha20Poly1305));
+
+    let n = 500usize;
+    let batch: Vec<OutboundPacket> = (0..n)
+        .map(|i| OutboundPacket {
+            plaintext: Bytes::from(format!("packet {i}").into_bytes()),
+        })
+        .collect();
+    let wires = tx.encrypt_batch_par(batch).unwrap();
+    assert_eq!(wires.len(), n);
+
+    let mut recovered = std::collections::HashSet::new();
+    for w in &wires {
+        let (ft, plain) = rx.decrypt_obf(w).expect("parallel-verzegeld pakket opent");
+        assert_eq!(ft, FrameType::Data);
+        recovered.insert(plain.to_vec());
+    }
+    assert_eq!(
+        recovered.len(),
+        n,
+        "alle {n} unieke plaintexts teruggekregen"
+    );
+}
+
+/// `decrypt_batch_par` classificeert: geobfusceerde data → Ok(Data), ruis → Err
+/// (zodat de coördinator die als handshake/ruis serieel afhandelt).
+#[test]
+fn decrypt_batch_par_classifies_data_and_noise() {
+    let shared = [0x81u8; 32];
+    let tx = SessionManager::new(obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305));
+    let rx = obf_engine(shared, false, PadPolicy::Bucketed);
+    let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+    let mut datagrams: Vec<(std::net::SocketAddr, Bytes)> = (0..200)
+        .map(|i| {
+            let w = tx
+                .seal_obf(
+                    FrameType::Data as u8,
+                    format!("d{i}").as_bytes(),
+                    PadPolicy::Bucketed,
+                )
+                .unwrap();
+            (addr, w)
+        })
+        .collect();
+    // Eén ruis-datagram ertussen.
+    datagrams.push((addr, Bytes::from(vec![0xEEu8; 60])));
+
+    let results = rx.decrypt_batch_par(&datagrams);
+    assert_eq!(results.len(), 201);
+    let mut ok = 0;
+    let mut err = 0;
+    for (_src, _dg, r) in &results {
+        match r {
+            Ok((ft, _)) => {
+                assert_eq!(*ft, FrameType::Data);
+                ok += 1;
+            }
+            Err(_) => err += 1,
+        }
+    }
+    assert_eq!(ok, 200, "alle data geopend");
+    assert_eq!(err, 1, "ruis als Err geclassificeerd");
+}
+
+/// Micro-benchmark: parallelle vs sequentiële crypto-doorvoer + schaling.
+/// Draai met:  cargo test --release bench_crypto_parallel -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_crypto_parallel() {
+    use std::time::Instant;
+
+    let shared = [0x82u8; 32];
+    let n = 200_000usize;
+    let mk_batch = || -> Vec<OutboundPacket> {
+        (0..n)
+            .map(|_| OutboundPacket {
+                plaintext: Bytes::from(vec![0x5Au8; 1200]),
+            })
+            .collect()
+    };
+    let gbps = |dt: f64| n as f64 * 1200.0 * 8.0 / dt / 1e9;
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1);
+    println!("\n=== crypto parallel vs sequentieel ({n} x 1200 B, {cores} cores) ===");
+
+    // Seal.
+    let eng = obf_engine(shared, true, PadPolicy::Full);
+    let t = Instant::now();
+    let _ = eng.encrypt_batch(mk_batch()).unwrap();
+    let seq = t.elapsed().as_secs_f64();
+    let eng = obf_engine(shared, true, PadPolicy::Full);
+    let t = Instant::now();
+    let _ = eng.encrypt_batch_par(mk_batch()).unwrap();
+    let par = t.elapsed().as_secs_f64();
+    println!(
+        "  seal  seq {:.2} Gbit/s | par {:.2} Gbit/s  ({:.1}x)",
+        gbps(seq),
+        gbps(par),
+        seq / par
+    );
+
+    // Open (decrypt): seal M distinct, dan sequentieel vs parallel openen.
+    let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let txm = SessionManager::new(obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305));
+    let dg: Vec<(std::net::SocketAddr, Bytes)> = (0..n)
+        .map(|_| {
+            (
+                addr,
+                txm.seal_obf(FrameType::Data as u8, &[0x5Au8; 1200], PadPolicy::Full)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let rx_seq = SessionManager::new(obf_session(1, shared, false, AeadAlgo::ChaCha20Poly1305));
+    let t = Instant::now();
+    for (_a, w) in &dg {
+        let _ = rx_seq.decrypt_obf(w);
+    }
+    let oseq = t.elapsed().as_secs_f64();
+    let rx_par = obf_engine(shared, false, PadPolicy::Full);
+    let t = Instant::now();
+    let _ = rx_par.decrypt_batch_par(&dg);
+    let opar = t.elapsed().as_secs_f64();
+    println!(
+        "  open  seq {:.2} Gbit/s | par {:.2} Gbit/s  ({:.1}x)",
+        gbps(oseq),
+        gbps(opar),
+        oseq / opar
+    );
+}

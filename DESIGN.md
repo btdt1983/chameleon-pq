@@ -171,6 +171,55 @@ stronger AEAD, not extra quantum safety.
 
 ---
 
+## 4a. Throughput: auto-selected cipher, batched I/O, multi-core crypto
+
+None of the following changes the wire format or the crypto — they only
+remove the three ceilings that sit between the negotiated AEAD and real
+line rate. Each is measured, not assumed.
+
+1. **Cipher auto-select is a benchmark, not just a feature flag.** AES *NI*
+   capability detection (§4) is necessary but not sufficient: on a CPU with
+   AES-NI but narrow SIMD (e.g. Westmere, AES-NI without AVX) the `aegis`
+   crate's fast path does not kick in and AEGIS runs an order of magnitude
+   *slower* than ChaCha20. So `preferred()` runs a one-shot startup
+   micro-benchmark (seal a fixed buffer many times under each cipher) and
+   picks whichever is actually faster on this silicon, defaulting to
+   ChaCha20 when there is no AES-NI. The negotiation and transcript binding
+   above are unchanged — the benchmark only decides this node's
+   *preference*.
+2. **Batched UDP I/O (GSO/GRO).** The per-packet `sendto`/`recvmmsg` syscall
+   is the first wall: a microbench tops out near ~0.18 Mpps sending one
+   datagram at a time. `udp.rs` wraps `quinn-udp` to segment many datagrams
+   into one syscall with UDP GSO on send and coalesce with GRO on receive
+   (per-packet fallback on old kernels / non-Linux), lifting the send path to
+   ~9.6 Mpps. No wire change: GSO segments are ordinary datagrams on the wire.
+3. **Multi-core seal/open.** With the syscall wall gone the next ceiling is
+   the single-core AEAD (~2 Gbit/s obf seal/open) — the crypto ran in one
+   outbound and one inbound task. `engine.rs` now seals/opens a GSO/GRO batch
+   **in parallel across all cores** with rayon (`encrypt_batch_par` /
+   `decrypt_batch_par`), bridged from the async loops with `spawn_blocking`
+   (one hand-off per batch, amortised over 64–256 packets; a small-batch
+   threshold keeps light traffic on the sequential inline path). This is
+   safe with no change to the crypto: the tx counter is an `AtomicU64`
+   (`fetch_add` → a unique nonce per packet across threads, §5), `decrypt`
+   opens **lock-free** and only the cheap check/commit take the per-session
+   replay `Mutex`, and the 2048-entry window (§6) absorbs any
+   parallel-completion reorder. `Session`/`SessionManager` are `Send + Sync`,
+   so `Arc<SessionManager>` seals from N rayon workers directly. Measured
+   ~4.5× (seal) / ~13× (open) on a 12-thread box. Operators can cap the pool
+   with `[engine].workers` (0 = auto = all cores) to reserve cores for the
+   reactor/TUN.
+
+**Scope, stated plainly:** the parallel path only helps the *unpaced* fast
+path (`traffic.enabled = false`). With timing/cover shaping on (the default,
+§9a) the configured `rate_pps × burst` caps throughput on purpose, so the
+crypto is not the bound and the paced path stays single-threaded to keep its
+exact rate/burst/size guarantee. Raw speed and timing-analysis resistance are
+opposed dimensions; this design lets you choose, it does not pretend you get
+both at once.
+
+---
+
 ## 5. Nonce management
 
 **Decision:** each direction gets a 96-bit nonce built from a 4-byte
@@ -498,3 +547,10 @@ These are stated plainly so no one mistakes intent for proof:
   idle-vs-active. No wire/proto change; on by default in Adaptive mode. See §9a.
 - **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
   See §6.
+- **Batched UDP I/O.** GSO on send / GRO on receive via `quinn-udp`
+  (`udp.rs`), removing the per-packet syscall wall (~0.18 → ~9.6 Mpps on a
+  microbench). No wire change. See §4a.
+- **Multi-core crypto.** Batch seal/open now run in parallel across all cores
+  via rayon (`engine.rs`, `spawn_blocking`-bridged), ~4.5×/~13× on 12 threads,
+  capped by `[engine].workers`. Unpaced fast path only; no wire/crypto change.
+  See §4a.

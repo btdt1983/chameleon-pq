@@ -85,15 +85,17 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Teilstücke
 - Keepalive / Erkennung toter Peers
 - Plattformübergreifendes TUN: Linux, macOS, Windows (Wintun)
-- Performance: das Datenpfad-AEAD wird beim Start per Kurz-Benchmark
-  automatisch gewählt (AEGIS-256X2 wo es am schnellsten ist, sonst ChaCha20 —
-  z. B. wenn AEGIS auf Software-AES zurückfällt), und die UDP-I/O ist gebündelt
-  mit GSO beim Senden / GRO beim Empfangen (via `quinn-udp`, per-Paket-Fallback
-  auf alten Kernels / Nicht-Linux), sodass viele Datagramme pro Syscall gehen —
-  ein Microbench hebt den Sendepfad von ~0,18 auf ~9,6 Mpps. Keine
-  Wire-Änderung; das Single-Core-AEAD (~2 Gbit/s) ist dann die Grenze
-  (Multi-Threading ist Zukunftsarbeit)
-- 67 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- Performance (keine Wire-Änderung): das Datenpfad-AEAD wird beim Start per
+  Kurz-Benchmark automatisch gewählt (AEGIS-256X2 wo am schnellsten, sonst
+  ChaCha20 — z. B. wenn AEGIS auf Software-AES zurückfällt); die UDP-I/O ist
+  gebündelt mit GSO/GRO (via `quinn-udp`, Per-Paket-Fallback) — ein Microbench
+  hebt den Sendepfad von ~0,18 auf ~9,6 Mpps; und Seal/Open laufen PARALLEL über
+  alle Cores (rayon, `[engine].workers`), gemessen ~4,5× (seal) / ~13× (open) auf
+  einer 12-Thread-Maschine. Hinweis: der parallele Pfad hilft im **schnellen
+  Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
+  die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
+  gegensätzliche Dimensionen, zwischen denen man wählt
+- 69 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -102,7 +104,12 @@ Bekannte Einschränkungen des Geltungsbereichs:
   vorherige Session, Längen-Padding, leere Keepalives) und die verschleierte
   Handshake-Hülle (symmetrische Schlüsselableitung, Wrap-then-Fragment-Round-Trip
   mit Jitter, vollständiger gegenseitiger Handshake, Ablehnung falscher
-  Schlüssel/Rauschen, Reassembler-Cap + Prune) abdecken
+  Schlüssel/Rauschen, Reassembler-Cap + Prune), Timing-/Cover-Traffic (die
+  CBR-/Adaptive-/Cooldown-Logik des reinen Pacers, dass ein Cover-Paket als
+  `Padding` zurückkommt und unter `Full`-Padding gleich lang + Header-verschieden
+  ist) und parallele Krypto (parallel versiegelte Pakete entschlüsseln alle mit
+  eindeutigen Countern, und `decrypt_batch_par` trennt Daten von Rauschen)
+  abdecken
 
 ## Build
 
@@ -172,8 +179,10 @@ Unter Windows benötigen Sie zusätzlich `wintun.dll` von
   Timing-/Cover-Traffic-Shaping: `Pacer::next_emit` entscheidet pro Slot, ob ein
   echtes Paket, ein Cover-Paket oder nichts gesendet wird (`ShapeMode`
   CBR/Adaptive); die async-Schleife in `main.rs` treibt ihn an
-- `engine.rs` – CPU-Verschlüsselungs-Engine (konstantzeitfähig, geringe
-  Latenz; kein GPU-Pfad – siehe DESIGN.md §11–§12 zur Begründung)
+- `engine.rs` – CPU-Verschlüsselungs-Engine: Batch-Seal/Open, **parallel über
+  alle Cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`, aus den
+  async-Schleifen mit `spawn_blocking` überbrückt); konstantzeitfähig, geringe
+  Latenz, kein GPU-Pfad (siehe DESIGN.md §11–§12 zur Begründung)
 - `net.rs` – UDP-Schleifen; klare Ein-/Ausgangspunkte zur TUN-Schicht
 - `udp.rs` – gebündelte UDP-I/O (GSO beim Senden, GRO beim Empfangen) via
   `quinn-udp`, mit Per-Paket-Fallback auf älteren Kernels / Nicht-Linux; das
