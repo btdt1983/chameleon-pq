@@ -140,8 +140,8 @@ pub struct Session {
     replay: Mutex<ReplayWindow>,
     /// Per-richting header-protection sleutels voor de obfuscatie-laag (obf.rs).
     /// Los van de AEAD-sleutels, afgeleid uit hetzelfde shared secret met eigen
-    /// HKDF-labels. Als plain [u8;32] opgeslagen, net als de AEGIS-sleutel in
-    /// aead.rs (dezelfde hygiëne-afweging).
+    /// HKDF-labels. Opgeslagen als plain [u8;32] (ze gaan als &[u8;32] naar de
+    /// obf-laag) maar worden bij drop expliciet gewist — zie `impl Drop`.
     tx_obf_key: [u8; 32],
     rx_obf_key: [u8; 32],
 }
@@ -304,6 +304,18 @@ impl Session {
             // volgende kandidaat proberen; anders wordt het uiteindelijk gedropt.
             Err(_) => Ok(None),
         }
+    }
+}
+
+// Wis de obfuscatie-header-sleutels bij drop. De AEAD-sleutels zelf zitten in de
+// Box<dyn DirectionalAead> en worden daar gewist (ring / AegisDir::drop); de
+// afgeleide directional key-bytes zijn Zeroizing. Zo blijft geen enkele
+// sessie-sleutel na drop in het geheugen staan.
+impl Drop for Session {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.tx_obf_key.zeroize();
+        self.rx_obf_key.zeroize();
     }
 }
 
