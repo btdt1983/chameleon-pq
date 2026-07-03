@@ -62,18 +62,23 @@ impl AeadAlgo {
         }
     }
 
-    /// De voorkeurskeuze voor DEZE machine. AEGIS alleen als de CPU AES-
-    /// hardware heeft; anders de veilige, constant-time ChaCha20.
+    /// De voorkeurskeuze voor DEZE machine, EENMALIG bepaald en gecached.
+    ///
+    /// "Heeft AES-NI" bleek een te grove maat: op oudere AES-NI-CPU's zonder
+    /// brede SIMD (bv. Westmere) valt de `aegis`-crate terug op traag software-
+    /// AES en is AEGIS wél 30× LANGZAMER dan ChaCha (die via `ring` eigen
+    /// assembly heeft). Daarom kiezen we niet blind op een feature-vlag maar
+    /// meten we bij startup welke cipher hier écht sneller is. Op moderne
+    /// hardware wint AEGIS-256X2 ruim (AES-NI blijft daar de facto de default);
+    /// op deze machine wint ChaCha — automatisch, zonder config.
     ///
     /// Belangrijk: dit is een lokale voorkeur. Beide peers moeten hetzelfde
     /// algoritme draaien (zie `negotiate`), want de sessiesleutels en nonce-
     /// lengtes verschillen per cipher.
     pub fn preferred() -> Self {
-        if cpu_has_aes() {
-            AeadAlgo::Aegis256X2
-        } else {
-            AeadAlgo::ChaCha20Poly1305
-        }
+        use std::sync::OnceLock;
+        static PREFERRED: OnceLock<AeadAlgo> = OnceLock::new();
+        *PREFERRED.get_or_init(pick_preferred)
     }
 
     /// Onderhandel het te gebruiken algoritme tussen de eigen voorkeur en die
@@ -104,6 +109,53 @@ fn cpu_has_aes() -> bool {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 fn cpu_has_aes() -> bool {
     false // onbekende architectuur: kies de veilige, universele cipher
+}
+
+/// Bepaal (eenmalig) de snelste veilige cipher voor deze machine.
+fn pick_preferred() -> AeadAlgo {
+    // Zonder AES-NI is AEGIS geen optie: software-AES is niet alleen traag maar
+    // ook cache-timing-gevoelig. ChaCha20 is dan constant-time en snel.
+    if !cpu_has_aes() {
+        return AeadAlgo::ChaCha20Poly1305;
+    }
+    // Mét AES-NI: meet welke écht sneller is (lager = sneller).
+    let chacha = bench_seal(AeadAlgo::ChaCha20Poly1305);
+    let aegis = bench_seal(AeadAlgo::Aegis256X2);
+    let choice = if aegis <= chacha {
+        AeadAlgo::Aegis256X2
+    } else {
+        AeadAlgo::ChaCha20Poly1305
+    };
+    tracing::info!(
+        "AEAD auto-select: {:?} (startup-bench 512×1200B — ChaCha {:.1} ms, AEGIS {:.1} ms)",
+        choice,
+        chacha.as_secs_f64() * 1e3,
+        aegis.as_secs_f64() * 1e3
+    );
+    choice
+}
+
+/// Micro-benchmark: tijd om een reeks MTU-pakketten met dit algoritme te
+/// verzegelen. Klein gehouden zodat de startup-kost verwaarloosbaar is
+/// (< ~5 ms op moderne hardware; tientallen ms op een trage AES-NI-CPU).
+fn bench_seal(algo: AeadAlgo) -> std::time::Duration {
+    use std::time::Instant;
+    let key = Zeroizing::new([0u8; 32]);
+    let dir = match make_directional(algo, &key) {
+        Ok(d) => d,
+        Err(_) => return std::time::Duration::MAX, // niet bruikbaar → nooit kiezen
+    };
+    let nonce = vec![0u8; algo.nonce_len()];
+    let pt = [0u8; 1200];
+    // Warmup (caches / turbo-ramp).
+    for _ in 0..128 {
+        let _ = dir.seal(&nonce, b"", &pt);
+    }
+    let t = Instant::now();
+    for _ in 0..512 {
+        let _ = dir.seal(&nonce, b"", &pt);
+    }
+    t.elapsed()
 }
 
 // ── De Aead-trait ────────────────────────────────────────────────────────────

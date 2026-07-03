@@ -349,9 +349,51 @@ from the pre-shared *public* keys by default, so an adversary who already holds
 both public keys can de-obfuscate (setting `psk_hex` closes this). And even with
 every static/structural fingerprint gone, the **~8 KB total handshake size** and
 its **2-RTT burst timing** are still observable, and a burst's fragments share a
-(random) `msg_id`. Timing masking / cover traffic / constant-rate pacing are not
-implemented. So this is a large step toward traffic-analysis resistance, not a
-completed claim.
+(random) `msg_id`. The *data-path* timing dimension is addressed below (§9a);
+the initial handshake burst remains a residual because it precedes the pacer.
+
+### 9a. Timing / cover traffic (`pacer.rs`, Phase 3)
+
+Phases 1–2 made every datagram look random and hid its size, but a passive
+observer could still see *when* data flowed — bursts, idle gaps, the overall
+envelope. Phase 3 adds **constant-rate traffic shaping**: the sender emits on a
+**fixed schedule** and fills empty slots with **cover (dummy) packets** the
+receiver silently discards, so bursts and idle-vs-active dissolve into a steady
+stream.
+
+**Mechanism.** A cover packet is an ordinary obfuscated data-path datagram whose
+*inner* type decrypts to a new `FrameType::Padding` — the receiver's
+`decrypt_obf` returns `Padding` and the inbound loop drops it (but still counts
+it as peer liveness). No new crypto, and **no wire/proto change**: `PROTO_VERSION`
+lives in the handshake, not the data path, so a peer that predates Phase 3 simply
+gets `UnknownFrameType` on a cover packet and drops it — real data still flows,
+and pacing can even be **asymmetric per direction** with no negotiation. The
+outbound loop (`main.rs`) replaces the batch-linger flush with a fixed-interval
+ticker that emits `burst` datagrams per slot via the pure `pacer::Pacer`
+scheduler: each slot dequeues a real packet if one is queued, else emits a cover
+packet (CBR / Adaptive-within-cooldown) or nothing (Adaptive-idle). Every paced
+datagram — real and cover — is padded to one **constant size** (`Full`), so both
+the rate *and* the size are constant. A bounded queue tail-drops real packets
+when offered load exceeds the rate (TCP recovers), which is what keeps the rate
+constant.
+
+**Modes & cost (config `[traffic]`, on by default in Adaptive):** **Adaptive**
+(the default) paces only during activity plus a cooldown and goes quiet when
+genuinely idle — no bandwidth at rest, but coarse active-vs-idle reappears.
+**CBR** streams at the configured rate 24/7 — strongest, but the rate is then a
+constant bandwidth floor *and* the throughput ceiling, so operators size
+`rate_pps × burst` to their link. In both modes the rate is the throughput
+ceiling (traffic above it tail-drops); the MTU is capped so a packet + overhead
+fits one datagram (like WireGuard sizing the tunnel MTU to the path).
+
+**Honest limitation (what remains):** timing shaping hides the *shape* of the
+traffic, not the **existence** of the tunnel (the endpoints are known,
+site-to-site) or its **total duration**; the **initial handshake burst** is
+pre-pacer and still visible (rekey pacing is a documented follow-up); CBR costs
+constant bandwidth and adds up to ~`1/rate` latency per packet; and in Adaptive
+mode coarse volume-over-time still leaks. So this closes the timing dimension for
+the data path under CBR, but "full traffic-analysis resistance" remains a
+qualified claim.
 
 ---
 
@@ -417,13 +459,15 @@ These are stated plainly so no one mistakes intent for proof:
    most important caveat, and it is not something code changes can fix.
 2. **Single PQ KEM.** The key exchange is Kyber768 + X25519 (hybrid
    classical/PQ), not a hybrid of two independent PQ KEMs.
-3. **Partial traffic-analysis resistance.** The **data path** and the
-   **handshake envelope** are now obfuscated — every datagram looks like random
-   bytes, with no visible type, session_id, counter or fragment structure, and
-   sizes are padded/jittered (§9). Still open: the ~8 KB handshake volume and
-   the 2-RTT burst *timing* remain observable, the handshake obfuscation key is
-   pubkey-derived by default (an optional PSK closes that), and cover traffic /
-   pacing are not implemented. So it is a large step, not a completed property.
+3. **Partial traffic-analysis resistance.** The data path, the handshake
+   envelope, and (optionally) packet *timing* are now obfuscated — random-looking
+   datagrams, hidden sizes, and constant-rate cover traffic that dissolves
+   bursts and idle-vs-active (§9, §9a). Still open: the tunnel's existence and
+   total duration are inherent to a fixed site-to-site link, the initial
+   handshake burst precedes the pacer, the handshake obfuscation key is
+   pubkey-derived by default (an optional PSK closes that), and constant-rate
+   shaping has a real bandwidth/latency cost. A large step, not a completed
+   property.
 
 ### Resolved since the first draft
 
@@ -448,5 +492,9 @@ These are stated plainly so no one mistakes intent for proof:
   pre-shared identities (or a PSK) and split into size-jittered fragments with a
   masked header — the old constant type byte and fixed fragment burst are gone.
   See §9.
+- **Timing / cover traffic.** Constant-rate shaping (`pacer.rs`): the sender
+  emits on a fixed schedule and fills idle slots with cover packets (an encrypted
+  `Padding` inner type the receiver discards), dissolving bursts and
+  idle-vs-active. No wire/proto change; on by default in Adaptive mode. See §9a.
 - **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
   See §6.

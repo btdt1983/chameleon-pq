@@ -17,25 +17,29 @@
 //! cleartext-frame voor de (nog cleartext) handshake/rekey-berichten.
 
 use bytes::Bytes;
-use chameleon::config::{AppConfig, Cli, Command};
+use chameleon::config::{AppConfig, Cli, Command, TrafficMode};
 use chameleon::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
 use chameleon::engine::{CryptoEngine, OutboundPacket};
 use chameleon::frame::{Frame, FrameType};
 use chameleon::hsobf;
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
 use chameleon::obf::PadPolicy;
+use chameleon::pacer::{Emit, Pacer, ShapeMode};
 use chameleon::session::SessionManager;
 use chameleon::tun_iface::TunPair;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-const UDP_BUF: usize = 65_536;
 const MAX_BATCH: usize = 256;
+/// Bovengrens op de outbound-wachtrij onder pacing. Bij overvol wordt het
+/// nieuwste TUN-pakket getaild-dropt (TCP herstelt); ongebonden bufferen zou de
+/// constante rate breken en latency opstapelen.
+const MAX_QUEUE: usize = 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -209,36 +213,100 @@ async fn run_tunnel_loops(
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
     const PEER_DEAD_AFTER: u64 = 45; // seconden zonder enig pakket = dood
 
+    // Timing-/cover-traffic pacing (Fase 3). `paced` alleen als óók het datapad
+    // geobfusceerd is (cover-pakketten rijden erop; config valideert dit).
+    let paced = cfg.traffic.enabled && cfg.obfuscation.enabled;
+    let pace_mode = match cfg.traffic.mode {
+        TrafficMode::Cbr => ShapeMode::Cbr,
+        TrafficMode::Adaptive => ShapeMode::Adaptive,
+    };
+    let pace_slot = Duration::from_micros(1_000_000u64 / cfg.traffic.rate_pps.max(1) as u64);
+    let pace_burst = cfg.traffic.burst.max(1) as usize;
+    let pace_cooldown = Duration::from_millis(cfg.traffic.cooldown_ms);
+
+    // Gedeelde GSO/GRO-state voor gebatchte UDP-I/O (quinn-udp). Faalt zelden;
+    // op een kernel zonder GSO/GRO valt quinn-udp vanzelf per-pakket terug.
+    let sock_state = match chameleon::udp::socket_state(&socket) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            error!("UDP I/O state init failed: {e}");
+            return;
+        }
+    };
+
     // ── Outbound: TUN → engine → UDP ─────────────────────────────
     let engine_out = engine.clone();
     let socket_out = socket.clone();
     let auth_out = auth.clone();
     let peer_out = peer;
     let rekeying_out = rekeying.clone();
+    let state_out = sock_state.clone();
     let outbound = tokio::spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
-        let mut tick = interval(linger);
         let mut from_tun = from_tun;
+        // Ticker: het vaste slot-tempo bij pacing, anders de batch-linger.
+        let mut tick = interval(if paced { pace_slot } else { linger });
+        let mut pacer = Pacer::new(pace_mode, pace_cooldown);
 
         loop {
             tokio::select! {
                 maybe = from_tun.recv() => {
                     match maybe {
                         Some(pkt) => {
-                            pending.push(OutboundPacket { plaintext: pkt });
-                            if pending.len() >= MAX_BATCH {
-                                flush_outbound(&engine_out, &socket_out, &mut pending, peer_out).await;
+                            if paced {
+                                // Bounded queue met tail-drop (zie MAX_QUEUE).
+                                if pending.len() >= MAX_QUEUE {
+                                    debug!("outbound queue full — tail-drop");
+                                } else {
+                                    pending.push(OutboundPacket { plaintext: pkt });
+                                }
+                            } else {
+                                pending.push(OutboundPacket { plaintext: pkt });
+                                if pending.len() >= MAX_BATCH {
+                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
+                                }
                             }
                         }
                         None => break,
                     }
                 }
                 _ = tick.tick() => {
-                    if !pending.is_empty() {
-                        flush_outbound(&engine_out, &socket_out, &mut pending, peer_out).await;
+                    if paced {
+                        // Emit `burst` datagrammen per slot en verstuur ze in ÉÉN
+                        // GSO-syscall: echte pakketten uit de wachtrij, lege slots
+                        // gevuld met cover — alle op constante grootte (Full), zodat
+                        // rate én grootte constant blijven en de slot-burst (die de
+                        // pacer sowieso al produceert) in één syscall past.
+                        let mut slot: Vec<Bytes> = Vec::with_capacity(pace_burst);
+                        for _ in 0..pace_burst {
+                            match pacer.next_emit(!pending.is_empty(), Instant::now()) {
+                                Emit::Real => {
+                                    let pkt = pending.remove(0);
+                                    match engine_out.seal_data_full(&pkt.plaintext) {
+                                        Ok(wire) => slot.push(wire),
+                                        Err(e) => error!("seal data: {e}"),
+                                    }
+                                }
+                                Emit::Cover => match engine_out.cover_datagram() {
+                                    Ok(wire) => slot.push(wire),
+                                    Err(e) => error!("cover datagram: {e}"),
+                                },
+                                // Adaptive-idle: niets meer te sturen dit slot.
+                                Emit::Idle => break,
+                            }
+                        }
+                        for (run, seg) in chameleon::udp::group_equal_sized(&slot) {
+                            if let Err(e) =
+                                chameleon::udp::batch_send(&socket_out, &state_out, peer_out, run, seg).await
+                            {
+                                error!("UDP batch send (paced): {e}");
+                            }
+                        }
+                    } else if !pending.is_empty() {
+                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
                     }
-                    // Rekey-trigger: alleen als de drempel is bereikt EN er niet
-                    // al een rekey loopt. We initiëren hier als INITIATOR.
+
+                    // Rekey-trigger (gedeeld): drempel bereikt EN geen lopende rekey.
                     if engine_out.sessions().needs_rekey()
                         && !rekeying_out.swap(true, Ordering::AcqRel)
                     {
@@ -270,8 +338,11 @@ async fn run_tunnel_loops(
     let socket_in = socket.clone();
     let auth_in = auth.clone();
     let last_recv_in = last_recv.clone();
+    let state_in = sock_state.clone();
     let inbound = tokio::spawn(async move {
-        let mut buf = vec![0u8; UDP_BUF];
+        // Gebatchte ontvangst-buffers (GRO): één syscall levert meerdere
+        // datagrammen, die we hieronder één voor één door de bestaande demux halen.
+        let (mut recv_storage, mut recv_metas) = chameleon::udp::recv_buffers();
         // Reassembler voor mid-sessie rekey-init frames (responder-kant).
         let mut rekey_reasm = Reassembler::default();
         // Pending rekey-responder state: na de init bewaren we de (nog niet
@@ -280,62 +351,113 @@ async fn run_tunnel_loops(
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
 
-        loop {
+        'inbound: loop {
             tokio::select! {
                 _ = prune_tick.tick() => {
                     // State-Bloat-DoS-fix: ruim half-afgemaakte fragmenten op.
                     rekey_reasm.prune_old(Duration::from_secs(10));
                     rekey_confirm_reasm.prune_old(Duration::from_secs(10));
                 }
-                recv = socket_in.recv_from(&mut buf) => {
-                    let (n, src) = match recv {
-                        Ok(v)  => v,
+                recv = chameleon::udp::batch_recv(&socket_in, &state_in, &mut recv_storage, &mut recv_metas) => {
+                    let count = match recv {
+                        Ok(c)  => c,
                         Err(e) => { error!("UDP recv: {e}"); continue; }
                     };
-                    // 1) Geobfusceerd datapad EERST (data/keepalive/close). Slaagt
-                    //    dit, dan is het pakket vóór ons en geauthenticeerd; het
-                    //    echte type komt uit de inner framing.
-                    if let Ok((ft, plain)) = engine_in.sessions().decrypt_obf(&buf[..n]) {
-                        last_recv_in.store(now_secs(), Ordering::Relaxed);
-                        match ft {
-                            FrameType::Data => {
-                                debug!("inbound {} bytes -> TUN", plain.len());
-                                if to_tun.send(plain).await.is_err() { break; }
-                            }
-                            FrameType::KeepAlive => debug!("keepalive (obf) received"),
-                            FrameType::Close => { info!("peer closed session"); break; }
-                            FrameType::Handshake => {} // niet verwacht via het obf-pad
-                        }
-                        continue;
-                    }
+                    // Collect de (GRO-gesplitste) datagrammen owned, zodat de
+                    // storage-borrow vrijkomt vóór de per-datagram-verwerking met
+                    // awaits. De kopie is verwaarloosbaar t.o.v. de syscall-winst.
+                    let datagrams: Vec<(std::net::SocketAddr, Bytes)> =
+                        chameleon::udp::iter_datagrams(&recv_storage, &recv_metas, count)
+                            .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
+                            .collect();
 
-                    // 2) Handshake-obfuscatie AAN: alles wat geen data is, is een
-                    //    (rekey-)handshake-of-ruis. We vallen hier NOOIT terug op
-                    //    cleartext — een gemaskeerd byte mag niet per ongeluk als
-                    //    Close/KeepAlive worden gelezen (clean break).
-                    if let Some(k) = hs_obf {
-                        if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &buf[..n]) {
+                    for (src, datagram) in datagrams {
+                        // 1) Geobfusceerd datapad EERST (data/keepalive/close).
+                        if let Ok((ft, plain)) = engine_in.sessions().decrypt_obf(&datagram) {
                             last_recv_in.store(now_secs(), Ordering::Relaxed);
-                            if rekeying.load(Ordering::Acquire) {
-                                // Wij zijn rekey-initiator: geef de rauwe datagram door.
-                                let _ = hs_tx.send(Bytes::copy_from_slice(&buf[..n])).await;
-                            } else if pending_rekey.is_none() {
-                                // Peer initieert rekey, fase 1 (init).
-                                if let Ok(Some(blob)) = rekey_reasm.push_parts(mid, idx, tot, chunk) {
-                                    if let Ok(init_wire) = hsobf::open(&k, &blob) {
+                            match ft {
+                                FrameType::Data => {
+                                    debug!("inbound {} bytes -> TUN", plain.len());
+                                    if to_tun.send(plain).await.is_err() { break 'inbound; }
+                                }
+                                FrameType::KeepAlive => debug!("keepalive (obf) received"),
+                                FrameType::Close => { info!("peer closed session"); break 'inbound; }
+                                FrameType::Handshake => {} // niet verwacht via het obf-pad
+                                FrameType::Padding => debug!("cover packet discarded"),
+                            }
+                            continue;
+                        }
+
+                        // 2) Handshake-obfuscatie AAN: alles wat geen data is, is een
+                        //    (rekey-)handshake-of-ruis; nooit cleartext-fallback.
+                        if let Some(k) = hs_obf {
+                            if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &datagram) {
+                                last_recv_in.store(now_secs(), Ordering::Relaxed);
+                                if rekeying.load(Ordering::Acquire) {
+                                    let _ = hs_tx.send(datagram.clone()).await;
+                                } else if pending_rekey.is_none() {
+                                    if let Ok(Some(blob)) = rekey_reasm.push_parts(mid, idx, tot, chunk) {
+                                        if let Ok(init_wire) = hsobf::open(&k, &blob) {
+                                            let new_id = chameleon::net::alloc_session_id();
+                                            match rekey_as_responder(
+                                                &socket_in, src, auth_in.as_ref(),
+                                                new_id, init_wire, Some(&k),
+                                            ).await {
+                                                Ok(hs) => { pending_rekey = Some((hs, new_id)); }
+                                                Err(e) => warn!("responder rekey (init) failed: {e}"),
+                                            }
+                                        }
+                                    }
+                                } else if let Ok(Some(blob)) = rekey_confirm_reasm.push_parts(mid, idx, tot, chunk) {
+                                    if let Ok(confirm_wire) = hsobf::open(&k, &blob) {
+                                        let (hs, new_id) = pending_rekey.take().unwrap();
+                                        if let Err(e) = rekey_responder_confirm(
+                                            hs, auth_in.as_ref(),
+                                            engine_in.sessions(), new_id, confirm_wire,
+                                        ) {
+                                            warn!("responder rekey (confirm) failed: {e}");
+                                        } else {
+                                            schedule_retire(engine_in.sessions().clone());
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // 3) Handshake-obfuscatie UIT: klassiek cleartext frame.
+                        let frame = match Frame::decode(datagram.clone()) {
+                            Ok(f)  => f,
+                            Err(e) => { warn!("bad frame: {e}"); continue; }
+                        };
+                        last_recv_in.store(now_secs(), Ordering::Relaxed);
+                        match frame.frame_type {
+                            FrameType::Data => {
+                                match engine_in.sessions().decrypt(
+                                    frame.session_id, frame.sequence, &frame.payload)
+                                {
+                                    Ok(plain) => {
+                                        debug!("inbound {} bytes -> TUN", plain.len());
+                                        if to_tun.send(plain).await.is_err() { break 'inbound; }
+                                    }
+                                    Err(e) => debug!("decrypt drop: {e}"),
+                                }
+                            }
+                            FrameType::Handshake => {
+                                if rekeying.load(Ordering::Acquire) {
+                                    let _ = hs_tx.send(datagram.clone()).await;
+                                } else if pending_rekey.is_none() {
+                                    if let Ok(Some(init_wire)) = rekey_reasm.push(&frame.payload) {
                                         let new_id = chameleon::net::alloc_session_id();
                                         match rekey_as_responder(
                                             &socket_in, src, auth_in.as_ref(),
-                                            new_id, init_wire, Some(&k),
+                                            new_id, init_wire, None,
                                         ).await {
                                             Ok(hs) => { pending_rekey = Some((hs, new_id)); }
                                             Err(e) => warn!("responder rekey (init) failed: {e}"),
                                         }
                                     }
-                                }
-                            } else if let Ok(Some(blob)) = rekey_confirm_reasm.push_parts(mid, idx, tot, chunk) {
-                                // Fase 2 (confirm).
-                                if let Ok(confirm_wire) = hsobf::open(&k, &blob) {
+                                } else if let Ok(Some(confirm_wire)) = rekey_confirm_reasm.push(&frame.payload) {
                                     let (hs, new_id) = pending_rekey.take().unwrap();
                                     if let Err(e) = rekey_responder_confirm(
                                         hs, auth_in.as_ref(),
@@ -347,60 +469,10 @@ async fn run_tunnel_loops(
                                     }
                                 }
                             }
+                            FrameType::KeepAlive => debug!("keepalive received"),
+                            FrameType::Close     => { info!("peer closed session"); break 'inbound; }
+                            FrameType::Padding => {}
                         }
-                        continue;
-                    }
-
-                    // 3) Handshake-obfuscatie UIT: klassiek cleartext frame —
-                    //    handshake/rekey of het niet-geobfusceerde datapad.
-                    let frame = match Frame::decode(Bytes::copy_from_slice(&buf[..n])) {
-                        Ok(f)  => f,
-                        Err(e) => { warn!("bad frame: {e}"); continue; }
-                    };
-                    // Elk geldig pakket = teken van leven van de peer.
-                    last_recv_in.store(now_secs(), Ordering::Relaxed);
-                    match frame.frame_type {
-                        FrameType::Data => {
-                            match engine_in.sessions().decrypt(
-                                frame.session_id, frame.sequence, &frame.payload)
-                            {
-                                Ok(plain) => {
-                                    debug!("inbound {} bytes -> TUN", plain.len());
-                                    if to_tun.send(plain).await.is_err() { break; }
-                                }
-                                Err(e) => debug!("decrypt drop: {e}"),
-                            }
-                        }
-                        FrameType::Handshake => {
-                            // Demux: lopende rekey die WIJ initieerden (-> hs_tx,
-                            // als rauwe datagram) of een NIEUWE rekey van de peer?
-                            if rekeying.load(Ordering::Acquire) {
-                                let _ = hs_tx.send(Bytes::copy_from_slice(&buf[..n])).await;
-                            } else if pending_rekey.is_none() {
-                                if let Ok(Some(init_wire)) = rekey_reasm.push(&frame.payload) {
-                                    let new_id = chameleon::net::alloc_session_id();
-                                    match rekey_as_responder(
-                                        &socket_in, src, auth_in.as_ref(),
-                                        new_id, init_wire, None,
-                                    ).await {
-                                        Ok(hs) => { pending_rekey = Some((hs, new_id)); }
-                                        Err(e) => warn!("responder rekey (init) failed: {e}"),
-                                    }
-                                }
-                            } else if let Ok(Some(confirm_wire)) = rekey_confirm_reasm.push(&frame.payload) {
-                                let (hs, new_id) = pending_rekey.take().unwrap();
-                                if let Err(e) = rekey_responder_confirm(
-                                    hs, auth_in.as_ref(),
-                                    engine_in.sessions(), new_id, confirm_wire,
-                                ) {
-                                    warn!("responder rekey (confirm) failed: {e}");
-                                } else {
-                                    schedule_retire(engine_in.sessions().clone());
-                                }
-                            }
-                        }
-                        FrameType::KeepAlive => debug!("keepalive received"),
-                        FrameType::Close     => { info!("peer closed session"); break; }
                     }
                 }
             }
@@ -416,6 +488,11 @@ async fn run_tunnel_loops(
     let engine_ka = engine.clone();
     let obf_enabled_ka = cfg.obfuscation.enabled;
     let pad_policy_ka: PadPolicy = cfg.obfuscation.padding.into();
+    // Onder CBR-pacing stroomt er sowieso constant (cover-)verkeer, dus de
+    // periodieke keepalive-send is overbodig — we slaan 'm dan over en houden
+    // alleen de dode-peer-detectie. (Adaptive kan idle-stil vallen, dus daar
+    // blijft de keepalive-send nodig.)
+    let ka_skip_send = paced && matches!(cfg.traffic.mode, TrafficMode::Cbr);
     let keepalive = tokio::spawn(async move {
         let mut ka_tick = interval(KEEPALIVE_INTERVAL);
         loop {
@@ -424,6 +501,9 @@ async fn run_tunnel_loops(
             if idle >= PEER_DEAD_AFTER {
                 warn!("peer silent for {idle}s — declaring dead, closing tunnel");
                 break;
+            }
+            if ka_skip_send {
+                continue; // CBR-cover levert het leven-signaal al
             }
             // Stuur een keepalive zodat de andere kant óók weet dat wij leven.
             // Geobfusceerd (zodat de keepalive niet als klein vast pakket
@@ -460,6 +540,7 @@ async fn run_tunnel_loops(
 async fn flush_outbound(
     engine: &CryptoEngine,
     socket: &UdpSocket,
+    state: &quinn_udp::UdpSocketState,
     pending: &mut Vec<OutboundPacket>,
     peer: SocketAddr,
 ) {
@@ -467,9 +548,11 @@ async fn flush_outbound(
     let count = batch.len();
     match engine.encrypt_batch(batch) {
         Ok(wires) => {
-            for wire in wires {
-                if let Err(e) = socket.send_to(&wire, peer).await {
-                    error!("UDP send: {e}");
+            // Verstuur gelijk-grote runs in zo min mogelijk syscalls (GSO waar
+            // mogelijk). Onder Full is de hele batch één run → één GSO-call.
+            for (run, seg) in chameleon::udp::group_equal_sized(&wires) {
+                if let Err(e) = chameleon::udp::batch_send(socket, state, peer, run, seg).await {
+                    error!("UDP batch send: {e}");
                 }
             }
             debug!("flushed {} pkts", count);

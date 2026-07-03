@@ -18,15 +18,18 @@ system — not as a production VPN.
 Known scope limits:
 - No external security audit has been performed — this remains the single
   most important caveat for any self-built cryptographic protocol
-- The **data path** (QUIC-style header protection + length padding) **and the
-  handshake envelope** (static-key wrap-then-fragment, size-jittered) are now
-  obfuscated — every datagram looks like uniform random bytes, with no visible
-  type byte, session id, counter or fragment structure. Residual: the ~8 KB
-  handshake volume and its 2-RTT burst *timing* stay observable, and the
-  handshake obfuscation key is derived from the pre-shared pubkeys by default
-  (an adversary holding both pubkeys could de-obfuscate — set
-  `[obfuscation].psk_hex` to close that). Timing masking / cover traffic are not
-  implemented, so full traffic-analysis resistance is still not claimed
+- The **data path**, the **handshake envelope**, AND now **packet timing** are
+  all obfuscated — every datagram looks like uniform random bytes, and optional
+  traffic shaping (`[traffic]`, on by default in **Adaptive** mode; **CBR**
+  available for full constant-rate) sends on a fixed schedule with cover packets
+  filling idle slots, so bursts and idle-vs-active dissolve into a steady
+  stream. Residual (documented, not claimed as *full* resistance): the tunnel's
+  existence and total duration are inherent to a fixed site-to-site link, the
+  **initial** handshake burst is pre-pacer, and the handshake obfuscation key is
+  pubkey-derived by default (`[obfuscation].psk_hex` closes that). Shaping has a
+  real bandwidth/latency cost — the configured rate is both the floor (in CBR)
+  and the
+  throughput ceiling
 - ML-DSA is integrated for authentication, but the key exchange still pairs
   Kyber768 with X25519 (no second PQ KEM)
 
@@ -58,13 +61,29 @@ Known scope limits:
   masked header — the handshake burst no longer shows a constant type byte or a
   fixed fragment structure. The real handshake crypto is unchanged; this is a
   pure outer obfuscation layer (no forward secrecy on the obf layer)
+- Timing / cover-traffic shaping (`pacer.rs`, `[traffic]`, on by default in
+  Adaptive mode): packets go out on a fixed schedule and empty slots are filled
+  with cover (dummy) packets the receiver silently discards, so burst and
+  idle-vs-active patterns are hidden. Cover packets are ordinary obf datagrams
+  with an encrypted `Padding` inner type, constant-size under `Full` padding, so
+  they are wire-indistinguishable from real data. Adaptive (default) paces during
+  activity + cooldown and goes quiet when idle (no bandwidth at rest); **CBR**
+  streams constantly for the strongest hiding at a constant cost. No wire/proto
+  change — a peer that predates this safely drops cover packets
 - Per-direction keys; 2048-entry sliding-window replay protection
 - Rekey with anti-storm gate, retry on packet loss, current+previous session
   overlap so in-flight traffic survives the swap
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
-- 54 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- Performance: the data-path AEAD is auto-selected at startup by a quick
+  benchmark (AEGIS-256X2 on hardware where it's fastest, ChaCha20 where AEGIS
+  would fall back to slow software AES), and UDP I/O is batched with GSO on send
+  / GRO on receive (via `quinn-udp`, per-packet fallback on old kernels /
+  non-Linux) so many datagrams go per syscall — a microbench lifts the send
+  path from ~0.18 to ~9.6 Mpps. No wire change; the single-core AEAD (~2 Gbit/s)
+  is then the ceiling (multi-threading is future work)
+- 67 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -73,7 +92,10 @@ Known scope limits:
   padding, empty keepalives, cleartext-handshake fall-through), and the
   obfuscated handshake envelope (symmetric key derivation, wrap-then-fragment
   round-trip with jitter, full mutual handshake, wrong-key/noise rejection,
-  reassembler cap + prune, and that a 0.1.x cleartext frame is not accepted)
+  reassembler cap + prune, and that a 0.1.x cleartext frame is not accepted),
+  and timing/cover traffic (the pure pacer scheduler's CBR/Adaptive/cooldown
+  logic, that a cover packet round-trips as `Padding`, and that cover and data
+  are equal-length + header-distinct under `Full` padding)
 
 ## Build
 
@@ -120,8 +142,9 @@ to the binary.
   `MlDsaAuth` (ML-DSA-65 via `pqcrypto-mldsa`), combined by `HybridAuth`
   (all legs must verify); transcript hash, HKDF
 - `aead.rs` — pluggable data-path AEAD: `ChaCha20-Poly1305` and
-  `AEGIS-256X2` behind a trait (now with associated-data support), CPU AES
-  detection and downgrade-safe negotiation
+  `AEGIS-256X2` behind a trait (with associated-data support); a startup
+  micro-benchmark auto-selects the faster cipher for the machine, and the
+  choice is downgrade-safe (bound in the handshake transcript)
 - `session.rs` — per-direction AEAD keys, nonce management, header binding
   via AAD, sliding-window replay, `SessionManager` with rekey
 - `tunnel.rs` — 8192-byte handshake (single KEM slot, noise-padded; sized
@@ -138,9 +161,16 @@ to the binary.
   message in ChaCha20-Poly1305 and splits it into size-jittered fragments with
   a masked header (`derive_hs_obf_key` / `seal_and_fragment` / `unmask_fragment`
   / `open`)
+- `pacer.rs` — pure (tokio-free) constant-rate scheduler for timing/cover-traffic
+  shaping: `Pacer::next_emit` decides per slot whether to send a real packet,
+  a cover packet, or nothing (`ShapeMode` CBR/Adaptive); the async loop in
+  `main.rs` drives it
 - `engine.rs` — CPU encryption engine (constant-time, low-latency; no GPU
   path — see DESIGN.md §11–§12 for why)
 - `net.rs` — UDP loops; clear in/out API points to the TUN layer
+- `udp.rs` — batched UDP I/O (GSO on send, GRO on receive) via `quinn-udp`,
+  with a per-packet fallback on older kernels / non-Linux; the only module that
+  touches the dependency (`batch_send` / `batch_recv` / `group_equal_sized`)
 - `rekey.rs` — rekey driver that solves the shared-socket problem
   (inbound loop is the sole socket reader; rekey driver receives via channel)
 - `tun_iface.rs` — cross-platform TUN with mock for tests

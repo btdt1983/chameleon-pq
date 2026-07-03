@@ -28,6 +28,11 @@ pub enum FrameType {
     Handshake = 0x02,
     KeepAlive = 0x03,
     Close = 0x04,
+    /// Cover/dummy-verkeer (Fase 3): een inner-type dat de ontvanger stil
+    /// weggooit. Gebruikt door de constant-rate pacer om lege slots te vullen,
+    /// zodat burst- en idle-patronen verdwijnen. Zit alleen in de INNER framing
+    /// (obf.rs), nooit als zichtbaar wire-byte.
+    Padding = 0x05,
 }
 
 impl FrameType {
@@ -37,6 +42,7 @@ impl FrameType {
             0x02 => Ok(Self::Handshake),
             0x03 => Ok(Self::KeepAlive),
             0x04 => Ok(Self::Close),
+            0x05 => Ok(Self::Padding),
             _ => Err(ChameleonError::UnknownFrameType(v)),
         }
     }
@@ -101,5 +107,18 @@ impl Frame {
             sequence,
             payload,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_type_from_u8_covers_padding() {
+        assert_eq!(FrameType::from_u8(0x05).unwrap(), FrameType::Padding);
+        assert_eq!(FrameType::Padding as u8, 0x05);
+        // Onbekend type blijft een fout (fail-closed).
+        assert!(FrameType::from_u8(0x06).is_err());
     }
 }

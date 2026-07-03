@@ -23,7 +23,8 @@ server_addr = "1.2.3.4:51820"   # alleen nodig in client-modus
 name    = "chameleon0"           # interface-naam (Linux/macOS: vrije keuze; Windows: ook)
 address = "10.99.0.1"           # IP-adres van deze kant van de tunnel
 netmask = "255.255.255.0"
-mtu     = 1400                  # laat ruimte voor VPN-header boven de 1280-MTU
+mtu     = 1200                  # MTU-veilig voor het geobf. datapad (max 1232);
+                                # groter fragmenteert IP en verraadt/breekt de obf
 
 [engine]
 # Maximale wachttijd (µs) voor een batch voordat die geflusht wordt.
@@ -52,3 +53,24 @@ handshake = true
 # Ed25519-pubkeys (nul config). Mét dit kan een tegenstander die alleen de
 # pubkeys heeft de handshake niet de-obfusceren. Zet op BEIDE kanten hetzelfde.
 #   psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+[traffic]
+# Timing-/cover-traffic-obfuscatie: verstuur op een VAST tempo en vul lege slots
+# met dummy-pakketten, zodat burst-/idle-patronen verdwijnen (de laatste dimensie
+# van verkeersanalyse). Vereist obfuscation.enabled = true.
+#
+# LET OP — dit kost bandbreedte en doorvoer. De rate (rate_pps × burst) is je
+# doorvoerplafond (verkeer daarboven wordt gedropt) én, in CBR, je constante
+# bandbreedte. Bij de defaults: 256 × 2 = 512 pakketten/s × ~1232 B ≈ ~5 Mbps.
+# In ADAPTIVE (standaard) stroomt dit alleen tijdens activiteit + cooldown; in
+# rust is er geen cover-verkeer. In CBR stroomt het 24/7 (≈ 1,6 TB/maand/richting).
+# Stem rate_pps/burst af op je link; verlaag voor minder kost (lager plafond),
+# verhoog voor meer doorvoer. Zet enabled=false om timing-shaping uit te zetten.
+enabled  = true
+# "adaptive" — STANDAARD: pace tijdens activiteit + cooldown, stil in rust
+#              (geen bandbreedte idle, wél burst-verberging tijdens verkeer)
+# "cbr"      — constant bit-rate (altijd op tempo, ook idle; sterkst, duurst)
+mode     = "adaptive"
+rate_pps = 256      # emissie-slots per seconde
+burst    = 2        # pakketten per slot (rate = rate_pps × burst)
+cooldown_ms = 500   # adaptive: cover blijft zo lang na het laatste echte pakket
