@@ -1,6 +1,6 @@
 [package]
 name        = "chameleon-pq"
-version     = "0.4.0"
+version     = "0.5.0"
 edition     = "2021"
 rust-version = "1.80"
 license     = "Apache-2.0"
@@ -47,6 +47,7 @@ toml              = "0.7"
 clap = { version = "4", features = ["derive"] }
 
 # Utilities
+rayon             = "1"      # data-parallelle crypto over CPU-cores (Fase C)
 rand              = "0.8"
 thiserror         = "1"
 parking_lot       = "0.12"

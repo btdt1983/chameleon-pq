@@ -16,11 +16,18 @@ use crate::frame::{Frame, FrameType};
 use crate::obf::PadPolicy;
 use crate::session::SessionManager;
 use bytes::Bytes;
+use rayon::prelude::*;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub struct OutboundPacket {
     pub plaintext: Bytes,
 }
+
+/// Resultaat van één parallel-ontsleuteld inkomend datagram: (bron-adres, ruwe
+/// datagram-bytes, en het open-resultaat — `Ok((type, plaintext))` voor het
+/// datapad, `Err` voor een handshake-fragment of ruis).
+pub type DecryptResult = (SocketAddr, Bytes, Result<(FrameType, Bytes)>);
 
 pub struct CryptoEngine {
     sessions: Arc<SessionManager>,
@@ -57,22 +64,48 @@ impl CryptoEngine {
             .seal_obf(FrameType::Data as u8, plaintext, PadPolicy::Full)
     }
 
-    /// Versleutel een batch uitgaande pakketten tot WIRE-KLARE datagrammen.
-    /// De obf-seal gebeurt in `SessionManager::seal_obf` onder één sessie-lock,
-    /// zodat de counter en de header-protection-sleutel altijd bij elkaar horen
-    /// (geen race met een gelijktijdige rekey).
-    pub fn encrypt_batch(&self, batch: Vec<OutboundPacket>) -> Result<Vec<Bytes>> {
-        let mut out = Vec::with_capacity(batch.len());
-        for pkt in batch {
-            let wire = if self.obf_enabled {
-                self.sessions
-                    .seal_obf(FrameType::Data as u8, &pkt.plaintext, self.pad_policy)?
-            } else {
-                let (sid, counter, ct) = self.sessions.encrypt(&pkt.plaintext)?;
-                Frame::new_data(sid, counter, ct).encode()?
-            };
-            out.push(wire);
+    /// Verzegel één uitgaand pakket tot een wire-klaar datagram. De obf-seal
+    /// gebeurt in `SessionManager::seal_obf`; de counter is atomisch, dus dit is
+    /// veilig vanuit meerdere threads tegelijk (zie `encrypt_batch_par`).
+    fn seal_one(&self, plaintext: &[u8]) -> Result<Bytes> {
+        if self.obf_enabled {
+            self.sessions
+                .seal_obf(FrameType::Data as u8, plaintext, self.pad_policy)
+        } else {
+            let (sid, counter, ct) = self.sessions.encrypt(plaintext)?;
+            Frame::new_data(sid, counter, ct).encode()
         }
-        Ok(out)
+    }
+
+    /// Versleutel een batch uitgaande pakketten tot WIRE-KLARE datagrammen
+    /// (sequentieel — voor kleine batches).
+    pub fn encrypt_batch(&self, batch: Vec<OutboundPacket>) -> Result<Vec<Bytes>> {
+        batch
+            .iter()
+            .map(|pkt| self.seal_one(&pkt.plaintext))
+            .collect()
+    }
+
+    /// Zoals `encrypt_batch`, maar verzegelt de batch PARALLEL over alle
+    /// CPU-cores (Fase C). Order-behoudend; `collect` short-circuit op de eerste
+    /// fout (bv. RekeyRequired) net als de sequentiële variant. Roep dit aan
+    /// binnen een `spawn_blocking` (rayon blokkeert).
+    pub fn encrypt_batch_par(&self, batch: Vec<OutboundPacket>) -> Result<Vec<Bytes>> {
+        batch
+            .par_iter()
+            .map(|pkt| self.seal_one(&pkt.plaintext))
+            .collect()
+    }
+
+    /// Ontsleutel een batch inkomende datagrammen PARALLEL over alle CPU-cores.
+    /// Geeft per datagram (src, ruwe bytes, resultaat) terug in INVOER-volgorde,
+    /// zodat de aanroeper kan partitioneren: `Ok` = data/keepalive/close/padding
+    /// (datapad), `Err` = handshake-fragment of ruis (terug naar de seriële
+    /// coördinator). De AEAD-open is lock-vrij, dus dit schaalt over cores.
+    pub fn decrypt_batch_par(&self, datagrams: &[(SocketAddr, Bytes)]) -> Vec<DecryptResult> {
+        datagrams
+            .par_iter()
+            .map(|(src, dg)| (*src, dg.clone(), self.sessions.decrypt_obf(dg)))
+            .collect()
     }
 }

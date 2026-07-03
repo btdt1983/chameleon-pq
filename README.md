@@ -76,14 +76,17 @@ Known scope limits:
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
-- Performance: the data-path AEAD is auto-selected at startup by a quick
-  benchmark (AEGIS-256X2 on hardware where it's fastest, ChaCha20 where AEGIS
-  would fall back to slow software AES), and UDP I/O is batched with GSO on send
-  / GRO on receive (via `quinn-udp`, per-packet fallback on old kernels /
-  non-Linux) so many datagrams go per syscall — a microbench lifts the send
-  path from ~0.18 to ~9.6 Mpps. No wire change; the single-core AEAD (~2 Gbit/s)
-  is then the ceiling (multi-threading is future work)
-- 67 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- Performance (no wire change): the data-path AEAD is auto-selected at startup
+  by a quick benchmark (AEGIS-256X2 where it's fastest, ChaCha20 where AEGIS
+  would fall back to slow software AES); UDP I/O is batched with GSO on send /
+  GRO on receive (via `quinn-udp`, per-packet fallback on old kernels /
+  non-Linux) — a microbench lifts the send path from ~0.18 to ~9.6 Mpps; and the
+  seal/open runs in parallel across all cores (rayon, `[engine].workers`),
+  measured at ~4.5× (seal) / ~13× (open) on a 12-thread box. Note: the parallel
+  path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
+  on (default) the configured rate caps throughput, so speed vs.
+  timing-obfuscation are opposed dimensions you choose between
+- 69 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -93,9 +96,11 @@ Known scope limits:
   obfuscated handshake envelope (symmetric key derivation, wrap-then-fragment
   round-trip with jitter, full mutual handshake, wrong-key/noise rejection,
   reassembler cap + prune, and that a 0.1.x cleartext frame is not accepted),
-  and timing/cover traffic (the pure pacer scheduler's CBR/Adaptive/cooldown
-  logic, that a cover packet round-trips as `Padding`, and that cover and data
-  are equal-length + header-distinct under `Full` padding)
+  timing/cover traffic (the pure pacer scheduler's CBR/Adaptive/cooldown logic,
+  that a cover packet round-trips as `Padding`, and that cover and data are
+  equal-length + header-distinct under `Full` padding), and parallel crypto
+  (parallel-sealed packets all decrypt with unique counters, and
+  `decrypt_batch_par` classifies data vs noise)
 
 ## Build
 
@@ -165,8 +170,10 @@ to the binary.
   shaping: `Pacer::next_emit` decides per slot whether to send a real packet,
   a cover packet, or nothing (`ShapeMode` CBR/Adaptive); the async loop in
   `main.rs` drives it
-- `engine.rs` — CPU encryption engine (constant-time, low-latency; no GPU
-  path — see DESIGN.md §11–§12 for why)
+- `engine.rs` — CPU encryption engine: batch seal/open, run **in parallel
+  across cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`, bridged
+  from the async loops with `spawn_blocking`); constant-time, low-latency, no GPU
+  path (see DESIGN.md §11–§12 for why)
 - `net.rs` — UDP loops; clear in/out API points to the TUN layer
 - `udp.rs` — batched UDP I/O (GSO on send, GRO on receive) via `quinn-udp`,
   with a per-packet fallback on older kernels / non-Linux; the only module that
