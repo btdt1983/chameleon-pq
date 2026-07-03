@@ -3,7 +3,7 @@
 //! transcript-ondertekening (Ed25519 via de Authenticator-trait).
 
 use crate::aead::AeadAlgo;
-use crate::crypto::{derive_shared, mac_key_from, Authenticator, Transcript};
+use crate::crypto::{derive_shared, mac_key_from, role_bound_hash, Authenticator, Transcript};
 use crate::error::{ChameleonError, Result};
 use crate::session::Session;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -22,11 +22,18 @@ use x25519_dalek::{EphemeralSecret, PublicKey as XPub};
 // eenmalige gebeurtenis, dus de extra fragmenten kosten niets wezenlijks.
 pub const HANDSHAKE_MSG_LEN: usize = 8192;
 // v3: naast het geobfusceerde datapad (v2, obf.rs) is nu ook de HANDSHAKE-
-// envelope geobfusceerd (hsobf.rs, statische-sleutel wrap-then-fragment). Dit
-// maakt het wireformat incompatibel met 0.1.x-peers; de versie-bump zorgt dat
-// een oudere handshake die tóch bij decode belandt meteen faalt — een schone
-// fout i.p.v. een succesvolle handshake gevolgd door stil gedropte data.
-pub const PROTO_VERSION: u8 = 3;
+// envelope geobfusceerd (hsobf.rs, statische-sleutel wrap-then-fragment).
+// v4: de twee transcript-handtekeningen zijn ROL-gebonden (SIG_LABEL_*), zodat
+// responder en initiator niet langer over identieke bytes tekenen (L-5). Dat
+// verandert de handshake-auth; de versie-bump laat een peer met een oudere
+// handshake meteen schoon falen i.p.v. met een verwarrende MAC-fout.
+pub const PROTO_VERSION: u8 = 4;
+
+/// Rol-labels voor de domeinscheiding van de transcript-handtekeningen (L-5):
+/// de responder tekent de Response, de initiator de Confirm — nooit over
+/// dezelfde bytes. Ze worden vóór de transcript-hash gehasht (`role_bound_hash`).
+const SIG_LABEL_RESPONDER: &[u8] = b"Chameleon-PQ-v1 responder proof";
+const SIG_LABEL_INITIATOR: &[u8] = b"Chameleon-PQ-v1 initiator proof";
 
 /// Bovengrens op het aantal gelijktijdig onvoltooide berichten in één
 /// Reassembler. Sinds Fase 2 wordt (bij handshake-obfuscatie) elk niet-data-
@@ -480,7 +487,8 @@ impl Handshake {
         transcript.absorb(&resp.transcript_bytes());
 
         let th = transcript.hash();
-        resp.sig = auth.sign(&th)?;
+        // Rol-gebonden handtekening (L-5): responder tekent SIG_LABEL_RESPONDER‖th.
+        resp.sig = auth.sign(&role_bound_hash(SIG_LABEL_RESPONDER, &th))?;
         let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &mac_key_from(&shared));
         let tag = hmac::sign(&mac_key, &th);
         resp.mac.copy_from_slice(tag.as_ref());
@@ -541,8 +549,8 @@ impl Handshake {
         transcript.absorb(&resp.transcript_bytes());
         let th = transcript.hash();
 
-        // Authenticeer de RESPONDER.
-        auth.verify(&th, &resp.sig)?;
+        // Authenticeer de RESPONDER via zijn rol-gebonden handtekening (L-5).
+        auth.verify(&role_bound_hash(SIG_LABEL_RESPONDER, &th), &resp.sig)?;
         let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &mac_key_from(&shared));
         hmac::verify(&mac_key, &th, &resp.mac).map_err(|_| ChameleonError::Handshake {
             state: "finalize".into(),
@@ -552,7 +560,8 @@ impl Handshake {
         // Bouw het Confirm-bericht: onze handtekening over hetzelfde transcript.
         // Hiermee bewijst de initiator zijn identiteit aan de responder.
         let mut confirm = HandshakeMessage::new_confirm(auth.signature_len())?;
-        confirm.sig = auth.sign(&th)?;
+        // Rol-gebonden handtekening (L-5): initiator tekent SIG_LABEL_INITIATOR‖th.
+        confirm.sig = auth.sign(&role_bound_hash(SIG_LABEL_INITIATOR, &th))?;
         let tag = hmac::sign(&mac_key, &th);
         confirm.mac.copy_from_slice(tag.as_ref());
         let wire = confirm.encode()?;
@@ -588,14 +597,19 @@ impl Handshake {
             });
         }
 
-        // Authenticeer de INITIATOR via zijn handtekening over het transcript.
-        // Dit is wat de handshake wederzijds maakt: zonder geldige initiator-
-        // handtekening wordt de sessie NOOIT vertrouwd.
-        auth.verify(&transcript_hash, &conf.sig)
-            .map_err(|_| ChameleonError::Handshake {
-                state: "confirm".into(),
-                msg: "initiator signature verification failed (not the expected peer)".into(),
-            })?;
+        // Authenticeer de INITIATOR via zijn rol-gebonden handtekening (L-5) over
+        // het transcript. Dit is wat de handshake wederzijds maakt: zonder geldige
+        // initiator-handtekening wordt de sessie NOOIT vertrouwd. De rol-binding
+        // zorgt dat de responder-handtekening (over SIG_LABEL_RESPONDER‖th) hier
+        // niet als initiator-bewijs kan worden gereflecteerd.
+        auth.verify(
+            &role_bound_hash(SIG_LABEL_INITIATOR, &transcript_hash),
+            &conf.sig,
+        )
+        .map_err(|_| ChameleonError::Handshake {
+            state: "confirm".into(),
+            msg: "initiator signature verification failed (not the expected peer)".into(),
+        })?;
 
         Ok(Handshake::Established { session })
     }

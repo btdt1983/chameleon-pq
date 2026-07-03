@@ -95,7 +95,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 69 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 72 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -107,9 +107,12 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Schlüssel/Rauschen, Reassembler-Cap + Prune), Timing-/Cover-Traffic (die
   CBR-/Adaptive-/Cooldown-Logik des reinen Pacers, dass ein Cover-Paket als
   `Padding` zurückkommt und unter `Full`-Padding gleich lang + Header-verschieden
-  ist) und parallele Krypto (parallel versiegelte Pakete entschlüsseln alle mit
-  eindeutigen Countern, und `decrypt_batch_par` trennt Daten von Rauschen)
-  abdecken
+  ist), parallele Krypto (parallel versiegelte Pakete entschlüsseln alle mit
+  eindeutigen Countern, und `decrypt_batch_par` trennt Daten von Rauschen),
+  rollen-getrennte Handshake-Signaturen (eine reflektierte Responder-Signatur
+  wird als Confirm abgelehnt, selbst bei geteiltem Identitätsschlüssel) und den
+  bounded UDP-Handshake (gegenseitiger Abschluss über echte Sockets + sauberer
+  Timeout, wenn kein Responder antwortet) abdecken
 
 ## Build
 

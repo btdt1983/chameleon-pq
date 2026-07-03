@@ -5,7 +5,7 @@ use chameleon::frame::{Frame, FrameType};
 use chameleon::hsobf;
 use chameleon::obf::PadPolicy;
 use chameleon::session::{Session, SessionManager};
-use chameleon::tunnel::{fragment, Handshake, Reassembler};
+use chameleon::tunnel::{fragment, Handshake, HandshakeMessage, Reassembler};
 
 /// Fragmenteer en herassembleer een wire-bericht (de realistische wire-weg).
 fn roundtrip(sid: u32, wire: &Bytes) -> Bytes {
@@ -1330,4 +1330,115 @@ fn bench_crypto_parallel() {
         gbps(opar),
         oseq / opar
     );
+}
+
+// ── L-5: rol-gebonden handshake-handtekeningen ───────────────────────────────
+
+#[test]
+fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
+    // Domeinscheiding (L-5): responder tekent SIG_LABEL_RESPONDER‖th, initiator
+    // SIG_LABEL_INITIATOR‖th. Zelfs met IDENTIEKE identiteitssleutels aan beide
+    // kanten (het worst case voor reflectie) mag de responder-handtekening niet
+    // als initiator-bewijs in de Confirm gelden.
+    let seed = [7u8; 32];
+    let pubk = Ed25519Auth::derive_public(&seed);
+    let mk = || Ed25519Auth::new(&seed, pubk).unwrap(); // own == peer == pubk
+
+    // (A) Reflectiepoging: neem de responder-sig uit de Response en plak 'm in
+    //     een Confirm. Zonder rol-binding (beide over th, zelfde sleutel) zou dit
+    //     slagen; mét L-5 moet het falen.
+    let (_hs_init_a, init_wire_a) = Handshake::start(&mk()).unwrap();
+    let (hs_resp_a, resp_wire_a) = Handshake::respond(init_wire_a, 1, &mk()).unwrap();
+    let resp_msg_a = HandshakeMessage::decode(resp_wire_a).unwrap();
+    let mut forged = HandshakeMessage::new_confirm(resp_msg_a.sig.len()).unwrap();
+    forged.sig = resp_msg_a.sig;
+    assert!(
+        hs_resp_a.confirm(forged.encode().unwrap(), &mk()).is_err(),
+        "gereflecteerde responder-sig mag niet als initiator-bewijs gelden (L-5)"
+    );
+
+    // (B) Controle: met dezelfde gedeelde sleutel slaagt een ECHTE handshake nog
+    //     steeds -> de afwijzing in (A) komt door de rol-binding, niet doordat de
+    //     sleutel niet zou matchen.
+    let (hs_init_b, init_wire_b) = Handshake::start(&mk()).unwrap();
+    let (hs_resp_b, resp_wire_b) = Handshake::respond(init_wire_b, 1, &mk()).unwrap();
+    let (_done, confirm_wire_b) = hs_init_b.finalize(resp_wire_b, 1, &mk()).unwrap();
+    assert!(
+        matches!(
+            hs_resp_b.confirm(confirm_wire_b, &mk()).unwrap(),
+            Handshake::Established { .. }
+        ),
+        "echte confirm met gedeelde sleutel wordt wél geaccepteerd"
+    );
+}
+
+// ── M-2: bounded initiële handshake over echte UDP ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_over_udp_completes_mutual() {
+    use chameleon::net::{run_handshake_initiator, run_handshake_responder};
+    use tokio::net::UdpSocket;
+
+    let init_seed = [3u8; 32];
+    let resp_seed = [4u8; 32];
+    let init_pub = Ed25519Auth::derive_public(&init_seed);
+    let resp_pub = Ed25519Auth::derive_public(&resp_seed);
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+
+    // Responder in een aparte taak (de initiator retryt tot hij luistert).
+    let resp_task = tokio::spawn(async move {
+        let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
+        run_handshake_responder(&server, &resp_auth, None).await
+    });
+
+    let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
+    let init_session = run_handshake_initiator(&client, server_addr, &init_auth, None)
+        .await
+        .expect("initiator handshake ok");
+
+    let (resp_session, peer) = resp_task.await.unwrap().expect("responder handshake ok");
+    assert_eq!(peer, client_addr, "responder pint het initiator-bronadres");
+
+    // Beide kanten Established bewijst dat de wederzijdse auth ÉN de sleutel-
+    // afleiding klopten: `finalize` verifieert de responder-MAC over het gedeelde
+    // geheim en `confirm` de initiator-handtekening — een sleutel-mismatch zou
+    // daar al falen. (Een echte data-roundtrip zou hier stuklopen op de proces-
+    // globale session_id-teller: in productie draaien beide kanten als aparte
+    // processen met elk een teller die op 1 start; in één testproces lopen ze
+    // uiteen zodat het session_id in de AAD niet matcht.)
+    assert_eq!(
+        init_session.algo(),
+        resp_session.algo(),
+        "beide kanten onderhandelden dezelfde AEAD"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_initiator_times_out_without_responder() {
+    use chameleon::net::run_handshake_initiator;
+    use tokio::net::UdpSocket;
+
+    let init_auth = Ed25519Auth::new(&[5u8; 32], Ed25519Auth::derive_public(&[6u8; 32])).unwrap();
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // Een echt gebonden maar STILLE peer: die antwoordt nooit (geen ICMP-fout,
+    // dus we testen echt het timeout-pad, niet een socket-fout).
+    let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+
+    let start = std::time::Instant::now();
+    let res = run_handshake_initiator(&client, dead_addr, &init_auth, None).await;
+    assert!(
+        res.is_err(),
+        "geen response -> handshake faalt schoon (geen hang)"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "handshake moet bounded falen, niet oneindig hangen"
+    );
+    drop(dead);
 }
