@@ -258,6 +258,16 @@ impl DirectionalAead for AegisDir {
     }
 }
 
+// De AEGIS-sleutel staat als plain [u8;32] in het proces (de `aegis`-crate neemt
+// geen Zeroizing-sleutel). Wis 'm expliciet bij drop zodat hij niet in een core
+// dump/swap achterblijft. ChaCha via `ring` wist zijn eigen sleutel al bij drop.
+impl Drop for AegisDir {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+    }
+}
+
 // ── Constructor: bouw de juiste richting-cipher voor een algoritme ───────────
 
 pub fn make_directional(

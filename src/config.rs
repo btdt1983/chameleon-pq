@@ -24,6 +24,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -96,18 +97,24 @@ pub struct IdentityConfig {
 }
 
 impl IdentityConfig {
-    pub fn seed_bytes(&self) -> Result<[u8; 32]> {
-        hex_to_32(&self.ed25519_seed_hex, "identity.ed25519_seed_hex")
+    pub fn seed_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
+        // Zeroizing: de private seed wordt gewist zodra de caller 'm laat vallen,
+        // zodat hij niet in een core dump/swap achterblijft.
+        Ok(Zeroizing::new(hex_to_32(
+            &self.ed25519_seed_hex,
+            "identity.ed25519_seed_hex",
+        )?))
     }
     pub fn peer_pub_bytes(&self) -> Result<[u8; 32]> {
         hex_to_32(&self.peer_ed25519_pub_hex, "identity.peer_ed25519_pub_hex")
     }
 
-    /// Eigen ML-DSA secret key als bytes, indien geconfigureerd.
-    pub fn mldsa_secret_bytes(&self) -> Result<Option<Vec<u8>>> {
+    /// Eigen ML-DSA secret key als bytes, indien geconfigureerd. Zeroizing zodat
+    /// de secret key bij drop uit het geheugen wordt gewist.
+    pub fn mldsa_secret_bytes(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         self.mldsa_secret_hex
             .as_deref()
-            .map(|s| hex_to_vec(s, "identity.mldsa_secret_hex"))
+            .map(|s| hex_to_vec(s, "identity.mldsa_secret_hex").map(Zeroizing::new))
             .transpose()
     }
 

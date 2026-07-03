@@ -164,9 +164,19 @@ fn hs_obf_key_from_cfg(cfg: &AppConfig) -> anyhow::Result<Option<[u8; 32]>> {
     if !cfg.obfuscation.handshake {
         return Ok(None);
     }
-    let own_pub = Ed25519Auth::derive_public(&cfg.identity.seed_bytes()?);
+    let own_pub = Ed25519Auth::derive_public(&cfg.identity.seed_bytes()?[..]);
     let peer_pub = cfg.identity.peer_pub_bytes()?;
     let psk = cfg.obfuscation.psk_bytes()?;
+    if psk.is_none() {
+        warn!(
+            "obfuscation.psk_hex is niet gezet: de handshake-obfuscatiesleutel wordt \
+             afgeleid uit de PUBLIEKE Ed25519-sleutels. Een tegenstander die die \
+             pubkeys kent kan de handshake de-obfusceren én geldige obf-envelopes \
+             vervalsen — dat geeft geen DoS-gating tegen zulke tegenstanders (dure \
+             rekey-crypto/amplificatie). Zet obfuscation.psk_hex (>= 16 bytes) aan \
+             BEIDE kanten voor een echt geheime obfuscatiesleutel."
+        );
+    }
     Ok(Some(chameleon::hsobf::derive_hs_obf_key(
         &own_pub,
         &peer_pub,
@@ -182,14 +192,14 @@ fn hs_obf_key_from_cfg(cfg: &AppConfig) -> anyhow::Result<Option<[u8; 32]>> {
 fn build_auth(cfg: &AppConfig) -> anyhow::Result<Arc<dyn Authenticator>> {
     let seed = cfg.identity.seed_bytes()?;
     let peer_pub = cfg.identity.peer_pub_bytes()?;
-    let ed = Ed25519Auth::new(&seed, peer_pub)?;
+    let ed = Ed25519Auth::new(&seed[..], peer_pub)?;
 
     match (
         cfg.identity.mldsa_secret_bytes()?,
         cfg.identity.peer_mldsa_pub_bytes()?,
     ) {
         (Some(sk), Some(pk)) => {
-            let mldsa = MlDsaAuth::from_keys(&sk, &pk)?;
+            let mldsa = MlDsaAuth::from_keys(&sk[..], &pk)?;
             info!("peer-auth: hybrid Ed25519 + ML-DSA-65 (post-quantum signatures)");
             Ok(Arc::new(HybridAuth::new(vec![
                 Box::new(ed),
@@ -364,6 +374,7 @@ async fn run_tunnel_loops(
     let auth_in = auth.clone();
     let last_recv_in = last_recv.clone();
     let state_in = sock_state.clone();
+    let peer_in = peer;
     let inbound = tokio::spawn(async move {
         // Gebatchte ontvangst-buffers (GRO): één syscall levert meerdere
         // datagrammen, die we hieronder één voor één door de bestaande demux halen.
@@ -442,6 +453,18 @@ async fn run_tunnel_loops(
 
                         // Geen datapad → handshake-fragment of ruis: SERIEEL op de
                         // coördinator (rekey-state blijft op één thread).
+                        //
+                        // M-1: accepteer control-/handshake-verkeer ALLEEN van de
+                        // gevestigde peer. De rekey-demux hieronder stuurt een
+                        // ~8 KB response en doet dure crypto (Kyber+DH+ML-DSA);
+                        // met een ongepind bron-adres zou een gespooft `src`
+                        // reflectie/amplificatie naar een slachtoffer toelaten én
+                        // rekey-crypto op ruis verspillen. Het datapad hierboven is
+                        // al door de AEAD-tag beschermd en hoeft niet gepind.
+                        if src != peer_in {
+                            continue;
+                        }
+
                         // 2) Handshake-obfuscatie AAN.
                         if let Some(k) = hs_obf {
                             if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &datagram) {
