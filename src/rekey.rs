@@ -82,14 +82,15 @@ pub async fn rekey_as_initiator(
         match attempt_result {
             Ok(Ok(Some(resp_wire))) => {
                 // finalize verifieert de responder en geeft het Confirm-bericht.
-                return match hs.finalize(resp_wire, new_session_id, auth)? {
+                return match hs.finalize(resp_wire, auth)? {
                     (Handshake::Established { session }, confirm_wire) => {
                         // Verstuur Confirm zodat de responder ons authenticeert.
                         send_handshake(socket, peer, new_session_id, &confirm_wire, hs_obf).await?;
+                        let sid = session.session_id; // afgeleid session_id (I-13)
                         sessions.install_new_session(session);
                         info!(
                             "rekey complete after {attempt} attempt(s), mutual — \
-                               now on session {new_session_id}"
+                               now on session {sid}"
                         );
                         Ok(())
                     }
@@ -144,7 +145,7 @@ pub async fn rekey_as_responder(
     init_wire: Bytes,
     hs_obf: Option<&[u8; 32]>,
 ) -> Result<Handshake> {
-    match Handshake::respond(init_wire, new_session_id, auth)? {
+    match Handshake::respond(init_wire, auth)? {
         (hs @ Handshake::SentResponse { .. }, resp_wire) => {
             send_handshake(socket, peer, new_session_id, &resp_wire, hs_obf).await?;
             info!(
@@ -171,8 +172,11 @@ pub fn rekey_responder_confirm(
 ) -> Result<()> {
     match hs.confirm(confirm_wire, auth)? {
         Handshake::Established { session } => {
+            let sid = session.session_id; // afgeleid session_id (I-13)
             sessions.install_new_session(session);
-            info!("rekey (responder) complete, mutual — now on session {new_session_id}");
+            info!(
+                "rekey (responder) complete, mutual — now on session {sid} (req {new_session_id})"
+            );
             Ok(())
         }
         _ => Err(crate::error::ChameleonError::Handshake {

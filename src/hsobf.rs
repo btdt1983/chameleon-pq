@@ -23,7 +23,7 @@
 //!
 //! EERLIJKE GRENS: dit is OBFUSCATIE, geen extra beveiliging. De statische
 //! sleutel geeft géén forward secrecy en géén echte authenticatie — de échte
-//! handshake-crypto (Kyber+X25519 ephemeral, transcript-ondertekening in
+//! handshake-crypto (ML-KEM+X25519 ephemeral, transcript-ondertekening in
 //! tunnel.rs) blijft ongewijzigd en levert alle daadwerkelijke veiligheid. Een
 //! tegenstander die beide pubkeys al heeft kan de-obfusceren (gebruik dan
 //! psk_hex). De ~8 KB totale omvang en de 2-RTT burst-timing blijven zichtbaar;

@@ -3,7 +3,7 @@
 *[🇬🇧 English](README.md) | 🇩🇪 Deutsch*
 
 Experimentelles hybrides Post-Quanten-VPN, geschrieben in Rust. Kombiniert
-Kyber768 (KEM) mit X25519 für den Schlüsselaustausch und eine hybride
+ML-KEM-768 (KEM) mit X25519 für den Schlüsselaustausch und eine hybride
 Ed25519 + ML-DSA-65 (FIPS 204)-Signatur für die Peer-Authentifizierung,
 über UDP mit einer TUN-Schnittstelle unter Linux/macOS/Windows.
 
@@ -32,11 +32,11 @@ Bekannte Einschränkungen des Geltungsbereichs:
   konfigurierte Rate ist zugleich die Untergrenze
   und das Durchsatz-Limit
 - ML-DSA ist für die Authentifizierung integriert, der Schlüsselaustausch
-  kombiniert aber weiterhin Kyber768 mit X25519 (kein zweites PQ-KEM)
+  kombiniert aber weiterhin ML-KEM-768 mit X25519 (kein zweites PQ-KEM)
 
 ## Was funktioniert
 
-- Hybrider Post-Quanten-Handshake (Kyber768 + X25519, beide ephemer → PFS)
+- Hybrider Post-Quanten-Handshake (ML-KEM-768 + X25519, beide ephemer → PFS)
 - Gegenseitige Authentifizierung: 3-Nachrichten-Handshake (2-RTT), bei dem
   beide Peers das Transcript signieren; der Responder gewährt kein
   Vertrauen, bis das Confirm des Initiators verifiziert ist
@@ -95,7 +95,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 74 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 75 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide

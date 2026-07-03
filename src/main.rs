@@ -464,7 +464,7 @@ async fn run_tunnel_loops(
                         //
                         // M-1: accepteer control-/handshake-verkeer ALLEEN van de
                         // gevestigde peer. De rekey-demux hieronder stuurt een
-                        // ~8 KB response en doet dure crypto (Kyber+DH+ML-DSA);
+                        // ~8 KB response en doet dure crypto (ML-KEM+DH+ML-DSA);
                         // met een ongepind bron-adres zou een gespooft `src`
                         // reflectie/amplificatie naar een slachtoffer toelaten én
                         // rekey-crypto op ruis verspillen. Het datapad hierboven is

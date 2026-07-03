@@ -45,9 +45,9 @@ fn full_handshake_derives_matching_keys_and_tunnels_data() {
     let init_wire2 = reassembled.expect("reassembly compleet");
     assert_eq!(init_wire2, init_wire);
 
-    let (hs_resp, resp_wire) = Handshake::respond(init_wire2, 1, &resp_auth).unwrap();
+    let (hs_resp, resp_wire) = Handshake::respond(init_wire2, &resp_auth).unwrap();
     // Initiator verifieert responder en produceert het Confirm-bericht.
-    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_wire, 1, &init_auth).unwrap();
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_wire, &init_auth).unwrap();
     // Responder verifieert de initiator via de Confirm -> wederzijds vertrouwd.
     let hs_resp_done = hs_resp.confirm(confirm_wire, &resp_auth).unwrap();
 
@@ -106,8 +106,8 @@ fn wrong_peer_identity_fails_auth() {
     let resp_auth = Ed25519Auth::new(&resp_seed, [0u8; 32]).unwrap();
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
-    let (_hs_resp, resp_wire) = Handshake::respond(init_wire, 1, &resp_auth).unwrap();
-    let result = hs_init.finalize(resp_wire, 1, &init_auth);
+    let (_hs_resp, resp_wire) = Handshake::respond(init_wire, &resp_auth).unwrap();
+    let result = hs_init.finalize(resp_wire, &init_auth);
     assert!(
         result.is_err(),
         "MITM responder had moeten falen bij finalize"
@@ -129,9 +129,9 @@ fn wrong_peer_identity_fails_auth() {
     let resp_wrong_expect = Ed25519Auth::new(&resp_real_seed, [0x77u8; 32]).unwrap();
 
     let (hs_init2, init_wire2) = Handshake::start(&init_ok).unwrap();
-    let (_hs_resp2, resp_wire2) = Handshake::respond(init_wire2, 1, &resp_wrong_expect).unwrap();
+    let (_hs_resp2, resp_wire2) = Handshake::respond(init_wire2, &resp_wrong_expect).unwrap();
     assert!(
-        hs_init2.finalize(resp_wire2, 1, &init_ok).is_err(),
+        hs_init2.finalize(resp_wire2, &init_ok).is_err(),
         "verkeerde initiator-verwachting poison't het transcript -> finalize faalt (L-6)"
     );
 }
@@ -299,11 +299,11 @@ fn mutual_handshake_three_messages_with_fragmentation() {
     let init_rx = roundtrip(1, &init_wire);
 
     // 2. Response
-    let (hs_resp, resp_wire) = Handshake::respond(init_rx, 1, &resp_auth).unwrap();
+    let (hs_resp, resp_wire) = Handshake::respond(init_rx, &resp_auth).unwrap();
     let resp_rx = roundtrip(1, &resp_wire);
 
     // 3. Confirm
-    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, 1, &init_auth).unwrap();
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, &init_auth).unwrap();
     let confirm_rx = roundtrip(1, &confirm_wire);
     let hs_resp_done = hs_resp.confirm(confirm_rx, &resp_auth).unwrap();
 
@@ -341,8 +341,8 @@ fn aead_negotiation_picks_aegis_when_supported() {
     let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
-    let (hs_resp, resp_wire) = Handshake::respond(init_wire, 1, &resp_auth).unwrap();
-    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_wire, 1, &init_auth).unwrap();
+    let (hs_resp, resp_wire) = Handshake::respond(init_wire, &resp_auth).unwrap();
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_wire, &init_auth).unwrap();
     let hs_resp_done = hs_resp.confirm(confirm_wire, &resp_auth).unwrap();
 
     let init_session = match hs_init_done {
@@ -407,9 +407,9 @@ fn hybrid_pq_handshake_tunnels_data_both_ways() {
     );
 
     let init_rx = roundtrip(1, &init_wire);
-    let (hs_resp, resp_wire) = Handshake::respond(init_rx, 1, &resp_auth).unwrap();
+    let (hs_resp, resp_wire) = Handshake::respond(init_rx, &resp_auth).unwrap();
     let resp_rx = roundtrip(1, &resp_wire);
-    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, 1, &init_auth).unwrap();
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, &init_auth).unwrap();
     let confirm_rx = roundtrip(1, &confirm_wire);
     let hs_resp_done = hs_resp.confirm(confirm_rx, &resp_auth).unwrap();
 
@@ -457,10 +457,10 @@ fn hybrid_pq_wrong_mldsa_key_fails_even_when_ed25519_matches() {
     ]);
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
-    let (_hs_resp, resp_wire) = Handshake::respond(init_wire, 1, &resp_auth).unwrap();
+    let (_hs_resp, resp_wire) = Handshake::respond(init_wire, &resp_auth).unwrap();
     // De responder ondertekende met zijn ECHTE ML-DSA-sleutel; de initiator
     // verifieert tegen de VERKEERDE -> finalize moet falen, ook al matcht Ed25519.
-    let result = hs_init.finalize(resp_wire, 1, &init_auth);
+    let result = hs_init.finalize(resp_wire, &init_auth);
     assert!(
         result.is_err(),
         "verkeerde ML-DSA-peer-sleutel moet de hybride handshake laten falen"
@@ -805,9 +805,9 @@ fn hs_obf_full_mutual_handshake() {
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
     let init_rx = hs_roundtrip(&key, &init_wire);
-    let (hs_resp, resp_wire) = Handshake::respond(init_rx, 1, &resp_auth).unwrap();
+    let (hs_resp, resp_wire) = Handshake::respond(init_rx, &resp_auth).unwrap();
     let resp_rx = hs_roundtrip(&key, &resp_wire);
-    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, 1, &init_auth).unwrap();
+    let (hs_init_done, confirm_wire) = hs_init.finalize(resp_rx, &init_auth).unwrap();
     let confirm_rx = hs_roundtrip(&key, &confirm_wire);
     let hs_resp_done = hs_resp.confirm(confirm_rx, &resp_auth).unwrap();
 
@@ -1345,7 +1345,7 @@ fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
     //     een Confirm. Zonder rol-binding (beide over th, zelfde sleutel) zou dit
     //     slagen; mét L-5 moet het falen.
     let (_hs_init_a, init_wire_a) = Handshake::start(&mk()).unwrap();
-    let (hs_resp_a, resp_wire_a) = Handshake::respond(init_wire_a, 1, &mk()).unwrap();
+    let (hs_resp_a, resp_wire_a) = Handshake::respond(init_wire_a, &mk()).unwrap();
     let resp_msg_a = HandshakeMessage::decode(resp_wire_a).unwrap();
     let mut forged = HandshakeMessage::new_confirm(resp_msg_a.sig.len()).unwrap();
     forged.sig = resp_msg_a.sig;
@@ -1358,8 +1358,8 @@ fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
     //     steeds -> de afwijzing in (A) komt door de rol-binding, niet doordat de
     //     sleutel niet zou matchen.
     let (hs_init_b, init_wire_b) = Handshake::start(&mk()).unwrap();
-    let (hs_resp_b, resp_wire_b) = Handshake::respond(init_wire_b, 1, &mk()).unwrap();
-    let (_done, confirm_wire_b) = hs_init_b.finalize(resp_wire_b, 1, &mk()).unwrap();
+    let (hs_resp_b, resp_wire_b) = Handshake::respond(init_wire_b, &mk()).unwrap();
+    let (_done, confirm_wire_b) = hs_init_b.finalize(resp_wire_b, &mk()).unwrap();
     assert!(
         matches!(
             hs_resp_b.confirm(confirm_wire_b, &mk()).unwrap(),
@@ -1400,18 +1400,15 @@ async fn handshake_over_udp_completes_mutual() {
     let (resp_session, peer) = resp_task.await.unwrap().expect("responder handshake ok");
     assert_eq!(peer, client_addr, "responder pint het initiator-bronadres");
 
-    // Beide kanten Established bewijst dat de wederzijdse auth ÉN de sleutel-
-    // afleiding klopten: `finalize` verifieert de responder-MAC over het gedeelde
-    // geheim en `confirm` de initiator-handtekening — een sleutel-mismatch zou
-    // daar al falen. (Een echte data-roundtrip zou hier stuklopen op de proces-
-    // globale session_id-teller: in productie draaien beide kanten als aparte
-    // processen met elk een teller die op 1 start; in één testproces lopen ze
-    // uiteen zodat het session_id in de AAD niet matcht.)
+    // Sinds I-13 leiden beide kanten hetzelfde session_id uit het gedeelde geheim
+    // af (geen proces-globale teller meer), dus een echte data-roundtrip werkt óók
+    // in één testproces: dit bewijst matchende directionele sleutels + session_id.
     assert_eq!(
-        init_session.algo(),
-        resp_session.algo(),
-        "beide kanten onderhandelden dezelfde AEAD"
+        init_session.session_id, resp_session.session_id,
+        "beide kanten leiden hetzelfde session_id af (I-13)"
     );
+    let (ctr, ct) = init_session.encrypt(b"udp ping").unwrap();
+    assert_eq!(&resp_session.decrypt(ctr, &ct).unwrap()[..], b"udp ping");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1484,7 +1481,53 @@ fn respond_rejects_low_order_x25519_point() {
     let tampered = init_msg.encode().unwrap();
 
     assert!(
-        Handshake::respond(tampered, 1, &resp_auth).is_err(),
+        Handshake::respond(tampered, &resp_auth).is_err(),
         "low-order/all-zero X25519-punt moet worden geweigerd (L-9)"
+    );
+}
+
+// ── I-13: session_id afgeleid uit het gedeelde geheim ────────────────────────
+
+#[test]
+fn derived_session_id_matches_across_sides_and_differs_per_handshake() {
+    let i = [1u8; 32];
+    let r = [9u8; 32];
+    let i_pub = Ed25519Auth::derive_public(&i);
+    let r_pub = Ed25519Auth::derive_public(&r);
+    let mk_i = || Ed25519Auth::new(&i, r_pub).unwrap();
+    let mk_r = || Ed25519Auth::new(&r, i_pub).unwrap();
+
+    let run = || {
+        let (hs_i, init_w) = Handshake::start(&mk_i()).unwrap();
+        let (hs_r, resp_w) = Handshake::respond(init_w, &mk_r()).unwrap();
+        let (done_i, conf_w) = hs_i.finalize(resp_w, &mk_i()).unwrap();
+        let done_r = hs_r.confirm(conf_w, &mk_r()).unwrap();
+        let sid_i = match done_i {
+            Handshake::Established { session } => session.session_id,
+            _ => panic!("initiator niet Established"),
+        };
+        let sid_r = match done_r {
+            Handshake::Established { session } => session.session_id,
+            _ => panic!("responder niet Established"),
+        };
+        (sid_i, sid_r)
+    };
+
+    let (a_i, a_r) = run();
+    let (b_i, b_r) = run();
+    // Beide kanten van één handshake komen op hetzelfde id uit.
+    assert_eq!(
+        a_i, a_r,
+        "beide kanten leiden hetzelfde session_id af (I-13)"
+    );
+    assert_eq!(
+        b_i, b_r,
+        "beide kanten leiden hetzelfde session_id af (I-13)"
+    );
+    // Twee losse handshakes (verse ephemeral shared) geven verschillende ids,
+    // zodat current/previous tijdens een rekey-overlap uit elkaar te houden zijn.
+    assert_ne!(
+        a_i, b_i,
+        "verschillende handshakes -> verschillend session_id"
     );
 }

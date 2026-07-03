@@ -75,6 +75,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
         continue-on-error: true   # informational at this stage
 
+      - name: Cargo audit (RustSec advisory scan)
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
+        continue-on-error: true   # informational — flags vulnerable/yanked deps
+
   # Tagged releases (e.g. `git tag v0.1.0 && git push --tags`) automatically
   # publish a GitHub Release with the built binaries attached.
   release:

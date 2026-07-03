@@ -1,16 +1,9 @@
-//! Netwerk-glue: UDP-socket loops die de handshake en het datapad bedraden.
-//!
-//! KRISTALHELDERE API-PUNTEN (waar pakketten in/uit gaan):
-//!   • inbound  : socket.recv -> dispatch_inbound()  -> TUN-write kanaal
-//!   • outbound : TUN-read kanaal -> batch -> engine -> socket.send
-//!
-//! De TUN-driver zelf zit hier NIET in (platform-afhankelijk). In plaats
-//! daarvan exposeren we twee mpsc-kanalen die de TUN-laag aankoppelt:
-//!   tun_to_net  (Receiver<Bytes>) : plaintext IP-pakketten van de TUN
-//!   net_to_tun  (Sender<Bytes>)   : plaintext IP-pakketten naar de TUN
+//! Netwerk-glue: de UDP-bedrading van de INITIËLE handshake (initiator +
+//! responder, met fragmentatie/obfuscatie) plus kleine helpers. De live in/
+//! outbound-datapadloops draaien in `main.rs::run_tunnel_loops`; die is de enige
+//! socket-lezer (sole-reader-invariant, zie rekey.rs).
 
 use crate::crypto::Authenticator;
-use crate::engine::{CryptoEngine, OutboundPacket};
 use crate::error::{ChameleonError, Result};
 use crate::frame::{Frame, FrameType};
 use crate::hsobf;
@@ -18,15 +11,11 @@ use crate::tunnel::{fragment, Handshake, Reassembler};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::time::{interval, timeout, Duration};
-use tracing::{debug, error, info, warn};
+use tokio::time::{timeout, Duration};
+use tracing::{debug, info, warn};
 
 const UDP_BUF: usize = 65_536;
-const MAX_BATCH: usize = 256;
-const BATCH_LINGER: Duration = Duration::from_micros(200);
 
 /// Timeouts voor de INITIËLE handshake (M-2). De initiator herverzendt zijn init
 /// bij uitblijvende response (bounded retry, ephemeral sleutels blijven gelijk).
@@ -43,112 +32,6 @@ pub fn alloc_session_id() -> u32 {
 }
 fn next_session_id() -> u32 {
     SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Het lopende geheel zodra een sessie tot stand is gekomen.
-///
-/// LEGACY/ONGEBRUIKT: de binary draait zijn eigen in/outbound-loops in
-/// `main.rs::run_tunnel_loops`; dáár leeft de obfuscatie-integratie (obf.rs).
-/// Deze struct is een oudere parallelle variant die niet is bedraad. Behouden
-/// als referentie; `run_inbound` hieronder gebruikt nog het klassieke
-/// (niet-geobfusceerde) pad.
-pub struct Tunnel {
-    socket: Arc<UdpSocket>,
-    engine: Arc<CryptoEngine>,
-    peer: SocketAddr,
-}
-
-impl Tunnel {
-    pub fn new(socket: Arc<UdpSocket>, engine: Arc<CryptoEngine>, peer: SocketAddr) -> Self {
-        Self {
-            socket,
-            engine,
-            peer,
-        }
-    }
-
-    /// OUTBOUND: plaintext van de TUN -> versleutel (batched) -> UDP.
-    /// Dit is de low-latency/high-throughput splitsing: de engine kiest CPU/GPU.
-    pub async fn run_outbound(&self, mut tun_to_net: mpsc::Receiver<Bytes>) {
-        let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
-        let mut tick = interval(BATCH_LINGER);
-
-        loop {
-            tokio::select! {
-                maybe = tun_to_net.recv() => {
-                    match maybe {
-                        Some(pkt) => {
-                            pending.push(OutboundPacket { plaintext: pkt });
-                            if pending.len() >= MAX_BATCH {
-                                self.flush(&mut pending).await;
-                            }
-                        }
-                        None => break, // TUN-kanaal gesloten
-                    }
-                }
-                _ = tick.tick() => {
-                    if !pending.is_empty() {
-                        self.flush(&mut pending).await;
-                    }
-                    if self.engine.sessions().needs_rekey() {
-                        info!("rekey threshold reached (rekey trigger hook)");
-                        // Hier zou run_handshake_initiator opnieuw draaien en
-                        // engine.sessions().install_new_session() aanroepen.
-                    }
-                }
-            }
-        }
-    }
-
-    async fn flush(&self, pending: &mut Vec<OutboundPacket>) {
-        let batch = std::mem::take(pending);
-        match self.engine.encrypt_batch(batch) {
-            Ok(wires) => {
-                for wire in wires {
-                    if let Err(e) = self.socket.send_to(&wire, self.peer).await {
-                        error!("udp send error: {e}");
-                    }
-                }
-            }
-            Err(e) => error!("batch encrypt failed: {e}"),
-        }
-    }
-
-    /// INBOUND: UDP -> ontsleutel -> plaintext naar de TUN.
-    pub async fn run_inbound(&self, net_to_tun: mpsc::Sender<Bytes>) {
-        let mut buf = vec![0u8; UDP_BUF];
-        loop {
-            let (n, _src) = match self.socket.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("recv error: {e}");
-                    continue;
-                }
-            };
-            let frame = match Frame::decode(Bytes::copy_from_slice(&buf[..n])) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!("bad frame: {e}");
-                    continue;
-                }
-            };
-            if frame.frame_type != FrameType::Data {
-                continue; // handshake-frames worden in de setup-fase afgehandeld
-            }
-            match self
-                .engine
-                .sessions()
-                .decrypt(frame.session_id, frame.sequence, &frame.payload)
-            {
-                Ok(plain) => {
-                    if net_to_tun.send(plain).await.is_err() {
-                        break; // TUN-kanaal gesloten
-                    }
-                }
-                Err(e) => debug!("decrypt drop (replay/bad): {e}"),
-            }
-        }
-    }
 }
 
 // ── Handshake-bedrading over UDP (met fragmentatie) ──────────────────────────
@@ -267,12 +150,15 @@ pub async fn run_handshake_initiator(
     })?;
 
     // finalize verifieert de responder EN geeft het Confirm-bericht terug.
-    match hs.finalize(resp_wire, session_id, auth)? {
+    match hs.finalize(resp_wire, auth)? {
         (Handshake::Established { session }, confirm_wire) => {
             // Verstuur het Confirm-bericht zodat de responder óns kan
             // authenticeren (wederzijdse auth).
             send_handshake(socket, peer, session_id, &confirm_wire, hs_obf).await?;
-            info!("handshake complete (initiator, mutual), session {session_id}");
+            info!(
+                "handshake complete (initiator, mutual), session {}",
+                session.session_id
+            );
             Ok(session)
         }
         _ => Err(ChameleonError::Handshake {
@@ -306,12 +192,12 @@ pub async fn run_handshake_responder(
         let (hs, peer_addr) = loop {
             let (n, src) = socket.recv_from(&mut buf).await?;
             match push_handshake(&mut reasm, &buf[..n], hs_obf) {
-                Ok(Some(init_wire)) => match Handshake::respond(init_wire, session_id, auth) {
+                Ok(Some(init_wire)) => match Handshake::respond(init_wire, auth) {
                     Ok((hs, resp_wire)) => {
                         send_handshake(socket, src, session_id, &resp_wire, hs_obf).await?;
                         break (hs, src);
                     }
-                    // Ongeldige init (bv. kapotte Kyber-key): overslaan, blijf luisteren.
+                    // Ongeldige init (bv. kapotte ML-KEM-key): overslaan, blijf luisteren.
                     Err(e) => {
                         warn!("ignoring bad handshake init from {src}: {e}");
                         reasm = Reassembler::default();
@@ -340,7 +226,10 @@ pub async fn run_handshake_responder(
         match confirmed {
             Ok(Ok(confirm_wire)) => match hs.confirm(confirm_wire, auth) {
                 Ok(Handshake::Established { session }) => {
-                    info!("handshake complete (responder, mutual), session {session_id}");
+                    info!(
+                        "handshake complete (responder, mutual), session {}",
+                        session.session_id
+                    );
                     return Ok((session, peer_addr));
                 }
                 Ok(_) => {

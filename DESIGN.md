@@ -39,16 +39,16 @@ endpoint.
 
 ## 2. Hybrid post-quantum key agreement
 
-**Decision:** combine X25519 (classical ECDH) with Kyber768 (post-quantum
+**Decision:** combine X25519 (classical ECDH) with ML-KEM-768 (post-quantum
 KEM), both ephemeral, and derive the session key from *both* shared
 secrets concatenated through HKDF.
 
 **Why hybrid and not pure post-quantum:** post-quantum algorithms are
 young. Their mathematical assumptions have far fewer years of scrutiny
 than classical ECDH. By combining the two, the session stays secure as
-long as *either* leg holds. A break in Kyber alone does not break the
+long as *either* leg holds. A break in ML-KEM alone does not break the
 session (X25519 still protects it); a quantum computer that breaks X25519
-does not break the session (Kyber still protects it). You are only
+does not break the session (ML-KEM still protects it). You are only
 vulnerable if both fall at once. This is strictly safer than betting on
 one alone.
 
@@ -98,7 +98,7 @@ wrapped alongside `Ed25519Auth` in `HybridAuth`; the state machine did not
 change. (See §9 for the message-size consequence, which is now realised.)
 
 **Why ML-DSA-65 specifically:** it targets the ~192-bit (NIST level 3)
-security category, the common middle choice, matching the level of Kyber768
+security category, the common middle choice, matching the level of ML-KEM-768
 in the KEM. Keys and signatures are large (public key ~1952 B, signature
 ~3309 B), which is exactly why the handshake had to grow (§9). ML-DSA keys
 are not derivable from a short seed, so `keygen` emits a full keypair and
@@ -165,7 +165,7 @@ monotonic-counter uniqueness guarantee (§5) holds for both.
 **A note on "post-quantum" and the cipher:** AEGIS does not add quantum
 resistance. Symmetric ciphers with 256-bit keys (both ChaCha20-Poly1305
 and AEGIS-256) already retain ~128-bit strength against Grover's
-algorithm. The post-quantum protection lives entirely in the Kyber key
+algorithm. The post-quantum protection lives entirely in the ML-KEM key
 exchange (§2), independent of which AEAD is chosen. AEGIS buys speed and a
 stronger AEAD, not extra quantum safety.
 
@@ -301,13 +301,13 @@ feeding the rekey driver through a channel, eliminates the race.
 
 **Decision:** handshake messages are a fixed 8192 bytes, padded with
 cryptographically random noise, with a single KEM slot that carries the
-Kyber public key (init) or ciphertext (response). The data path uses a
+ML-KEM public key (init) or ciphertext (response). The data path uses a
 separate, MTU-safe frame (<1280 B). Handshake messages are fragmented for
 transport; the data path is not.
 
 **Why 8192 and not 2048:** the original 2048 fit only the Ed25519 (64 B)
 signature. The hybrid signature is Ed25519 (64 B) + ML-DSA-65 (3309 B) =
-3373 B, which together with the Kyber public key in the KEM slot overflows
+3373 B, which together with the ML-KEM public key in the KEM slot overflows
 2048. 8192 leaves comfortable headroom and keeps Init/Response/Confirm all
 the same size regardless of which signature scheme is in use — so the
 message size leaks neither the message type nor whether ML-DSA is enabled.
@@ -318,15 +318,15 @@ distinguish an init message from a response by size, and the padded tail
 has no recognizable structure. This is a first step toward making the
 handshake hard to fingerprint.
 
-**Why a single shared KEM slot:** the Kyber public key (1184 B) and
+**Why a single shared KEM slot:** the ML-KEM public key (1184 B) and
 ciphertext (1088 B) differ in size. Using one fixed-size slot for both,
 with the unused tail filled with noise, keeps the wire layout identical
 in shape between the two message types. Phase validation (is this a valid
-Kyber public key / ciphertext?) plus the transcript MAC ensure a noise
+ML-KEM public key / ciphertext?) plus the transcript MAC ensure a noise
 field is never mistaken for real data.
 
 **Why handshake size forces fragmentation:** post-quantum keys are large.
-You cannot fit a Kyber-bearing handshake in a single MTU-safe datagram —
+You cannot fit a ML-KEM-bearing handshake in a single MTU-safe datagram —
 this is inherent to PQ crypto, not a design flaw. The handshake is a
 once-per-session event, so a handful of fragments there cost nothing
 meaningful. The data path stays under the MTU. With the hybrid ML-DSA
@@ -390,7 +390,7 @@ unchanged `HandshakeMessage::decode`.
 
 **Why this is obfuscation, not extra security:** the static key gives no forward
 secrecy and no real authentication — the genuine handshake security (ephemeral
-Kyber+X25519, transcript signing, §2–§3) is untouched. It is a pure outer
+ML-KEM+X25519, transcript signing, §2–§3) is untouched. It is a pure outer
 wrapper whose only job is to erase the wire fingerprint.
 
 **Honest limitation (what remains):** the handshake obfuscation key is derived
@@ -490,7 +490,7 @@ guarantees; until then, its absence is a feature, not a gap.
 ## 12. CPU vs GPU, stated plainly
 
 For the record, because it is counter-intuitive: the heavy, once-per-
-connection mathematics (Kyber, ML-DSA, the signatures) belongs on the
+connection mathematics (ML-KEM, ML-DSA, the signatures) belongs on the
 **CPU**, not the GPU — there is no volume to parallelize over. The simple,
 endlessly-repeated mathematics (per-packet AEAD) is the *only* GPU
 candidate, and even that wins only at extreme bulk. So the architecture
@@ -506,7 +506,7 @@ These are stated plainly so no one mistakes intent for proof:
 1. **No external security audit.** A self-built protocol is unproven
    until reviewed by qualified cryptographers. This remains the single
    most important caveat, and it is not something code changes can fix.
-2. **Single PQ KEM.** The key exchange is Kyber768 + X25519 (hybrid
+2. **Single PQ KEM.** The key exchange is ML-KEM-768 + X25519 (hybrid
    classical/PQ), not a hybrid of two independent PQ KEMs.
 3. **Partial traffic-analysis resistance.** The data path, the handshake
    envelope, and (optionally) packet *timing* are now obfuscated — random-looking
@@ -554,3 +554,16 @@ These are stated plainly so no one mistakes intent for proof:
   via rayon (`engine.rs`, `spawn_blocking`-bridged), ~4.5×/~13× on 12 threads,
   capped by `[engine].workers`. Unpaced fast path only; no wire/crypto change.
   See §4a.
+- **Security-review hardening (0.5.1–0.6.0).** A self-review drove: pinning the
+  control plane to the established peer (kills a reflection/amplification vector),
+  a bounded initial handshake (no permanent wedge, no crash on a malformed init),
+  role-separated transcript signatures (a responder signature can't be reflected
+  as a Confirm), binding both identities into the transcript (unknown-key-share
+  defense), rejecting an all-zero/low-order X25519 output, zeroizing long-lived
+  key material, and a loud warning on the unauthenticated obf-off debug mode.
+- **KEM standard.** The key exchange migrated from pre-standard Kyber768 to
+  **FIPS 203 ML-KEM-768** (`pqcrypto-mlkem`) — same 1184/1088 sizes, standardized
+  algorithm. Handshake-incompatible (PROTO_VERSION bump).
+- **Handshake-derived session id.** The per-session id is now derived from the
+  shared secret (`crypto::derive_session_id`) instead of a process-global
+  counter, so both ends always agree without a counter that could desync.

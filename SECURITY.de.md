@@ -21,7 +21,7 @@ willkommen.
 
 - Es wurde kein externes Audit durchgeführt
 - Die Authentifizierung ist hybrid (Ed25519 + ML-DSA-65), aber der
-  Schlüsselaustausch ist Kyber768 + X25519 – ein einzelnes PQ-KEM, kein
+  Schlüsselaustausch ist ML-KEM-768 + X25519 – ein einzelnes PQ-KEM, kein
   Hybrid aus zwei PQ-KEMs
 - Der Datenpfad, die Handshake-Hülle und (optional) das Paket-Timing sind
   verschleiert – Zufallsbytes-Datagramme, verborgene Größen und Constant-Rate-
