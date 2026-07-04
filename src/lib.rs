@@ -12,6 +12,7 @@ pub mod rekey;
 pub mod session;
 pub mod tun_iface;
 pub mod tunnel;
+pub mod tunnel_loops;
 pub mod udp;
 
 pub use error::{ChameleonError, Result};

@@ -101,7 +101,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 83 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 84 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -129,6 +129,11 @@ Bekannte Einschränkungen des Geltungsbereichs:
   `cargo test` (`tests/fuzz_parsers.rs`), dazu coverage-guided `cargo-fuzz`-Targets
   in `fuzz/` (Nightly; wöchentlicher CI-Job). ~18 Mio. Ausführungen fanden keinen
   Panic
+- End-to-End-Tunnel-Test (`tests/e2e_tunnel.rs`): die **echten** Tunnel-Loops
+  (`tunnel_loops::run_tunnel_loops`) laufen auf beiden Seiten über Loopback-UDP
+  mit einem Mock-TUN, und Klartext fließt in beide Richtungen durch den
+  vollständigen Handshake (inkl. L-4-Cookie-Round-Trip) → Seal → GSO-Send →
+  GRO-Recv → Decrypt → TUN-Pfad
 
 ## Build
 
