@@ -40,6 +40,12 @@ Bekannte Einschränkungen des Geltungsbereichs:
 - Gegenseitige Authentifizierung: 3-Nachrichten-Handshake (2-RTT), bei dem
   beide Peers das Transcript signieren; der Responder gewährt kein
   Vertrauen, bis das Confirm des Initiators verifiziert ist
+- Return-Routability-Cookie (WireGuard-Stil, stateless): der Responder macht
+  keine teure ML-KEM/DH/ML-DSA-Arbeit, bis der Initiator ein an seine
+  Quelladresse gebundenes Cookie zurückspiegelt — eine gespoofte/unverifizierte
+  Quelle kann so weder den teuren Handshake noch eine große reflektierte Antwort
+  auslösen. Die CookieChallenge ist eine vollwertige verschleierte Nachricht und
+  fällt daher nicht auf
 - Hybride Ed25519 + ML-DSA-65 (FIPS 204)-Transcript-Signierung zur
   Peer-Authentifizierung (vorab geteilte Identitäten) – die Signatur hält,
   solange *eines* der beiden Verfahren ungebrochen ist; fällt auf
@@ -95,7 +101,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 75 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 77 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -113,7 +119,10 @@ Bekannte Einschränkungen des Geltungsbereichs:
   wird als Confirm abgelehnt, selbst bei geteiltem Identitätsschlüssel), den
   bounded UDP-Handshake (gegenseitiger Abschluss über echte Sockets + sauberer
   Timeout, wenn kein Responder antwortet), Identitätsbindung (symmetrisch,
-  peer-abhängig) und die Ablehnung von low-order/all-zero-X25519-Punkten abdecken
+  peer-abhängig), die Ablehnung von low-order/all-zero-X25519-Punkten und das
+  Return-Routability-Cookie (deterministisch + eingabeabhängig, und eine Init
+  ohne Cookie wird mit einer CookieChallenge statt einer teuren Response
+  beantwortet) abdecken
 
 ## Build
 

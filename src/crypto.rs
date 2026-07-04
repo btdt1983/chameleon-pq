@@ -4,8 +4,10 @@
 use crate::error::{ChameleonError, Result};
 use pqcrypto_mldsa::mldsa65;
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
+use ring::hmac;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, SocketAddr};
 use zeroize::Zeroizing;
 
 // ── Authenticator-trait: het uitbreidingspunt voor hybride auth ──────────────
@@ -310,6 +312,26 @@ pub fn derive_session_id(shared: &[u8; 32]) -> u32 {
     h.update(shared);
     let d = h.finalize();
     u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+}
+
+/// Bereken een return-routability cookie voor een bronadres (L-4). Puur een
+/// anti-DoS-token: bewijst dat de afzender op `src` kan ontvangen vóór de
+/// responder dure ML-KEM/DH/ML-DSA-crypto doet of een grote Response stuurt.
+/// HMAC-SHA256 over (ip ‖ poort ‖ tijdvenster), afgekapt tot 16 bytes; niet in
+/// het transcript (raakt de sleutelafleiding niet).
+pub fn compute_cookie(secret: &[u8; 32], src: &SocketAddr, time_bucket: u64) -> [u8; 16] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+    let mut ctx = hmac::Context::with_key(&key);
+    match src.ip() {
+        IpAddr::V4(v4) => ctx.update(&v4.octets()),
+        IpAddr::V6(v6) => ctx.update(&v6.octets()),
+    }
+    ctx.update(&src.port().to_le_bytes());
+    ctx.update(&time_bucket.to_le_bytes());
+    let tag = ctx.sign();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&tag.as_ref()[..16]);
+    out
 }
 
 pub fn mac_key_from(shared: &[u8; 32]) -> [u8; 32] {
