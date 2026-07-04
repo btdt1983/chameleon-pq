@@ -91,7 +91,7 @@ Known scope limits:
   path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
   on (default) the configured rate caps throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 83 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 84 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -117,6 +117,10 @@ Known scope limits:
   decrypt path): a stable random + edge-case harness runs with `cargo test`
   (`tests/fuzz_parsers.rs`), plus coverage-guided `cargo-fuzz` targets in `fuzz/`
   (nightly; a weekly CI job). ~18 M executions across the targets found no panic
+- End-to-end tunnel test (`tests/e2e_tunnel.rs`): the **real** tunnel loops
+  (`tunnel_loops::run_tunnel_loops`) run on both sides over loopback UDP with a
+  mock TUN, and plaintext flows both ways through the full handshake (incl. the
+  L-4 cookie round-trip) → seal → GSO-send → GRO-recv → decrypt → TUN path
 
 ## Build
 
@@ -190,7 +194,11 @@ to the binary.
   across cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`, bridged
   from the async loops with `spawn_blocking`); constant-time, low-latency, no GPU
   path (see DESIGN.md §11–§12 for why)
-- `net.rs` — UDP loops; clear in/out API points to the TUN layer
+- `net.rs` — UDP handshake wiring (initiator/responder, fragmentation, the L-4
+  cookie) + the return-routability `CookieState`
+- `tunnel_loops.rs` — the live tunnel loops (outbound / inbound + handshake-rekey
+  demux / keepalive) as a reusable `run_tunnel_loops`; `main.rs` is a thin wrapper
+  and a custom client can drive the same loop
 - `udp.rs` — batched UDP I/O (GSO on send, GRO on receive) via `quinn-udp`,
   with a per-packet fallback on older kernels / non-Linux; the only module that
   touches the dependency (`batch_send` / `batch_recv` / `group_equal_sized`)

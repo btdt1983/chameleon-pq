@@ -42,9 +42,9 @@ impl TunPair {
         Ok(Self::spawn_io(iface))
     }
 
-    /// In-memory mock voor unit-tests (geen kernel-interface nodig).
-    /// Van buiten stuur je bytes in via `inject_tx`; lees uitvoer via `drain_rx`.
-    #[cfg(test)]
+    /// In-memory mock (geen kernel-interface nodig). Bedoeld voor tests en voor
+    /// clients die de tunnel-loops willen aandrijven zonder een echte TUN. Van
+    /// buiten stuur je bytes in via `inject_tx`; lees uitvoer via `drain_rx`.
     pub fn new_mock() -> (Self, MockHandles) {
         let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
         let (drain_tx, drain_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
@@ -114,7 +114,8 @@ impl TunPair {
     }
 }
 
-#[cfg(test)]
+/// Uiteinden van een mock-TUN: `inject_tx` speelt "kernel → TUN", `drain_rx`
+/// leest "TUN → kernel".
 pub struct MockHandles {
     /// Stuur bytes in alsof ze van de TUN komen.
     pub inject_tx: mpsc::Sender<Bytes>,
