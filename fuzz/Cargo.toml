@@ -1,0 +1,60 @@
+[package]
+name = "chameleon-pq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+zeroize = "1"
+
+[dependencies.chameleon-pq]
+path = ".."
+
+# Coverage-guided fuzz-targets voor de parsers van attacker-gecontroleerde input.
+# Draai bv.: `cargo +nightly fuzz run frame_decode`.
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_decode"
+path = "fuzz_targets/handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "obf_parsers"
+path = "fuzz_targets/obf_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hsobf_parsers"
+path = "fuzz_targets/hsobf_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler"
+path = "fuzz_targets/reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_decrypt"
+path = "fuzz_targets/session_decrypt.rs"
+test = false
+doc = false
+bench = false

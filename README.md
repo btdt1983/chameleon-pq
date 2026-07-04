@@ -91,7 +91,7 @@ Known scope limits:
   path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
   on (default) the configured rate caps throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 77 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 83 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -112,6 +112,11 @@ Known scope limits:
   binding (symmetric, peer-dependent), low-order/all-zero X25519 rejection, and
   the return-routability cookie (deterministic + input-dependent, and a
   cookie-less Init is answered with a CookieChallenge, not an expensive Response)
+- Fuzzing of the attacker-facing parsers (frame + handshake decode, the data-path
+  and handshake obfuscation parsers, the reassembler, and the inbound
+  decrypt path): a stable random + edge-case harness runs with `cargo test`
+  (`tests/fuzz_parsers.rs`), plus coverage-guided `cargo-fuzz` targets in `fuzz/`
+  (nightly; a weekly CI job). ~18 M executions across the targets found no panic
 
 ## Build
 
