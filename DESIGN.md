@@ -567,3 +567,14 @@ These are stated plainly so no one mistakes intent for proof:
 - **Handshake-derived session id.** The per-session id is now derived from the
   shared secret (`crypto::derive_session_id`) instead of a process-global
   counter, so both ends always agree without a counter that could desync.
+- **Return-routability cookie (L-4).** Before doing any expensive KEM/DH/signature
+  work — or sending a large response — the responder requires the initiator to
+  echo a stateless cookie tied to its source address (`crypto::compute_cookie` =
+  HMAC(per-process secret, ip‖port‖time-window), 16 B, not in the transcript). An
+  Init without a valid cookie gets a cheap `CookieChallenge` (a full-size,
+  obfuscated handshake message, so it doesn't add a distinctive fingerprint); the
+  initiator re-sends the Init with the cookie and only then does the responder do
+  the real handshake. This closes the spoofed-source CPU-DoS and large-response
+  reflection; only the initial handshake needs it (rekey is already source-pinned
+  to the established peer). WireGuard-style, kept always-on here since site-to-site
+  handshakes are rare so the extra round-trip is negligible.

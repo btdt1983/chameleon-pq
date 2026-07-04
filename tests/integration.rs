@@ -1531,3 +1531,94 @@ fn derived_session_id_matches_across_sides_and_differs_per_handshake() {
         "verschillende handshakes -> verschillend session_id"
     );
 }
+
+// ── L-4: return-routability cookie ───────────────────────────────────────────
+
+#[test]
+fn cookie_is_deterministic_and_input_dependent() {
+    use chameleon::crypto::compute_cookie;
+    let secret = [0x11u8; 32];
+    let a: std::net::SocketAddr = "1.2.3.4:5678".parse().unwrap();
+    let b: std::net::SocketAddr = "1.2.3.4:5679".parse().unwrap(); // andere poort
+    let c: std::net::SocketAddr = "1.2.3.5:5678".parse().unwrap(); // ander ip
+                                                                   // Deterministisch: zelfde input -> zelfde cookie.
+    assert_eq!(
+        compute_cookie(&secret, &a, 100),
+        compute_cookie(&secret, &a, 100)
+    );
+    // Afhankelijk van poort, ip, tijdvenster en geheim.
+    assert_ne!(
+        compute_cookie(&secret, &a, 100),
+        compute_cookie(&secret, &b, 100)
+    );
+    assert_ne!(
+        compute_cookie(&secret, &a, 100),
+        compute_cookie(&secret, &c, 100)
+    );
+    assert_ne!(
+        compute_cookie(&secret, &a, 100),
+        compute_cookie(&secret, &a, 101)
+    );
+    assert_ne!(
+        compute_cookie(&secret, &a, 100),
+        compute_cookie(&[0x22u8; 32], &a, 100)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responder_challenges_cookieless_init() {
+    use chameleon::net::run_handshake_responder;
+    use chameleon::tunnel::{Handshake, HandshakeMessage, HandshakeType};
+    use tokio::net::UdpSocket;
+
+    let resp_seed = [4u8; 32];
+    let init_seed = [3u8; 32];
+    let init_pub = Ed25519Auth::derive_public(&init_seed);
+    let resp_pub = Ed25519Auth::derive_public(&resp_seed);
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Responder-taak (wordt nooit compleet — we echoën de cookie niet terug).
+    tokio::spawn(async move {
+        let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
+        let _ = run_handshake_responder(&server, &resp_auth, None).await;
+    });
+
+    // Stuur een cleartext Init met cookie = 0 (obf uit).
+    let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
+    let (_hs, init_wire) = Handshake::start(&init_auth).unwrap();
+    for frag in chameleon::tunnel::fragment(1, &init_wire) {
+        let f = chameleon::frame::Frame::new_handshake(frag)
+            .encode()
+            .unwrap();
+        client.send_to(&f, server_addr).await.unwrap();
+    }
+
+    // We moeten een CookieChallenge terugkrijgen — NIET een Response (die zou dure
+    // crypto op een ongeverifieerde bron betekenen).
+    let mut reasm = chameleon::tunnel::Reassembler::default();
+    let mut buf = vec![0u8; 65536];
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (n, _src) = client.recv_from(&mut buf).await.unwrap();
+            let frame =
+                chameleon::frame::Frame::decode(bytes::Bytes::copy_from_slice(&buf[..n])).unwrap();
+            if frame.frame_type != chameleon::frame::FrameType::Handshake {
+                continue;
+            }
+            if let Some(full) = reasm.push(&frame.payload).unwrap() {
+                return HandshakeMessage::decode(full).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("responder stuurde een reply");
+
+    assert_eq!(
+        reply.msg_type,
+        HandshakeType::CookieChallenge,
+        "een cookie-loze Init moet een CookieChallenge opleveren, geen Response (L-4)"
+    );
+}

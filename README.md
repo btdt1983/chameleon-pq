@@ -39,6 +39,11 @@ Known scope limits:
 - Mutual authentication: 3-message (2-RTT) handshake where both peers sign
   the transcript; the responder withholds trust until the initiator's
   Confirm verifies
+- Return-routability cookie (WireGuard-style, stateless): the responder does no
+  expensive ML-KEM/DH/ML-DSA work until the initiator echoes a cookie tied to its
+  source address, so a spoofed/unverified source can't trigger the expensive
+  handshake or a large reflected response. The CookieChallenge is a full-size
+  obfuscated message, so it blends with the rest of the handshake
 - Hybrid Ed25519 + ML-DSA-65 (FIPS 204) transcript signing for peer
   authentication (pre-shared identities) — the signature holds as long as
   *either* scheme is unbroken; falls back to Ed25519-only when no ML-DSA
@@ -86,7 +91,7 @@ Known scope limits:
   path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
   on (default) the configured rate caps throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 75 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 77 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -104,7 +109,9 @@ Known scope limits:
   signatures (a reflected responder signature is rejected as a Confirm, even
   under a shared identity key), the bounded UDP handshake (mutual completion
   over real sockets + a clean timeout when no responder answers), identity
-  binding (symmetric, peer-dependent), and low-order/all-zero X25519 rejection
+  binding (symmetric, peer-dependent), low-order/all-zero X25519 rejection, and
+  the return-routability cookie (deterministic + input-dependent, and a
+  cookie-less Init is answered with a CookieChallenge, not an expensive Response)
 
 ## Build
 

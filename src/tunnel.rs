@@ -31,11 +31,12 @@ pub const HANDSHAKE_MSG_LEN: usize = 8192;
 // (auth.identity_binding(), L-6), zodat de handtekeningen binden wie er tekent
 // (unknown-key-share-afweer).
 // v6: de KEM is nu FIPS 203 ML-KEM-768 (pqcrypto-mlkem) i.p.v. het pre-standaard
-// Kyber768 (I-11). Zelfde key/ct-groottes (1184/1088) maar een ander algoritme,
-// dus niet interoperabel met v5. Elke versie-bump verandert de handshake; een
-// peer met een oudere handshake faalt daardoor meteen schoon i.p.v. met een
-// verwarrende MAC-fout.
-pub const PROTO_VERSION: u8 = 6;
+// Kyber768 (I-11). Zelfde key/ct-groottes (1184/1088) maar een ander algoritme.
+// v7: de handshake draagt nu een return-routability cookie (L-4) en kent een
+// CookieChallenge-berichttype; de responder doet pas dure crypto ná een geldige
+// cookie. Elke versie-bump verandert de handshake; een peer met een oudere
+// handshake faalt daardoor meteen schoon i.p.v. met een verwarrende MAC-fout.
+pub const PROTO_VERSION: u8 = 7;
 
 /// Rol-labels voor de domeinscheiding van de transcript-handtekeningen (L-5):
 /// de responder tekent de Response, de initiator de Confirm — nooit over
@@ -55,6 +56,9 @@ const MLKEM_PK_LEN: usize = 1184;
 const MLKEM_CT_LEN: usize = 1088;
 const KEM_SLOT_LEN: usize = MLKEM_PK_LEN; // grootste van pub/ct
 const MAC_LEN: usize = 32;
+/// Lengte van de return-routability cookie (L-4). HMAC-SHA256 over het bronadres,
+/// afgekapt tot 16 bytes — genoeg tegen forging, niet in het transcript.
+const COOKIE_LEN: usize = 16;
 
 const FRAG_PAYLOAD: usize = 1024;
 const FRAG_HEADER_LEN: usize = 8;
@@ -188,6 +192,10 @@ pub enum HandshakeType {
     /// Draagt de handtekening van de initiator over het volledige transcript.
     /// Maakt de handshake wederzijds geauthenticeerd.
     Confirm = 0x03,
+    /// Return-routability challenge (L-4): de responder stuurt dit i.p.v. een
+    /// Response wanneer de Init geen geldige cookie draagt. Kost geen handshake-
+    /// crypto; draagt alleen de cookie (in het `cookie`-veld), rest is noise.
+    CookieChallenge = 0x04,
 }
 
 impl HandshakeType {
@@ -196,6 +204,7 @@ impl HandshakeType {
             0x01 => Ok(Self::Init),
             0x02 => Ok(Self::Response),
             0x03 => Ok(Self::Confirm),
+            0x04 => Ok(Self::CookieChallenge),
             _ => Err(ChameleonError::Handshake {
                 state: "decode".into(),
                 msg: format!("unknown type {v}"),
@@ -216,6 +225,10 @@ pub struct HandshakeMessage {
     pub kem: [u8; KEM_SLOT_LEN],
     pub sig: Vec<u8>,
     pub mac: [u8; MAC_LEN],
+    /// Return-routability cookie (L-4). Nul in de eerste Init; door de initiator
+    /// gevuld met de door de responder uitgegeven cookie op de retry. Niet in het
+    /// transcript — puur een anti-DoS-token.
+    pub cookie: [u8; COOKIE_LEN],
 }
 
 impl HandshakeMessage {
@@ -249,6 +262,7 @@ impl HandshakeMessage {
             kem,
             sig,
             mac,
+            cookie: [0u8; COOKIE_LEN],
         })
     }
 
@@ -275,6 +289,7 @@ impl HandshakeMessage {
             kem,
             sig: vec![0u8; sig_len],
             mac: [0u8; MAC_LEN],
+            cookie: [0u8; COOKIE_LEN],
         })
     }
 
@@ -302,6 +317,31 @@ impl HandshakeMessage {
             kem,
             sig: vec![0u8; sig_len],
             mac: [0u8; MAC_LEN],
+            cookie: [0u8; COOKIE_LEN],
+        })
+    }
+
+    /// Bouw een CookieChallenge (L-4): de responder stuurt dit i.p.v. een Response
+    /// als de Init geen geldige cookie draagt. Kost geen handshake-crypto — het
+    /// draagt alleen de uitgegeven `cookie`; x25519_pub/kem/mac zijn noise en de
+    /// sig is leeg, zodat het op de wire (zelfde 8192-byte grootte, geobfusceerd)
+    /// niet van een echte handshake te onderscheiden is.
+    pub fn new_cookie_challenge(cookie: [u8; COOKIE_LEN]) -> Result<Self> {
+        let mut x25519_pub = [0u8; X25519_PUB_LEN];
+        Self::fill_noise(&mut x25519_pub);
+        let mut kem = [0u8; KEM_SLOT_LEN];
+        Self::fill_noise(&mut kem);
+        let mut mac = [0u8; MAC_LEN];
+        Self::fill_noise(&mut mac);
+        Ok(Self {
+            version: PROTO_VERSION,
+            msg_type: HandshakeType::CookieChallenge,
+            aead_algo: 0,
+            x25519_pub,
+            kem,
+            sig: Vec::new(),
+            mac,
+            cookie,
         })
     }
 
@@ -315,6 +355,7 @@ impl HandshakeMessage {
         buf.put_u16_le(self.sig.len() as u16);
         buf.put_slice(&self.sig);
         buf.put_slice(&self.mac);
+        buf.put_slice(&self.cookie);
         let used = buf.len();
         if used > HANDSHAKE_MSG_LEN {
             return Err(ChameleonError::Handshake {
@@ -349,16 +390,18 @@ impl HandshakeMessage {
         let mut kem = [0u8; KEM_SLOT_LEN];
         raw.copy_to_slice(&mut kem);
         let sig_len = raw.get_u16_le() as usize;
-        if raw.remaining() < sig_len + MAC_LEN {
+        if raw.remaining() < sig_len + MAC_LEN + COOKIE_LEN {
             return Err(ChameleonError::Handshake {
                 state: "decode".into(),
-                msg: "truncated sig/mac".into(),
+                msg: "truncated sig/mac/cookie".into(),
             });
         }
         let mut sig = vec![0u8; sig_len];
         raw.copy_to_slice(&mut sig);
         let mut mac = [0u8; MAC_LEN];
         raw.copy_to_slice(&mut mac);
+        let mut cookie = [0u8; COOKIE_LEN];
+        raw.copy_to_slice(&mut cookie);
         Ok(Self {
             version,
             msg_type,
@@ -367,6 +410,7 @@ impl HandshakeMessage {
             kem,
             sig,
             mac,
+            cookie,
         })
     }
 
@@ -386,9 +430,9 @@ impl HandshakeMessage {
             }
             // Confirm voegt geen sleutelmateriaal toe: het transcript is na
             // de Response bevroren, en Confirm ondertekent juist dat transcript.
-            // Deze functie hoort niet op een Confirm te worden aangeroepen,
-            // maar we houden de match compleet en veilig.
-            HandshakeType::Confirm => {}
+            // Deze functie hoort niet op een Confirm/CookieChallenge te worden
+            // aangeroepen, maar we houden de match compleet en veilig.
+            HandshakeType::Confirm | HandshakeType::CookieChallenge => {}
         }
         b.freeze()
     }
