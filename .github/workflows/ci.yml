@@ -6,6 +6,9 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main, master]
+  schedule:
+    - cron: '0 4 * * 1'   # wekelijks (ma 04:00 UTC): coverage-guided fuzzing
+  workflow_dispatch: {}   # handmatig te starten
 
 env:
   CARGO_TERM_COLOR: always
@@ -110,3 +113,24 @@ jobs:
             chameleon-pq-linux-x86_64
             chameleon-pq-windows-x86_64.exe
           generate_release_notes: true
+
+  # Coverage-guided fuzzing of the attacker-facing parsers (nightly + cargo-fuzz).
+  # Runs weekly / on demand — NOT on every push, since the stable
+  # `tests/fuzz_parsers.rs` harness already guards each commit. Each target runs
+  # briefly; a crash fails the job (a found bug is a real signal).
+  fuzz:
+    name: Fuzz parsers (nightly cargo-fuzz)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target (2 min each)
+        run: |
+          for t in frame_decode handshake_decode obf_parsers hsobf_parsers reassembler session_decrypt; do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=120
+            echo "::endgroup::"
+          done

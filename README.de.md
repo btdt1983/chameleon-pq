@@ -101,7 +101,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 77 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 83 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -123,6 +123,12 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Return-Routability-Cookie (deterministisch + eingabeabhängig, und eine Init
   ohne Cookie wird mit einer CookieChallenge statt einer teuren Response
   beantwortet) abdecken
+- Fuzzing der Parser für Angreifer-Eingaben (Frame- + Handshake-Decode, die
+  Verschleierungs-Parser von Datenpfad und Handshake, der Reassembler und der
+  Inbound-Entschlüsselungspfad): eine stabile Random-/Edge-Case-Harness läuft mit
+  `cargo test` (`tests/fuzz_parsers.rs`), dazu coverage-guided `cargo-fuzz`-Targets
+  in `fuzz/` (Nightly; wöchentlicher CI-Job). ~18 Mio. Ausführungen fanden keinen
+  Panic
 
 ## Build
 
