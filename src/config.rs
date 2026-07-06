@@ -67,7 +67,7 @@ pub enum Command {
 
 // ── Config-structs ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub identity: IdentityConfig,
     pub network: NetworkConfig,
@@ -80,7 +80,7 @@ pub struct AppConfig {
     pub traffic: TrafficConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IdentityConfig {
     /// Eigen Ed25519 seed: 32 bytes als lowercase hex-string.
     pub ed25519_seed_hex: String,
@@ -132,14 +132,14 @@ impl IdentityConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default = "default_bind")]
     pub bind_addr: SocketAddr,
     pub server_addr: Option<SocketAddr>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TunConfig {
     #[serde(default = "default_tun_name")]
     pub name: String,
@@ -151,7 +151,7 @@ pub struct TunConfig {
     pub mtu: u16,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct EngineConfig {
     #[serde(default = "default_linger")]
     pub batch_linger_us: u64,
@@ -192,7 +192,7 @@ pub enum PaddingPolicy {
 /// `[obfuscation]`-sectie. Standaard AAN met bucketed padding (clean break t.o.v.
 /// 0.1.0; zie ook de PROTO_VERSION-bump). Zet `enabled = false` voor het
 /// klassieke, niet-geobfusceerde datapad-frame (bv. voor debugging).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ObfuscationConfig {
     #[serde(default = "default_obf_enabled")]
     pub enabled: bool,
@@ -252,7 +252,7 @@ pub enum TrafficMode {
 /// en vertraagt echte pakketten tot slot-grenzen. De geconfigureerde rate
 /// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte ALS het
 /// doorvoerplafond — stem 'm af op je link.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TrafficConfig {
     #[serde(default = "default_traffic_enabled")]
     pub enabled: bool,

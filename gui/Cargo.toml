@@ -1,0 +1,19 @@
+[package]
+name = "chameleon-gui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
+
+# Eigen crate (net als fuzz/): houdt de zware GUI-deps buiten de core-crate.
+# De root is geen workspace, dus `cargo build` in de root negeert deze crate;
+# bouw expliciet met: `cargo build --manifest-path gui/Cargo.toml`.
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+chameleon-pq = { path = ".." }
+
+[[bin]]
+name = "chameleon-gui"
+path = "src/main.rs"
