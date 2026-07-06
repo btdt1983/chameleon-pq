@@ -569,6 +569,8 @@ dependencies = [
  "chameleon-pq",
  "iced",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
