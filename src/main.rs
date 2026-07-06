@@ -17,7 +17,7 @@
 //! cleartext-frame voor de (nog cleartext) handshake/rekey-berichten.
 
 use chameleon::config::{AppConfig, Cli, Command};
-use chameleon::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
+use chameleon::crypto::{Authenticator, Ed25519Auth, MlDsaAuth};
 use chameleon::engine::CryptoEngine;
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
 use chameleon::obf::PadPolicy;
@@ -101,9 +101,10 @@ async fn run_server(
         engine,
         tun,
         peer,
-        &cfg,
+        chameleon::tunnel_loops::TunnelParams::from_config(&cfg),
         auth.clone(),
         hs_obf,
+        Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
     )
     .await;
     Ok(())
@@ -130,9 +131,10 @@ async fn run_client(
         engine,
         tun,
         server,
-        &cfg,
+        chameleon::tunnel_loops::TunnelParams::from_config(&cfg),
         auth.clone(),
         hs_obf,
+        Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
     )
     .await;
     Ok(())
@@ -200,30 +202,18 @@ fn hs_obf_key_from_cfg(cfg: &AppConfig) -> anyhow::Result<Option<[u8; 32]>> {
 /// zonder de klassieke garantie op te geven. Zonder ML-DSA-sleutels valt het
 /// terug op Ed25519-only (klassiek).
 fn build_auth(cfg: &AppConfig) -> anyhow::Result<Arc<dyn Authenticator>> {
-    let seed = cfg.identity.seed_bytes()?;
-    let peer_pub = cfg.identity.peer_pub_bytes()?;
-    let ed = Ed25519Auth::new(&seed[..], peer_pub)?;
-
-    match (
-        cfg.identity.mldsa_secret_bytes()?,
-        cfg.identity.peer_mldsa_pub_bytes()?,
-    ) {
-        (Some(sk), Some(pk)) => {
-            let mldsa = MlDsaAuth::from_keys(&sk[..], &pk)?;
-            info!("peer-auth: hybrid Ed25519 + ML-DSA-65 (post-quantum signatures)");
-            Ok(Arc::new(HybridAuth::new(vec![
-                Box::new(ed),
-                Box::new(mldsa),
-            ])))
-        }
-        _ => {
-            warn!(
-                "peer-auth: Ed25519 only — no ML-DSA keys configured (classical, \
-                   not post-quantum). Run `keygen` and set the mldsa_* fields for hybrid auth."
-            );
-            Ok(Arc::new(ed))
-        }
+    // De feitelijke opbouw staat in de lib (chameleon::client), zodat de binary
+    // en elke andere client dezelfde auth-logica delen. Hier alleen de logging.
+    let auth = chameleon::client::build_auth(cfg)?;
+    if cfg.identity.has_mldsa() {
+        info!("peer-auth: hybrid Ed25519 + ML-DSA-65 (post-quantum signatures)");
+    } else {
+        warn!(
+            "peer-auth: Ed25519 only — no ML-DSA keys configured (classical, \
+               not post-quantum). Run `keygen` and set the mldsa_* fields for hybrid auth."
+        );
     }
+    Ok(auth)
 }
 
 // ── Keygen ───────────────────────────────────────────────────────────────────

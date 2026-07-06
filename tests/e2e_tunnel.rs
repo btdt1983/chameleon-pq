@@ -78,26 +78,30 @@ async fn tunnel_e2e_data_flows_both_ways() {
     let (server_tun, mut server_handles) = TunPair::new_mock();
     let (client_tun, mut client_handles) = TunPair::new_mock();
 
-    // ── Draai de ECHTE tunnel-loops aan beide kanten (gespawned; cfg wordt
-    //    'static geleaked, prima in een test). ──
-    let cfg: &'static AppConfig = Box::leak(Box::new(test_config()));
+    // ── Draai de ECHTE tunnel-loops aan beide kanten (gespawned; TunnelParams is
+    //    owned, dus geen Box::leak meer nodig). ──
+    let params = chameleon::tunnel_loops::TunnelParams::from_config(&test_config());
+    let server_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
+    let client_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
     tokio::spawn(run_tunnel_loops(
         server_sock.clone(),
         server_engine,
         server_tun,
         client_addr,
-        cfg,
+        params.clone(),
         server_auth.clone(),
         None,
+        server_stats.clone(),
     ));
     tokio::spawn(run_tunnel_loops(
         client_sock.clone(),
         client_engine,
         client_tun,
         server_addr,
-        cfg,
+        params.clone(),
         client_auth.clone(),
         None,
+        client_stats.clone(),
     ));
 
     // ── Client → server: injecteer in de client-TUN, lees uit de server-TUN. ──
@@ -117,4 +121,86 @@ async fn tunnel_e2e_data_flows_both_ways() {
         .expect("client-TUN kreeg binnen 5s data")
         .expect("kanaal open");
     assert_eq!(got, down, "server→client plaintext komt intact aan");
+
+    // ── Stats: beide kanten registreerden verkeer (voor de client-UI). ──
+    use std::sync::atomic::Ordering;
+    assert!(client_stats.connected.load(Ordering::Relaxed));
+    assert!(
+        client_stats.tx_bytes.load(Ordering::Relaxed) >= up.len() as u64,
+        "client telde de verzonden bytes"
+    );
+    assert!(
+        client_stats.rx_bytes.load(Ordering::Relaxed) >= down.len() as u64,
+        "client telde de ontvangen bytes"
+    );
+    assert!(client_stats.last_recv_epoch.load(Ordering::Relaxed) > 0);
+}
+
+/// De client-core (`chameleon::client::Client`) verbindt via de publieke API en
+/// stuurt data door de tunnel; de server-kant is handmatig opgezet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_core_connects_and_flows() {
+    use chameleon::client::Client;
+    use chameleon::net::run_handshake_responder;
+    use chameleon::tunnel_loops::{run_tunnel_loops, TunnelParams, TunnelStats};
+
+    let s_seed = [31u8; 32];
+    let c_seed = [32u8; 32];
+    let s_pub = Ed25519Auth::derive_public(&s_seed);
+    let c_pub = Ed25519Auth::derive_public(&c_seed);
+    let server_auth: Arc<dyn Authenticator> = Arc::new(Ed25519Auth::new(&s_seed, c_pub).unwrap());
+    let client_auth: Arc<dyn Authenticator> = Arc::new(Ed25519Auth::new(&c_seed, s_pub).unwrap());
+
+    let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_addr = server_sock.local_addr().unwrap();
+    let (server_tun, mut server_handles) = TunPair::new_mock();
+
+    // Server: responder-handshake + tunnel-loops op de achtergrond.
+    let params = TunnelParams::from_config(&test_config());
+    let sa = server_auth.clone();
+    tokio::spawn(async move {
+        let (session, client_addr) = run_handshake_responder(&server_sock, sa.as_ref(), None)
+            .await
+            .expect("responder ok");
+        let engine = build_engine(session);
+        run_tunnel_loops(
+            server_sock,
+            engine,
+            server_tun,
+            client_addr,
+            params,
+            sa,
+            None,
+            Arc::new(TunnelStats::default()),
+        )
+        .await;
+    });
+
+    // Client: via de client-core API (bindt zelf een socket, doet de handshake,
+    // start de tunnel-loops, keert terug met een handle).
+    let (client_tun, client_handles) = TunPair::new_mock();
+    let client = Client::connect(&test_config(), server_addr, client_auth, client_tun)
+        .await
+        .expect("client verbindt");
+    let st = client.status();
+    assert!(st.connected, "client meldt verbonden");
+    assert_eq!(st.peer, server_addr);
+
+    // Data client → server via de mock-TUN.
+    let msg = bytes::Bytes::from_static(b"via de client-core");
+    client_handles.inject_tx.send(msg.clone()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
+        .await
+        .expect("server kreeg data")
+        .expect("kanaal open");
+    assert_eq!(got, msg);
+
+    // De client-UI ziet de tellers oplopen.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        client.status().tx_bytes >= msg.len() as u64,
+        "tx_bytes geteld"
+    );
+
+    client.disconnect();
 }

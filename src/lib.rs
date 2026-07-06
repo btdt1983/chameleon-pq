@@ -1,4 +1,5 @@
 pub mod aead;
+pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod engine;
