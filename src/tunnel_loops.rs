@@ -38,20 +38,70 @@ const MAX_QUEUE: usize = 1024;
 /// bij licht verkeer te vermijden.
 const PAR_THRESHOLD: usize = 16;
 
+/// De configuratie-waarden die `run_tunnel_loops` nodig heeft, OWNED (geen
+/// `&AppConfig`-borrow) zodat de loop als taak gespawned kan worden — precies wat
+/// een client-UI wil (connect → tunnel draait op de achtergrond, UI blijft leven).
+#[derive(Debug, Clone)]
+pub struct TunnelParams {
+    pub batch_linger_us: u64,
+    pub obf_enabled: bool,
+    pub padding: PadPolicy,
+    pub traffic_enabled: bool,
+    pub traffic_mode: TrafficMode,
+    pub rate_pps: u32,
+    pub burst: u16,
+    pub cooldown_ms: u64,
+}
+
+impl TunnelParams {
+    pub fn from_config(cfg: &AppConfig) -> Self {
+        Self {
+            batch_linger_us: cfg.engine.batch_linger_us,
+            obf_enabled: cfg.obfuscation.enabled,
+            padding: cfg.obfuscation.padding.into(),
+            traffic_enabled: cfg.traffic.enabled,
+            traffic_mode: cfg.traffic.mode,
+            rate_pps: cfg.traffic.rate_pps,
+            burst: cfg.traffic.burst,
+            cooldown_ms: cfg.traffic.cooldown_ms,
+        }
+    }
+}
+
+/// Live tellers voor een lopende tunnel, zodat een frontend (client-UI) status
+/// kan tonen. Lock-vrij; `run_tunnel_loops` werkt ze bij. Bytes tellen de
+/// PLAINTEXT (wat door de TUN gaat), niet de wire-grootte.
+#[derive(Default)]
+pub struct TunnelStats {
+    /// True zolang de tunnel-loops draaien.
+    pub connected: AtomicBool,
+    /// Plaintext-bytes vanaf de TUN richting peer (uitgaand).
+    pub tx_bytes: AtomicU64,
+    /// Plaintext-bytes vanaf de peer richting TUN (inkomend).
+    pub rx_bytes: AtomicU64,
+    /// Epoch-seconden van het laatst ONTVANGEN pakket (0 = nog niets).
+    pub last_recv_epoch: AtomicU64,
+}
+
 /// Draai de drie tunnel-taken (outbound, inbound, keepalive) tot een van hen
 /// eindigt (peer-close, dode peer, of een gesloten TUN-kanaal). Voer eerst de
 /// handshake uit (`net::run_handshake_*`) om `engine`/`peer`/`hs_obf` te krijgen.
+// Veel argumenten, maar het is één centrale orchestratie-functie; ze bundelen in
+// een struct zou de call-sites alleen maar omslachtiger maken.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel_loops(
     socket: Arc<UdpSocket>,
     engine: Arc<CryptoEngine>,
     tun: TunPair,
     peer: SocketAddr,
-    cfg: &AppConfig,
+    params: TunnelParams,
     auth: Arc<dyn Authenticator>,
     hs_obf: Option<[u8; 32]>,
+    stats: Arc<TunnelStats>,
 ) {
     let TunPair { from_tun, to_tun } = tun;
-    let linger = Duration::from_micros(cfg.engine.batch_linger_us);
+    let linger = Duration::from_micros(params.batch_linger_us);
+    stats.connected.store(true, Ordering::Relaxed);
 
     // Kanaal waarmee de inbound-loop handshake-frames doorgeeft aan een
     // lopende rekey-driver. ZO is de inbound-loop de enige socket-lezer.
@@ -68,14 +118,14 @@ pub async fn run_tunnel_loops(
 
     // Timing-/cover-traffic pacing (Fase 3). `paced` alleen als óók het datapad
     // geobfusceerd is (cover-pakketten rijden erop; config valideert dit).
-    let paced = cfg.traffic.enabled && cfg.obfuscation.enabled;
-    let pace_mode = match cfg.traffic.mode {
+    let paced = params.traffic_enabled && params.obf_enabled;
+    let pace_mode = match params.traffic_mode {
         TrafficMode::Cbr => ShapeMode::Cbr,
         TrafficMode::Adaptive => ShapeMode::Adaptive,
     };
-    let pace_slot = Duration::from_micros(1_000_000u64 / cfg.traffic.rate_pps.max(1) as u64);
-    let pace_burst = cfg.traffic.burst.max(1) as usize;
-    let pace_cooldown = Duration::from_millis(cfg.traffic.cooldown_ms);
+    let pace_slot = Duration::from_micros(1_000_000u64 / params.rate_pps.max(1) as u64);
+    let pace_burst = params.burst.max(1) as usize;
+    let pace_cooldown = Duration::from_millis(params.cooldown_ms);
 
     // Gedeelde GSO/GRO-state voor gebatchte UDP-I/O (quinn-udp). Faalt zelden;
     // op een kernel zonder GSO/GRO valt quinn-udp vanzelf per-pakket terug.
@@ -94,6 +144,7 @@ pub async fn run_tunnel_loops(
     let peer_out = peer;
     let rekeying_out = rekeying.clone();
     let state_out = sock_state.clone();
+    let stats_out = stats.clone();
     let outbound = tokio::spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
@@ -106,6 +157,7 @@ pub async fn run_tunnel_loops(
                 maybe = from_tun.recv() => {
                     match maybe {
                         Some(pkt) => {
+                            stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             if paced {
                                 // Bounded queue met tail-drop (zie MAX_QUEUE).
                                 if pending.len() >= MAX_QUEUE {
@@ -193,6 +245,7 @@ pub async fn run_tunnel_loops(
     let last_recv_in = last_recv.clone();
     let state_in = sock_state.clone();
     let peer_in = peer;
+    let stats_in = stats.clone();
     let inbound = tokio::spawn(async move {
         // Gebatchte ontvangst-buffers (GRO): één syscall levert meerdere
         // datagrammen, die we hieronder één voor één door de bestaande demux halen.
@@ -255,10 +308,13 @@ pub async fn run_tunnel_loops(
                     for (src, datagram, result) in results {
                         // 1) Datapad (parallel ontsleuteld): direct afhandelen.
                         if let Ok((ft, plain)) = result {
-                            last_recv_in.store(now_secs(), Ordering::Relaxed);
+                            let now = now_secs();
+                            last_recv_in.store(now, Ordering::Relaxed);
+                            stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
                             match ft {
                                 FrameType::Data => {
                                     debug!("inbound {} bytes -> TUN", plain.len());
+                                    stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                     if to_tun.send(plain).await.is_err() { break 'inbound; }
                                 }
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
@@ -324,7 +380,9 @@ pub async fn run_tunnel_loops(
                             Ok(f)  => f,
                             Err(e) => { warn!("bad frame: {e}"); continue; }
                         };
-                        last_recv_in.store(now_secs(), Ordering::Relaxed);
+                        let now = now_secs();
+                        last_recv_in.store(now, Ordering::Relaxed);
+                        stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
                         match frame.frame_type {
                             FrameType::Data => {
                                 match engine_in.sessions().decrypt(
@@ -332,6 +390,7 @@ pub async fn run_tunnel_loops(
                                 {
                                     Ok(plain) => {
                                         debug!("inbound {} bytes -> TUN", plain.len());
+                                        stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                         if to_tun.send(plain).await.is_err() { break 'inbound; }
                                     }
                                     Err(e) => debug!("decrypt drop: {e}"),
@@ -387,13 +446,13 @@ pub async fn run_tunnel_loops(
     let last_recv_ka = last_recv.clone();
     let peer_ka = peer;
     let engine_ka = engine.clone();
-    let obf_enabled_ka = cfg.obfuscation.enabled;
-    let pad_policy_ka: PadPolicy = cfg.obfuscation.padding.into();
+    let obf_enabled_ka = params.obf_enabled;
+    let pad_policy_ka: PadPolicy = params.padding;
     // Onder CBR-pacing stroomt er sowieso constant (cover-)verkeer, dus de
     // periodieke keepalive-send is overbodig — we slaan 'm dan over en houden
     // alleen de dode-peer-detectie. (Adaptive kan idle-stil vallen, dus daar
     // blijft de keepalive-send nodig.)
-    let ka_skip_send = paced && matches!(cfg.traffic.mode, TrafficMode::Cbr);
+    let ka_skip_send = paced && matches!(params.traffic_mode, TrafficMode::Cbr);
     let keepalive = tokio::spawn(async move {
         let mut ka_tick = interval(KEEPALIVE_INTERVAL);
         loop {
@@ -435,6 +494,7 @@ pub async fn run_tunnel_loops(
         r = inbound   => { if let Err(e) = r { error!("inbound task: {e}"); } }
         r = keepalive => { if let Err(e) = r { error!("keepalive task: {e}"); } }
     }
+    stats.connected.store(false, Ordering::Relaxed);
     info!("tunnel closed");
 }
 

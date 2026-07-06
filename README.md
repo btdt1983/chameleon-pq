@@ -197,8 +197,13 @@ to the binary.
 - `net.rs` — UDP handshake wiring (initiator/responder, fragmentation, the L-4
   cookie) + the return-routability `CookieState`
 - `tunnel_loops.rs` — the live tunnel loops (outbound / inbound + handshake-rekey
-  demux / keepalive) as a reusable `run_tunnel_loops`; `main.rs` is a thin wrapper
-  and a custom client can drive the same loop
+  demux / keepalive) as a reusable `run_tunnel_loops`, plus `TunnelParams`
+  (owned config) and `TunnelStats` (live tx/rx counters); `main.rs` is a thin
+  wrapper and a custom client can drive the same loop
+- `client.rs` — client-core: `Client::connect` (handshake + start the tunnel in
+  the background) with live `Status`, `build_auth`/`hs_obf_key`, and
+  `security_warnings` (secure-by-default: loudly flags a weaker config). The
+  engine any frontend (CLI / GUI) reuses; it holds no crypto of its own
 - `udp.rs` — batched UDP I/O (GSO on send, GRO on receive) via `quinn-udp`,
   with a per-packet fallback on older kernels / non-Linux; the only module that
   touches the dependency (`batch_send` / `batch_recv` / `group_equal_sized`)
