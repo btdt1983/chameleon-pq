@@ -13,6 +13,10 @@ description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
 iced = { version = "0.13", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 chameleon-pq = { path = ".." }
+# Diagnostiek: de GUI heeft (anders dan de CLI) geen console op Windows, dus
+# schrijven we tracing-logs én panics naar een logbestand naast de binary.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[bin]]
 name = "chameleon-gui"

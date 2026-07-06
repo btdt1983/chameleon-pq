@@ -11,14 +11,101 @@ use chameleon::config::AppConfig;
 use chameleon::tun_iface::TunPair;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Color, Element, Length, Subscription, Task};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn main() -> iced::Result {
+    // Diagnostiek eerst: een Windows-GUI heeft geen console, dus zonder dit
+    // verdwijnt élke fout/panic met het venster. We loggen naar een bestand
+    // NAAST de binary (en, indien aanwezig, ook naar stderr).
+    init_diagnostics();
     iced::application("Chameleon-PQ", App::update, App::view)
         .subscription(App::subscription)
         .run_with(App::new)
+}
+
+/// Pad van het diagnostiek-logbestand: naast de executable (op Windows waar de
+/// gebruiker de .exe start), met terugval op de huidige map.
+fn log_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("chameleon-gui.log")))
+        .unwrap_or_else(|| PathBuf::from("chameleon-gui.log"))
+}
+
+/// Een `Write`/`MakeWriter` die naar het gedeelde logbestand schrijft.
+#[derive(Clone)]
+struct FileSink(Arc<Mutex<std::fs::File>>);
+
+impl Write for FileSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut f) => f.write(buf),
+            Err(_) => Ok(buf.len()), // nooit paniceren vanuit de logger
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock() {
+            Ok(mut f) => f.flush(),
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+/// Zet tracing naar een logbestand op én installeer een panic-hook die de panic
+/// (met locatie) naar datzelfde bestand schrijft. Zo legt de VOLGENDE reproductie
+/// vast wát er misgaat — ook op een Windows-GUI zonder console, waar nu niets
+/// zichtbaar is. De core-crate (client + tunnel-loops) logt via `tracing`, dus
+/// zodra dit staat zie je handshake-, TUN- en socket-fouten in het bestand.
+fn init_diagnostics() {
+    use tracing_subscriber::EnvFilter;
+
+    let path = log_path();
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return; // geen logbestand mogelijk -> laat de GUI gewoon draaien
+    };
+    let sink = FileSink(Arc::new(Mutex::new(file)));
+
+    // Standaard: info + debug voor onze eigen crate. Te overrulen via RUST_LOG.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,chameleon=debug"));
+    let writer_sink = sink.clone();
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(move || writer_sink.clone())
+        .try_init();
+
+    // Panic-hook: schrijf de panic (die anders met het venster verdwijnt) naar
+    // het logbestand én stderr, en roep daarna de standaard-hook aan.
+    let default_hook = std::panic::take_hook();
+    let panic_sink = sink;
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "onbekend".into());
+        // Backtrace meepakken — `force_capture()` negeert RUST_BACKTRACE (dat
+        // op een dubbelgeklikte Windows-GUI nooit gezet is), zodat we ALTIJD de
+        // exacte crash-plek zien, ook diep in tun/wintun of quinn-udp.
+        let bt = std::backtrace::Backtrace::force_capture();
+        let line = format!("\n=== GUI PANIC @ {loc} ===\n{info}\nbacktrace:\n{bt}\n");
+        // best-effort: nooit zelf paniceren in de hook
+        let mut s = panic_sink.clone();
+        let _ = s.write_all(line.as_bytes());
+        let _ = s.flush();
+        eprintln!("{line}");
+        default_hook(info);
+    }));
+
+    tracing::info!("Chameleon-PQ GUI gestart — log: {}", path.display());
 }
 
 struct App {
@@ -111,12 +198,21 @@ impl App {
                 self.log(format!("Verbinden met {server} …"));
                 return Task::perform(
                     async move {
+                        // Stap-voor-stap loggen: als het proces hard sterft (een
+                        // native access-violation in wintun/quinn-udp vuurt de
+                        // Rust-panic-hook NIET), wijst de laatste regel in het log
+                        // exact aan wélke stap de crash veroorzaakte.
+                        tracing::info!("connect: stap 1/3 build_auth");
                         let auth = build_auth(&cfg).map_err(|e| e.to_string())?;
+                        tracing::info!("connect: stap 2/3 TunPair::create (Windows: admin + wintun.dll naast .exe)");
                         let tun = TunPair::create(&cfg.tun).map_err(|e| e.to_string())?;
-                        Client::connect(&cfg, server, auth, tun)
+                        tracing::info!("connect: stap 3/3 Client::connect → {server}");
+                        let res = Client::connect(&cfg, server, auth, tun)
                             .await
                             .map(Arc::new)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string());
+                        tracing::info!("connect: klaar (ok={})", res.is_ok());
+                        res
                     },
                     Message::Connected,
                 );
@@ -142,7 +238,22 @@ impl App {
             }
             Message::Tick => {
                 if let Some(c) = &self.client {
-                    self.status = Some(c.status());
+                    let st = c.status();
+                    // De tunnel-loops draaien op de achtergrond; als ze sterven
+                    // (TUN-/socket-fout, dode peer, peer-close) valt `connected`
+                    // terug op false. Maak dat zichtbaar i.p.v. stil te bevriezen —
+                    // de reden staat in het logbestand (zie init_diagnostics).
+                    if !st.connected {
+                        tracing::warn!("tunnel-loops gestopt — zie logbestand voor de reden");
+                        self.log(
+                            "Tunnel gesloten (achtergrond-loops gestopt). \
+                             Details staan in chameleon-gui.log naast de binary.",
+                        );
+                        self.client = None;
+                        self.status = None;
+                    } else {
+                        self.status = Some(st);
+                    }
                 }
             }
         }
