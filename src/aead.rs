@@ -94,28 +94,37 @@ impl AeadAlgo {
     }
 }
 
-/// Detecteer of de CPU hardware-AES-instructies heeft.
-/// x86/x86_64: AES-NI. aarch64: de AES-crypto-extensie.
+/// Kan deze CPU AEGIS-256X2 (de 2-laans "X2"-variant) daadwerkelijk uitvoeren?
+/// x86/x86_64: AES-NI ÉN AVX2. AES-NI alléén is NIET genoeg — de X2-variant
+/// verwerkt twee lanes in 256-bits (AVX2) registers, dus op een CPU mét AES-NI
+/// maar ZONDER AVX2 (bv. Xeon X5660 / Westmere, of Sandy/Ivy Bridge) voert de
+/// `aegis`-crate een AVX2-instructie uit die de CPU niet kent → een native
+/// STATUS_ILLEGAL_INSTRUCTION (0xC000001D): een harde crash die géén panic-hook
+/// vangt, en die zelfs de startup-benchmark al velt (die moet AEGIS immers
+/// dráaien om 'm te meten). Daarom gaten we hier, vóór AEGIS ook maar één keer
+/// wordt aangeroepen. aarch64: de AES-crypto-extensie (NEON; geen AVX2-nodig).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn cpu_has_aes() -> bool {
-    std::arch::is_x86_feature_detected!("aes")
+fn cpu_can_aegis() -> bool {
+    std::arch::is_x86_feature_detected!("aes") && std::arch::is_x86_feature_detected!("avx2")
 }
 
 #[cfg(target_arch = "aarch64")]
-fn cpu_has_aes() -> bool {
+fn cpu_can_aegis() -> bool {
     std::arch::is_aarch64_feature_detected!("aes")
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-fn cpu_has_aes() -> bool {
-    false // onbekende architectuur: kies de veilige, universele cipher
+fn cpu_can_aegis() -> bool {
+    false // onbekende architectuur: kies de veilige, universele cipher (ChaCha20)
 }
 
 /// Bepaal (eenmalig) de snelste veilige cipher voor deze machine.
 fn pick_preferred() -> AeadAlgo {
-    // Zonder AES-NI is AEGIS geen optie: software-AES is niet alleen traag maar
-    // ook cache-timing-gevoelig. ChaCha20 is dan constant-time en snel.
-    if !cpu_has_aes() {
+    // Kan deze CPU AEGIS niet veilig draaien (geen AES-NI+AVX2), dan is AEGIS
+    // geen optie — en we mogen 'm niet eens BENCHMARKEN, want dat draait AEGIS
+    // en crasht al (illegale instructie). ChaCha20 (via ring) is overal
+    // constant-time en snel.
+    if !cpu_can_aegis() {
         return AeadAlgo::ChaCha20Poly1305;
     }
     // Mét AES-NI: meet welke écht sneller is (lager = sneller).
