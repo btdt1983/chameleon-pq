@@ -64,6 +64,13 @@ fn init_diagnostics() {
     use tracing_subscriber::EnvFilter;
 
     let path = log_path();
+    // Windows: vang NATIVE exceptions (access violation / stack overflow) die de
+    // Rust-panic-hook NIET ziet — precies waarom het venster tot nu toe spoorloos
+    // verdween en het log midden in een regel stopte. De handler schrijft de
+    // exception-code, het fault-adres én de MODULE (wintun.dll? de .exe zelf?)
+    // naar het logbestand, zodat de volgende crash zichzelf benoemt.
+    #[cfg(windows)]
+    win_crash::install(path.clone());
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -106,6 +113,97 @@ fn init_diagnostics() {
     }));
 
     tracing::info!("Chameleon-PQ GUI gestart — log: {}", path.display());
+}
+
+/// Windows-only: een top-level exception-filter die native crashes (die de
+/// Rust-panic-hook niet vangt — access violation 0xC0000005, stack overflow
+/// 0xC00000FD, enz.) vastlegt. Zonder dit stopt het log gewoon en verdwijnt het
+/// venster; mét dit weten we de exception-code, het fault-adres én in wélke
+/// module (bv. `wintun.dll` of de `.exe` zelf, waar quinn-udp in mee-compileert)
+/// het misging. Puur diagnostisch: we loggen en laten het proces daarna gewoon
+/// crashen (EXCEPTION_CONTINUE_SEARCH).
+#[cfg(windows)]
+mod win_crash {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    #[allow(dead_code)] // FFI-layout: niet elk veld wordt gelezen
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut core::ffi::c_void,
+        number_parameters: u32,
+        information: [usize; 15],
+    }
+    #[allow(dead_code)] // context_record wordt niet gelezen
+    #[repr(C)]
+    struct ExceptionPointers {
+        exception_record: *mut ExceptionRecord,
+        context_record: *mut core::ffi::c_void,
+    }
+    type Hmodule = *mut core::ffi::c_void;
+    type Filter = Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>;
+
+    // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | _UNCHANGED_REFCOUNT
+    const FROM_ADDRESS: u32 = 0x4;
+    const UNCHANGED_REFCOUNT: u32 = 0x2;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetUnhandledExceptionFilter(filter: Filter) -> Filter;
+        fn GetModuleHandleExW(flags: u32, addr: *const u16, module: *mut Hmodule) -> i32;
+        fn GetModuleFileNameW(module: Hmodule, buf: *mut u16, size: u32) -> u32;
+    }
+
+    unsafe extern "system" fn filter(info: *mut ExceptionPointers) -> i32 {
+        let (code, addr) = if !info.is_null() && !(*info).exception_record.is_null() {
+            let r = (*info).exception_record;
+            ((*r).code, (*r).address)
+        } else {
+            (0u32, core::ptr::null_mut())
+        };
+
+        // In wélke geladen module valt het fault-adres? Dat benoemt de dader.
+        let mut module: Hmodule = core::ptr::null_mut();
+        let mut name = String::from("(onbekend)");
+        if !addr.is_null()
+            && GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, addr as *const u16, &mut module)
+                != 0
+        {
+            let mut buf = [0u16; 260];
+            let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
+            if n > 0 && n <= buf.len() {
+                name = std::ffi::OsString::from_wide(&buf[..n])
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+
+        if let Some(path) = LOG_PATH.get() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    f,
+                    "\n=== NATIVE EXCEPTION code=0x{code:08X} addr={addr:p} module={name} ==="
+                );
+                let _ = f.flush();
+            }
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH: log gezet, laat het proces normaal crashen
+    }
+
+    /// Onthoud het logpad en installeer de filter. Idempotent.
+    pub fn install(log_path: PathBuf) {
+        let _ = LOG_PATH.set(log_path);
+        unsafe {
+            SetUnhandledExceptionFilter(Some(filter));
+        }
+    }
 }
 
 struct App {
