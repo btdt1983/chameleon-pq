@@ -71,7 +71,7 @@ impl TunnelParams {
 /// Live tellers voor een lopende tunnel, zodat een frontend (client-UI) status
 /// kan tonen. Lock-vrij; `run_tunnel_loops` werkt ze bij. Bytes tellen de
 /// PLAINTEXT (wat door de TUN gaat), niet de wire-grootte.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TunnelStats {
     /// True zolang de tunnel-loops draaien.
     pub connected: AtomicBool,

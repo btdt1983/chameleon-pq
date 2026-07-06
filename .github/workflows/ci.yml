@@ -134,3 +134,28 @@ jobs:
             cargo fuzz run "$t" -- -max_total_time=120
             echo "::endgroup::"
           done
+
+  # Build the desktop GUI (iced) on Windows — the target platform for the client.
+  # Separate crate (gui/), so it isn't covered by build-test. Uploads the .exe so
+  # you can grab a fresh Windows build without a local toolchain.
+  gui:
+    name: Build GUI (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo & gui target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            gui/target
+          key: ${{ runner.os }}-gui-${{ hashFiles('gui/Cargo.toml', 'Cargo.lock') }}
+      - name: Build GUI (release)
+        run: cargo build --release --manifest-path gui/Cargo.toml
+      - name: Upload GUI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-gui-windows
+          path: gui/target/release/chameleon-gui.exe

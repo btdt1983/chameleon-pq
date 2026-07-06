@@ -114,6 +114,7 @@ pub struct Status {
 
 /// Een verbonden client: de tunnel-loops draaien op de achtergrond; deze handle
 /// geeft status en kan de tunnel sluiten.
+#[derive(Debug)]
 pub struct Client {
     stats: Arc<TunnelStats>,
     task: tokio::task::JoinHandle<()>,
@@ -185,8 +186,9 @@ impl Client {
         }
     }
 
-    /// Sluit de tunnel: stop de achtergrond-taak.
-    pub fn disconnect(self) {
+    /// Sluit de tunnel: stop de achtergrond-taak. Neemt `&self` (JoinHandle::abort
+    /// is `&self`), zodat een frontend de client achter een `Arc` kan houden.
+    pub fn disconnect(&self) {
         self.task.abort();
         self.stats.connected.store(false, Ordering::Relaxed);
     }
