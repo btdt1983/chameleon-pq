@@ -18,6 +18,16 @@ chameleon-pq = { path = ".." }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Native bestandsdialoog om de config.toml te kiezen — TARGET-SPECIFIEK:
+# Windows/macOS gebruiken hun native dialoog (geen extra systeemlibs); Linux de
+# xdg-desktop-portal i.p.v. GTK, zodat het op de headless buildbox (en CI-ubuntu)
+# compileert zonder GTK-dev-libs. Zo trekt de Windows-CI-job GEEN ashpd/zbus binnen.
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["tokio"] }
+
 [[bin]]
 name = "chameleon-gui"
 path = "src/main.rs"

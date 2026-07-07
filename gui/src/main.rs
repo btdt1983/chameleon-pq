@@ -7,9 +7,9 @@
 //! CAP_NET_ADMIN/sudo; Windows: admin + wintun.dll naast de binary).
 
 use chameleon::client::{build_auth, security_warnings, Client, Status};
-use chameleon::config::AppConfig;
+use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
 use chameleon::tun_iface::TunPair;
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Color, Element, Length, Subscription, Task};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -210,6 +210,8 @@ struct App {
     config_path: String,
     config: Option<AppConfig>,
     server: String,
+    /// Geselecteerd verkeersprofiel; wint bij Connect van wat in de config staat.
+    profile: TrafficProfile,
     client: Option<Arc<Client>>,
     status: Option<Status>,
     warnings: Vec<String>,
@@ -221,6 +223,12 @@ struct App {
 enum Message {
     ConfigPathChanged(String),
     ServerChanged(String),
+    /// Open de native bestandsdialoog om een config te kiezen.
+    BrowseConfig,
+    /// Resultaat van de dialoog (None = geannuleerd).
+    ConfigPicked(Option<String>),
+    /// Profiel gekozen in de dropdown.
+    ProfileChanged(TrafficProfile),
     LoadConfig,
     Connect,
     Connected(Result<Arc<Client>, String>),
@@ -235,6 +243,7 @@ impl App {
                 config_path: "config.toml".into(),
                 config: None,
                 server: String::new(),
+                profile: TrafficProfile::default(),
                 client: None,
                 status: None,
                 warnings: Vec::new(),
@@ -265,6 +274,34 @@ impl App {
         match message {
             Message::ConfigPathChanged(v) => self.config_path = v,
             Message::ServerChanged(v) => self.server = v,
+            Message::BrowseConfig => {
+                // Native dialoog async openen; resultaat komt terug als ConfigPicked.
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("TOML-config", &["toml"])
+                            .set_title("Kies een Chameleon-config")
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_string_lossy().into_owned())
+                    },
+                    Message::ConfigPicked,
+                );
+            }
+            Message::ConfigPicked(picked) => {
+                if let Some(path) = picked {
+                    self.config_path = path;
+                    // Meteen laden — de gebruiker koos immers expliciet een bestand.
+                    return self.update(Message::LoadConfig);
+                }
+            }
+            Message::ProfileChanged(p) => {
+                self.profile = p;
+                if let Some(cfg) = &mut self.config {
+                    cfg.traffic.profile = p;
+                }
+                self.log(format!("Profiel: {p}"));
+            }
             Message::LoadConfig => match AppConfig::load(std::path::Path::new(&self.config_path)) {
                 Ok(cfg) => {
                     self.warnings = security_warnings(&cfg);
@@ -273,14 +310,24 @@ impl App {
                             self.server = s.to_string();
                         }
                     }
-                    self.log(format!("Config geladen: {}", self.config_path));
+                    // Toon het profiel uit de config in de dropdown.
+                    self.profile = cfg.traffic.profile;
+                    self.log(format!(
+                        "Config geladen: {} (profiel: {})",
+                        self.config_path, cfg.traffic.profile
+                    ));
                     self.config = Some(cfg);
                 }
                 Err(e) => self.log(format!("Config-fout: {e}")),
             },
             Message::Connect => {
                 let cfg = match &self.config {
-                    Some(c) => c.clone(),
+                    Some(c) => {
+                        // Het in de dropdown gekozen profiel wint van de config.
+                        let mut c = c.clone();
+                        c.traffic.profile = self.profile;
+                        c
+                    }
                     None => {
                         self.log("Laad eerst een config.");
                         return Task::none();
@@ -362,6 +409,7 @@ impl App {
         let config_row = row![
             text("Config:").width(Length::Fixed(70.0)),
             text_input("config.toml", &self.config_path).on_input(Message::ConfigPathChanged),
+            button(text("Bladeren…")).on_press(Message::BrowseConfig),
             button(text("Laden")).on_press(Message::LoadConfig),
         ]
         .spacing(8);
@@ -369,6 +417,29 @@ impl App {
         let server_row = row![
             text("Server:").width(Length::Fixed(70.0)),
             text_input("1.2.3.4:51820", &self.server).on_input(Message::ServerChanged),
+        ]
+        .spacing(8);
+
+        // Profiel-keuze met live plafond-indicatie (doorgerekend via effective()).
+        let eff = TrafficConfig {
+            profile: self.profile,
+            ..Default::default()
+        }
+        .effective();
+        let ceiling = if eff.enabled {
+            let pps = eff.rate_pps as u64 * eff.burst as u64;
+            format!("≈ {} Mbit/s plafond", pps * 1232 * 8 / 1_000_000)
+        } else {
+            "geen shaping — WireGuard-vergelijkbaar".to_string()
+        };
+        let profile_row = row![
+            text("Profiel:").width(Length::Fixed(70.0)),
+            pick_list(
+                &TrafficProfile::ALL[..],
+                Some(self.profile),
+                Message::ProfileChanged
+            ),
+            text(ceiling).size(13),
         ]
         .spacing(8);
 
@@ -448,6 +519,7 @@ impl App {
                 banner,
                 config_row,
                 server_row,
+                profile_row,
                 action,
                 status_panel,
                 text("Log:"),

@@ -247,13 +247,76 @@ pub enum TrafficMode {
     Adaptive,
 }
 
+/// Voorgedefinieerd verkeersprofiel: zet `mode`/`rate_pps`/`burst` in één keer
+/// goed zodat een gebruiker niet zelf de doorvoer-vs-verhulling-afweging hoeft te
+/// rekenen. Het profiel WINT; de losse velden hieronder gelden alleen bij
+/// `custom`. Zie `effective()` voor de exacte waarden per profiel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrafficProfile {
+    /// Max anti-analyse: CBR, laag plafond (~5 Mbit/s), constante bandbreedte 24/7.
+    /// Voor licht verkeer waar onzichtbaarheid boven snelheid gaat.
+    Stealth,
+    /// STANDAARD: adaptive, ruim plafond (~115 Mbit/s), STIL in rust. Timing
+    /// verborgen tijdens gebruik; goede algemene VPN-ervaring.
+    #[default]
+    Balanced,
+    /// Max snelheid mét timing-pacing: adaptive, hoog plafond (~460 Mbit/s).
+    /// Voor wie snelheid boven maximale verhulling stelt maar tóch cover wil.
+    Throughput,
+    /// GEEN timing-shaping (pacer uit). Native timing en snelheid — het
+    /// WireGuard-vergelijkbare profiel (packet-vorm-obfuscatie via [obfuscation]
+    /// blijft wél aan). Geen bescherming tegen timing-/burst-analyse.
+    Off,
+    /// Gebruik de losse `enabled`/`mode`/`rate_pps`/`burst`-velden hieronder.
+    Custom,
+}
+
+impl TrafficProfile {
+    /// Alle profielen in vaste volgorde — voor UI-keuzelijsten (client-GUI).
+    pub const ALL: [TrafficProfile; 5] = [
+        TrafficProfile::Stealth,
+        TrafficProfile::Balanced,
+        TrafficProfile::Throughput,
+        TrafficProfile::Off,
+        TrafficProfile::Custom,
+    ];
+}
+
+impl std::fmt::Display for TrafficProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TrafficProfile::Stealth => "stealth",
+            TrafficProfile::Balanced => "balanced",
+            TrafficProfile::Throughput => "throughput",
+            TrafficProfile::Off => "off",
+            TrafficProfile::Custom => "custom",
+        })
+    }
+}
+
+/// De uiteindelijke, doorgerekende traffic-parameters nadat het profiel is
+/// toegepast. Dit is wat het datapad (`tunnel_loops`) daadwerkelijk gebruikt.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveTraffic {
+    pub enabled: bool,
+    pub mode: TrafficMode,
+    pub rate_pps: u32,
+    pub burst: u16,
+    pub cooldown_ms: u64,
+}
+
 /// `[traffic]`-sectie: constant-rate pacing + cover-traffic tegen timing-analyse.
-/// Standaard AAN met CBR. Dit voegt cover-pakketten toe (constante bandbreedte)
-/// en vertraagt echte pakketten tot slot-grenzen. De geconfigureerde rate
-/// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte ALS het
-/// doorvoerplafond — stem 'm af op je link.
+/// Kies een `profile` (standaard `balanced`); alleen bij `profile = "custom"`
+/// gelden de losse `mode`/`rate_pps`/`burst`-velden. De effectieve rate
+/// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte (CBR) ALS het
+/// doorvoerplafond.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrafficConfig {
+    /// Voorgedefinieerd profiel; standaard `balanced`. Wint van de losse velden
+    /// tenzij op `custom` gezet.
+    #[serde(default)]
+    pub profile: TrafficProfile,
     #[serde(default = "default_traffic_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -272,11 +335,64 @@ pub struct TrafficConfig {
 impl Default for TrafficConfig {
     fn default() -> Self {
         Self {
+            profile: TrafficProfile::default(),
             enabled: default_traffic_enabled(),
             mode: TrafficMode::default(),
             rate_pps: default_rate_pps(),
             burst: default_burst(),
             cooldown_ms: default_cooldown_ms(),
+        }
+    }
+}
+
+impl TrafficConfig {
+    /// Reken het profiel uit naar concrete parameters. De preset-profielen
+    /// negeren de losse `enabled`/`mode`/`rate_pps`/`burst`-velden (op
+    /// `cooldown_ms` na); alleen `custom` gebruikt ze rechtstreeks.
+    pub fn effective(&self) -> EffectiveTraffic {
+        use TrafficProfile::*;
+        let cd = self.cooldown_ms;
+        match self.profile {
+            // 256×2 = 512 pps × ~1232 B ≈ 5 Mbit/s, constant.
+            Stealth => EffectiveTraffic {
+                enabled: true,
+                mode: TrafficMode::Cbr,
+                rate_pps: 256,
+                burst: 2,
+                cooldown_ms: cd,
+            },
+            // 3000×4 = 12k pps × ~1232 B ≈ 115 Mbit/s, alleen tijdens activiteit.
+            Balanced => EffectiveTraffic {
+                enabled: true,
+                mode: TrafficMode::Adaptive,
+                rate_pps: 3000,
+                burst: 4,
+                cooldown_ms: cd,
+            },
+            // 6000×8 = 48k pps × ~1232 B ≈ 460 Mbit/s, alleen tijdens activiteit.
+            Throughput => EffectiveTraffic {
+                enabled: true,
+                mode: TrafficMode::Adaptive,
+                rate_pps: 6000,
+                burst: 8,
+                cooldown_ms: cd,
+            },
+            // Pacer uit — WireGuard-vergelijkbaar (native timing/snelheid).
+            Off => EffectiveTraffic {
+                enabled: false,
+                mode: self.mode,
+                rate_pps: self.rate_pps,
+                burst: self.burst,
+                cooldown_ms: cd,
+            },
+            // Volledig handmatig.
+            Custom => EffectiveTraffic {
+                enabled: self.enabled,
+                mode: self.mode,
+                rate_pps: self.rate_pps,
+                burst: self.burst,
+                cooldown_ms: cd,
+            },
         }
     }
 }
@@ -409,14 +525,17 @@ impl AppConfig {
         }
         // Traffic shaping (Fase 3): cover-pakketten rijden op het geobfusceerde
         // datapad, dus vereist obfuscation.enabled; rate/burst moeten >= 1.
-        if self.traffic.enabled {
+        // Valideer op de EFFECTIEVE waarden (na profiel-resolutie), zodat een
+        // `custom`-profiel met onzin-waarden alsnog gevangen wordt.
+        let eff = self.traffic.effective();
+        if eff.enabled {
             if !self.obfuscation.enabled {
                 return Err(ChameleonError::Handshake {
                     state: "config".into(),
-                    msg: "traffic.enabled requires obfuscation.enabled = true".into(),
+                    msg: "traffic (profile != off) requires obfuscation.enabled = true".into(),
                 });
             }
-            if self.traffic.rate_pps < 1 || self.traffic.burst < 1 {
+            if eff.rate_pps < 1 || eff.burst < 1 {
                 return Err(ChameleonError::Handshake {
                     state: "config".into(),
                     msg: "traffic.rate_pps and traffic.burst must both be >= 1".into(),
@@ -493,5 +612,62 @@ mod tests {
     fn hex_rejects_bad_input() {
         assert!(hex_to_32("zz", "test").is_err());
         assert!(hex_to_32("ab", "test").is_err()); // too short
+    }
+
+    #[test]
+    fn default_traffic_profile_is_balanced() {
+        let t = TrafficConfig::default();
+        assert_eq!(t.profile, TrafficProfile::Balanced);
+        let e = t.effective();
+        assert!(e.enabled);
+        assert_eq!(e.mode, TrafficMode::Adaptive);
+        assert_eq!(e.rate_pps, 3000);
+        assert_eq!(e.burst, 4);
+    }
+
+    #[test]
+    fn profiles_resolve_to_expected_params() {
+        let eff = |p: TrafficProfile| {
+            TrafficConfig {
+                profile: p,
+                ..Default::default()
+            }
+            .effective()
+        };
+        // stealth: CBR, laag plafond.
+        let s = eff(TrafficProfile::Stealth);
+        assert!(s.enabled && s.mode == TrafficMode::Cbr && s.rate_pps == 256 && s.burst == 2);
+        // throughput: adaptive, hoog plafond.
+        let th = eff(TrafficProfile::Throughput);
+        assert!(
+            th.enabled && th.mode == TrafficMode::Adaptive && th.rate_pps == 6000 && th.burst == 8
+        );
+        // off: pacer uit (WireGuard-vergelijkbaar).
+        assert!(!eff(TrafficProfile::Off).enabled);
+    }
+
+    #[test]
+    fn custom_profile_uses_raw_fields() {
+        let t = TrafficConfig {
+            profile: TrafficProfile::Custom,
+            enabled: true,
+            mode: TrafficMode::Cbr,
+            rate_pps: 1234,
+            burst: 7,
+            cooldown_ms: 250,
+        };
+        let e = t.effective();
+        assert!(e.enabled && e.mode == TrafficMode::Cbr && e.rate_pps == 1234 && e.burst == 7);
+    }
+
+    #[test]
+    fn profile_parses_from_toml() {
+        let t: TrafficConfig = toml::from_str(r#"profile = "throughput""#).unwrap();
+        assert_eq!(t.profile, TrafficProfile::Throughput);
+        let off: TrafficConfig = toml::from_str(r#"profile = "off""#).unwrap();
+        assert!(!off.effective().enabled);
+        // Lege sectie → default balanced.
+        let empty: TrafficConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.profile, TrafficProfile::Balanced);
     }
 }

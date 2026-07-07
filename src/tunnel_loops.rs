@@ -55,15 +55,30 @@ pub struct TunnelParams {
 
 impl TunnelParams {
     pub fn from_config(cfg: &AppConfig) -> Self {
+        let t = cfg.traffic.effective();
+        if t.enabled {
+            // ~1232 B wire per pakket (MTU-veilig datagram); plafond = rate×burst×grootte.
+            let pps = t.rate_pps as u64 * t.burst as u64;
+            let ceiling_mbit = pps * 1232 * 8 / 1_000_000;
+            info!(
+                "traffic profile: {:?} — {:?}, {}×{} = {} pps ≈ {} Mbit/s plafond",
+                cfg.traffic.profile, t.mode, t.rate_pps, t.burst, pps, ceiling_mbit
+            );
+        } else {
+            info!(
+                "traffic profile: {:?} — pacer UIT (geen timing-shaping, WireGuard-vergelijkbaar)",
+                cfg.traffic.profile
+            );
+        }
         Self {
             batch_linger_us: cfg.engine.batch_linger_us,
             obf_enabled: cfg.obfuscation.enabled,
             padding: cfg.obfuscation.padding.into(),
-            traffic_enabled: cfg.traffic.enabled,
-            traffic_mode: cfg.traffic.mode,
-            rate_pps: cfg.traffic.rate_pps,
-            burst: cfg.traffic.burst,
-            cooldown_ms: cfg.traffic.cooldown_ms,
+            traffic_enabled: t.enabled,
+            traffic_mode: t.mode,
+            rate_pps: t.rate_pps,
+            burst: t.burst,
+            cooldown_ms: t.cooldown_ms,
         }
     }
 }
