@@ -167,7 +167,12 @@ pub async fn run_tunnel_loops(
     let rekeying_out = rekeying.clone();
     let state_out = sock_state.clone();
     let stats_out = stats.clone();
-    let outbound = tokio::spawn(async move {
+    // Run the three loops in a JoinSet so all of them are aborted when this
+    // function returns OR is cancelled (Client::disconnect aborts this task). A
+    // plain select! on JoinHandles detaches the losers, leaking a tunnel that
+    // keeps sending — which broke disconnect and the server's session loop.
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
@@ -299,7 +304,7 @@ pub async fn run_tunnel_loops(
     let state_in = sock_state.clone();
     let peer_in = peer;
     let stats_in = stats.clone();
-    let inbound = tokio::spawn(async move {
+    tasks.spawn(async move {
         // Gebatchte ontvangst-buffers (GRO): één syscall levert meerdere
         // datagrammen, die we hieronder één voor één door de bestaande demux halen.
         let (mut recv_storage, mut recv_metas) = crate::udp::recv_buffers();
@@ -506,7 +511,7 @@ pub async fn run_tunnel_loops(
     // alleen de dode-peer-detectie. (Adaptive kan idle-stil vallen, dus daar
     // blijft de keepalive-send nodig.)
     let ka_skip_send = paced && matches!(params.traffic_mode, TrafficMode::Cbr);
-    let keepalive = tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut ka_tick = interval(KEEPALIVE_INTERVAL);
         loop {
             ka_tick.tick().await;
@@ -542,10 +547,14 @@ pub async fn run_tunnel_loops(
         }
     });
 
-    tokio::select! {
-        r = outbound  => { if let Err(e) = r { error!("outbound task: {e}"); } }
-        r = inbound   => { if let Err(e) = r { error!("inbound task: {e}"); } }
-        r = keepalive => { if let Err(e) = r { error!("keepalive task: {e}"); } }
+    // Wait for the first loop to finish (peer close, dead peer, or TUN/socket
+    // error). Returning here drops `tasks`, which aborts the other two loops;
+    // being cancelled (Client::disconnect aborts this task) drops `tasks` too,
+    // so a disconnect actually stops the tunnel instead of leaking a sender.
+    if let Some(Err(e)) = tasks.join_next().await {
+        if !e.is_cancelled() {
+            error!("tunnel task join error: {e}");
+        }
     }
     stats.connected.store(false, Ordering::Relaxed);
     info!("tunnel closed");
