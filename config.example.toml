@@ -63,16 +63,23 @@ handshake = true
 # met dummy-pakketten, zodat burst-/idle-patronen verdwijnen (de laatste dimensie
 # van verkeersanalyse). Vereist obfuscation.enabled = true.
 #
-# LET OP — dit kost bandbreedte en doorvoer. De rate (rate_pps × burst) is je
-# doorvoerplafond (verkeer daarboven wordt gedropt) én, in CBR, je constante
-# bandbreedte. Bij de defaults: 256 × 2 = 512 pakketten/s × ~1232 B ≈ ~5 Mbps.
-# In ADAPTIVE (standaard) stroomt dit alleen tijdens activiteit + cooldown; in
-# rust is er geen cover-verkeer. In CBR stroomt het 24/7 (≈ 1,6 TB/maand/richting).
-# Stem rate_pps/burst af op je link; verlaag voor minder kost (lager plafond),
-# verhoog voor meer doorvoer. Zet enabled=false om timing-shaping uit te zetten.
+# Kies een PROFILE; dat zet mode/rate_pps/burst in één keer goed. De effectieve
+# rate (rate_pps × burst) is je doorvoerplafond (verkeer daarboven wordt gedropt)
+# én, in CBR, je constante bandbreedte (~1232 B per pakket op de lijn).
+#
+#   "stealth"    — CBR, 256×2 ≈ 5 Mbit/s. Max anti-analyse; constante bandbreedte
+#                  24/7 (≈ 1,6 TB/maand/richting). Voor licht, onopvallend verkeer.
+#   "balanced"   — STANDAARD. Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen
+#                  tijdens gebruik, STIL in rust. Goede algemene VPN-ervaring.
+#   "throughput" — Adaptive, 6000×8 ≈ 460 Mbit/s. Max snelheid mét pacing.
+#   "off"        — Pacer UIT: native timing/snelheid, GEEN timing-verhulling.
+#                  WireGuard-vergelijkbaar (packet-vorm-padding blijft wél aan).
+#   "custom"     — gebruik de losse mode/rate_pps/burst-velden hieronder.
+profile = "balanced"
+
+# De onderstaande velden gelden ALLEEN bij profile = "custom".
 enabled  = true
-# "adaptive" — STANDAARD: pace tijdens activiteit + cooldown, stil in rust
-#              (geen bandbreedte idle, wél burst-verberging tijdens verkeer)
+# "adaptive" — pace tijdens activiteit + cooldown, stil in rust
 # "cbr"      — constant bit-rate (altijd op tempo, ook idle; sterkst, duurst)
 mode     = "adaptive"
 rate_pps = 256      # emissie-slots per seconde
