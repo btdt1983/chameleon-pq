@@ -12,10 +12,11 @@ use crate::error::Result;
 use crate::frame::FrameType;
 use crate::net::run_handshake_initiator;
 use crate::obf::PadPolicy;
+use crate::route::FullTunnelRoutes;
 use crate::session::SessionManager;
 use crate::tun_iface::TunPair;
 use crate::tunnel_loops::{run_tunnel_loops, TunnelParams, TunnelStats};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -136,6 +137,9 @@ pub struct Client {
     socket: Arc<UdpSocket>,
     pad: PadPolicy,
     obf: bool,
+    /// Full-tunnel routes (WireGuard-style), held for RAII: removed when this
+    /// Client is dropped (i.e. on disconnect). `None` in split-tunnel mode.
+    _routes: Option<FullTunnelRoutes>,
 }
 
 // Manual Debug: CryptoEngine/SessionManager aren't Debug, but a frontend's
@@ -200,6 +204,34 @@ impl Client {
             traffic_rx,
         ));
 
+        // Full-tunnel routing (WireGuard-style): the tunnel is up now, so install
+        // the routes. Best-effort — a failure leaves a working split-tunnel
+        // rather than refusing the connection.
+        let routes = if cfg.tun.route_all {
+            match cfg
+                .tun
+                .peer_address
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            {
+                Some(gw) => match FullTunnelRoutes::install(gw, server.ip()) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!("full-tunnel routing failed: {e} — connected split-tunnel");
+                        None
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        "tun.route_all set but tun.peer_address missing/invalid — split-tunnel"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             stats,
             task,
@@ -211,6 +243,7 @@ impl Client {
             socket: socket_close,
             pad,
             obf,
+            _routes: routes,
         })
     }
 
