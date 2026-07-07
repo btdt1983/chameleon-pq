@@ -214,13 +214,31 @@ impl Client {
                 .as_deref()
                 .and_then(|s| s.parse::<Ipv4Addr>().ok())
             {
-                Some(gw) => match FullTunnelRoutes::install(gw, server.ip()) {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        tracing::warn!("full-tunnel routing failed: {e} — connected split-tunnel");
-                        None
+                Some(gw) => {
+                    // The wintun IP isn't configured for a moment right after
+                    // connect, so the route install fails (no ifindex / gateway
+                    // not on-link yet). Retry with a short delay until the tun is
+                    // ready; give up to split-tunnel rather than block forever.
+                    let mut installed = None;
+                    for attempt in 1..=8u32 {
+                        match FullTunnelRoutes::install(gw, server.ip(), &cfg.tun.name) {
+                            Ok(r) => {
+                                installed = Some(r);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "full-tunnel install attempt {attempt}/8 failed ({e})"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                            }
+                        }
                     }
-                },
+                    if installed.is_none() {
+                        tracing::warn!("full-tunnel routing failed after retries — split-tunnel");
+                    }
+                    installed
+                }
                 None => {
                     tracing::warn!(
                         "tun.route_all set but tun.peer_address missing/invalid — split-tunnel"
