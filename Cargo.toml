@@ -36,7 +36,7 @@ zeroize           = { version = "1", features = ["derive"] }
 tokio             = { version = "1", features = ["full"] }
 bytes             = "1"
 # Batched UDP I/O (GSO/GRO on Linux, cross-platform + per-packet fallback).
-quinn-udp         = "0.5"
+quinn-udp         = "0.6"
 
 # TUN interface (cross-platform; Windows needs wintun.dll alongside binary)
 tun               = { version = "0.6", features = ["async"] }

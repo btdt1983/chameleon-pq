@@ -61,18 +61,10 @@ pub async fn batch_send(
     if datagrams.is_empty() {
         return Ok(());
     }
-    // Windows: NIET via quinn-udp's GSO. Het WSASendMsg/`UDP_SEND_MSG_SIZE`-pad
-    // crasht native (access violation) op sommige Windows-adapters — reproduceer-
-    // baar zelfs over loopback — en zo'n hardware-exception ontsnapt aan de Rust-
-    // panic-hook (proces + venster weg, géén paniek-log). Verstuur daarom elk
-    // datagram met één `send_to`. Geen GSO-batchingwinst, maar stabiel; die winst
-    // was sowieso Linux-specifiek (kernel-UDP-GSO). Zie ook `batch_recv`.
-    if cfg!(windows) {
-        for d in datagrams {
-            socket.send_to(d.as_ref(), peer).await?;
-        }
-        return Ok(());
-    }
+    // EXPERIMENT (quinn-udp 0.6): the old GSO *send* bypass for Windows is removed
+    // to test whether 0.6 fixes the native WSASendMsg access violation that killed
+    // 0.5 on Windows. quinn-udp still falls back to per-datagram sends when the
+    // platform reports max_gso_segments() == 1, so this is safe on any kernel.
     let max_seg = state.max_gso_segments().max(1);
     let mut buf: Vec<u8> = Vec::with_capacity(seg_size * datagrams.len().min(max_seg));
     let mut i = 0;
@@ -111,20 +103,10 @@ pub async fn batch_recv(
     storage: &mut [Vec<u8>],
     metas: &mut [RecvMeta],
 ) -> io::Result<usize> {
-    // Windows: geen quinn-udp GRO (zelfde native-crash-reden als de send-kant in
-    // `batch_send`). Ontvang één datagram met `recv_from` in de eerste buffer;
-    // `stride = 0` laat `iter_datagrams` het als één heel datagram teruggeven.
-    if cfg!(windows) {
-        let (n, addr) = socket.recv_from(&mut storage[0]).await?;
-        metas[0] = RecvMeta {
-            addr,
-            len: n,
-            stride: 0,
-            ecn: None,
-            dst_ip: None,
-        };
-        return Ok(1);
-    }
+    // EXPERIMENT (quinn-udp 0.6): re-enable GRO on Windows. The 0.5 native crash
+    // was in GSO *send* (WSASendMsg); Tailscale proves batched I/O works on
+    // Windows, so this is worth testing on the newer quinn-udp. Falls back to a
+    // single-datagram recv only if the platform lacks GRO.
     let mut iov: Vec<IoSliceMut> = storage
         .iter_mut()
         .map(|b| IoSliceMut::new(b.as_mut_slice()))
@@ -211,13 +193,12 @@ mod tests {
     }
 
     fn meta(addr: SocketAddr, len: usize, stride: usize) -> RecvMeta {
-        RecvMeta {
-            addr,
-            len,
-            stride,
-            ecn: None,
-            dst_ip: None,
-        }
+        // RecvMeta is #[non_exhaustive] in quinn-udp 0.6 → build via default.
+        let mut m = RecvMeta::default();
+        m.addr = addr;
+        m.len = len;
+        m.stride = stride;
+        m
     }
 
     #[test]
