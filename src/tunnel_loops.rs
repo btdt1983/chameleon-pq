@@ -118,7 +118,31 @@ pub async fn run_tunnel_loops(
     // this changes (e.g. GUI profile switch) without tearing down the tunnel.
     traffic_rx: watch::Receiver<EffectiveTraffic>,
 ) {
-    let TunPair { from_tun, to_tun } = tun;
+    let TunPair {
+        from_tun,
+        to_tun,
+        read_task,
+        write_task,
+    } = tun;
+    // Abort-on-drop guard: if this future is cancelled (Client::disconnect aborts
+    // the task), stop the TUN read/write tasks too — the read task blocks on
+    // read() and would otherwise keep the interface open, breaking the next
+    // connect. On a normal return we also abort+await them explicitly below.
+    struct TunGuard(Vec<tokio::task::AbortHandle>);
+    impl Drop for TunGuard {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                h.abort();
+            }
+        }
+    }
+    let _tun_guard = TunGuard(
+        [read_task.as_ref(), write_task.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|h| h.abort_handle())
+            .collect(),
+    );
     let linger = Duration::from_micros(params.batch_linger_us);
     stats.connected.store(true, Ordering::Relaxed);
 
@@ -555,6 +579,20 @@ pub async fn run_tunnel_loops(
         if !e.is_cancelled() {
             error!("tunnel task join error: {e}");
         }
+    }
+    // Abort AND await the remaining loops so the socket has no second reader when
+    // the caller (server session loop) re-listens on it — a lingering reader
+    // would swallow the next handshake and time out its confirm.
+    tasks.shutdown().await;
+    // Fully release the TUN device (abort + await) before returning, so the
+    // server loop can re-create `chameleon0` without a name clash.
+    if let Some(h) = read_task {
+        h.abort();
+        let _ = h.await;
+    }
+    if let Some(h) = write_task {
+        h.abort();
+        let _ = h.await;
     }
     stats.connected.store(false, Ordering::Relaxed);
     info!("tunnel closed");
