@@ -83,6 +83,11 @@ async fn tunnel_e2e_data_flows_both_ways() {
     let params = chameleon::tunnel_loops::TunnelParams::from_config(&test_config());
     let server_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
     let client_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
+    // Keep a traffic sender per side alive for the test so the outbound loop's
+    // live-control arm parks instead of erroring; no live re-profiling here.
+    let eff = test_config().traffic.effective();
+    let (_server_traffic_tx, server_traffic_rx) = tokio::sync::watch::channel(eff);
+    let (_client_traffic_tx, client_traffic_rx) = tokio::sync::watch::channel(eff);
     tokio::spawn(run_tunnel_loops(
         server_sock.clone(),
         server_engine,
@@ -92,6 +97,7 @@ async fn tunnel_e2e_data_flows_both_ways() {
         server_auth.clone(),
         None,
         server_stats.clone(),
+        server_traffic_rx,
     ));
     tokio::spawn(run_tunnel_loops(
         client_sock.clone(),
@@ -102,6 +108,7 @@ async fn tunnel_e2e_data_flows_both_ways() {
         client_auth.clone(),
         None,
         client_stats.clone(),
+        client_traffic_rx,
     ));
 
     // ── Client → server: injecteer in de client-TUN, lees uit de server-TUN. ──
@@ -158,6 +165,8 @@ async fn client_core_connects_and_flows() {
     // Server: responder-handshake + tunnel-loops op de achtergrond.
     let params = TunnelParams::from_config(&test_config());
     let sa = server_auth.clone();
+    let (_srv_traffic_tx, srv_traffic_rx) =
+        tokio::sync::watch::channel(test_config().traffic.effective());
     tokio::spawn(async move {
         let (session, client_addr) = run_handshake_responder(&server_sock, sa.as_ref(), None)
             .await
@@ -172,6 +181,7 @@ async fn client_core_connects_and_flows() {
             sa,
             None,
             Arc::new(TunnelStats::default()),
+            srv_traffic_rx,
         )
         .await;
     });

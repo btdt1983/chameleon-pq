@@ -5,7 +5,7 @@
 //! (`tunnel_loops::run_tunnel_loops`). Een client kan zo niets verzwakken; het
 //! enige wat het beveiligingsniveau bepaalt is de CONFIG (zie `security_warnings`).
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, EffectiveTraffic};
 use crate::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
 use crate::engine::CryptoEngine;
 use crate::error::Result;
@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 /// Bouw de peer-authenticator uit de config: Ed25519, of hybride Ed25519 + ML-DSA
 /// (post-quantum) als beide ML-DSA-velden gezet zijn.
@@ -121,6 +122,9 @@ pub struct Client {
     peer: SocketAddr,
     session_id: u32,
     started_epoch: u64,
+    /// Live control of the traffic pacer: send a new `EffectiveTraffic` to
+    /// re-profile the running tunnel (e.g. GUI profile switch) without reconnect.
+    traffic_tx: watch::Sender<EffectiveTraffic>,
 }
 
 impl Client {
@@ -153,6 +157,9 @@ impl Client {
         // zet 'm ook, maar die taak start async — anders is er een korte race
         // waarin status() nog "niet verbonden" zou melden.)
         stats.connected.store(true, Ordering::Relaxed);
+        // Live pacer control: seeded with the connect-time profile; `set_traffic`
+        // pushes updates that the outbound loop applies without a reconnect.
+        let (traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
         let task = tokio::spawn(run_tunnel_loops(
             socket,
             engine,
@@ -162,6 +169,7 @@ impl Client {
             auth,
             hs_obf,
             stats.clone(),
+            traffic_rx,
         ));
 
         Ok(Self {
@@ -170,6 +178,7 @@ impl Client {
             peer: server,
             session_id,
             started_epoch: now_secs(),
+            traffic_tx,
         })
     }
 
@@ -184,6 +193,14 @@ impl Client {
             last_recv_epoch: self.stats.last_recv_epoch.load(Ordering::Relaxed),
             uptime_secs: now_secs().saturating_sub(self.started_epoch),
         }
+    }
+
+    /// Re-profile the running tunnel's traffic pacer live, without a reconnect.
+    /// Pass the resolved `EffectiveTraffic` for the desired profile; the outbound
+    /// loop applies it on its next tick. No-op once the tunnel has stopped.
+    pub fn set_traffic(&self, traffic: EffectiveTraffic) {
+        // Err only if the tunnel task (the sole receiver) is gone — safe to ignore.
+        let _ = self.traffic_tx.send(traffic);
     }
 
     /// Sluit de tunnel: stop de achtergrond-taak. Neemt `&self` (JoinHandle::abort

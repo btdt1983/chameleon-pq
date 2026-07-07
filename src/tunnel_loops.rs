@@ -6,7 +6,7 @@
 //! De inbound-loop is de ENIGE socket-lezer (sole-reader-invariant); mid-sessie
 //! handshake-frames gaan via een kanaal naar de rekey-driver (zie rekey.rs).
 
-use crate::config::{AppConfig, TrafficMode};
+use crate::config::{AppConfig, EffectiveTraffic, TrafficMode};
 use crate::crypto::Authenticator;
 use crate::engine::{CryptoEngine, DecryptResult, OutboundPacket};
 use crate::frame::{Frame, FrameType};
@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -57,16 +58,16 @@ impl TunnelParams {
     pub fn from_config(cfg: &AppConfig) -> Self {
         let t = cfg.traffic.effective();
         if t.enabled {
-            // ~1232 B wire per pakket (MTU-veilig datagram); plafond = rate×burst×grootte.
+            // ~1232 B wire per packet (MTU-safe datagram); ceiling = rate×burst×size.
             let pps = t.rate_pps as u64 * t.burst as u64;
             let ceiling_mbit = pps * 1232 * 8 / 1_000_000;
             info!(
-                "traffic profile: {:?} — {:?}, {}×{} = {} pps ≈ {} Mbit/s plafond",
+                "traffic profile: {:?} — {:?}, {}×{} = {} pps ≈ {} Mbit/s ceiling",
                 cfg.traffic.profile, t.mode, t.rate_pps, t.burst, pps, ceiling_mbit
             );
         } else {
             info!(
-                "traffic profile: {:?} — pacer UIT (geen timing-shaping, WireGuard-vergelijkbaar)",
+                "traffic profile: {:?} — pacer OFF (no timing shaping, WireGuard-comparable)",
                 cfg.traffic.profile
             );
         }
@@ -113,6 +114,9 @@ pub async fn run_tunnel_loops(
     auth: Arc<dyn Authenticator>,
     hs_obf: Option<[u8; 32]>,
     stats: Arc<TunnelStats>,
+    // Live-updatable traffic params: the outbound loop reconfigures its pacer when
+    // this changes (e.g. GUI profile switch) without tearing down the tunnel.
+    traffic_rx: watch::Receiver<EffectiveTraffic>,
 ) {
     let TunPair { from_tun, to_tun } = tun;
     let linger = Duration::from_micros(params.batch_linger_us);
@@ -131,9 +135,12 @@ pub async fn run_tunnel_loops(
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
     const PEER_DEAD_AFTER: u64 = 45; // seconden zonder enig pakket = dood
 
-    // Timing-/cover-traffic pacing (Fase 3). `paced` alleen als óók het datapad
-    // geobfusceerd is (cover-pakketten rijden erop; config valideert dit).
-    let paced = params.traffic_enabled && params.obf_enabled;
+    // Timing-/cover-traffic pacing (phase 3). `paced` only when the data path is
+    // also obfuscated (cover packets ride on it; the config validates this).
+    // Cover traffic requires obfuscation, so a live profile switch can only turn
+    // pacing on when obfuscation is enabled; capture it for the outbound loop.
+    let obf_on = params.obf_enabled;
+    let paced = params.traffic_enabled && obf_on;
     let pace_mode = match params.traffic_mode {
         TrafficMode::Cbr => ShapeMode::Cbr,
         TrafficMode::Adaptive => ShapeMode::Adaptive,
@@ -163,9 +170,15 @@ pub async fn run_tunnel_loops(
     let outbound = tokio::spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
-        // Ticker: het vaste slot-tempo bij pacing, anders de batch-linger.
+        // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
         let mut tick = interval(if paced { pace_slot } else { linger });
         let mut pacer = Pacer::new(pace_mode, pace_cooldown);
+        // Live-reconfigurable pacing state: a `traffic_rx` change (e.g. a GUI
+        // profile switch) recomputes these without tearing down the tunnel.
+        let mut paced = paced;
+        let mut pace_burst = pace_burst;
+        let mut traffic_rx = traffic_rx;
+        let mut traffic_live = true;
 
         loop {
             tokio::select! {
@@ -247,6 +260,31 @@ pub async fn run_tunnel_loops(
                             }
                         }
                         rekeying_out.store(false, Ordering::Release);
+                    }
+                }
+                // Live traffic-profile switch: recompute pacing on the fly, with
+                // no reconnect. `if traffic_live` disables this arm once every
+                // sender is gone (CLI paths keep one alive for the session).
+                res = traffic_rx.changed(), if traffic_live => {
+                    if res.is_err() {
+                        traffic_live = false; // all senders dropped
+                    } else {
+                        let eff = *traffic_rx.borrow_and_update();
+                        paced = eff.enabled && obf_on;
+                        let new_mode = match eff.mode {
+                            TrafficMode::Cbr => ShapeMode::Cbr,
+                            TrafficMode::Adaptive => ShapeMode::Adaptive,
+                        };
+                        let new_slot =
+                            Duration::from_micros(1_000_000u64 / eff.rate_pps.max(1) as u64);
+                        pace_burst = eff.burst.max(1) as usize;
+                        tick = interval(if paced { new_slot } else { linger });
+                        pacer = Pacer::new(new_mode, Duration::from_millis(eff.cooldown_ms));
+                        info!(
+                            "live traffic switch: {} ({} pps)",
+                            if paced { "paced" } else { "off" },
+                            eff.rate_pps as u64 * eff.burst as u64
+                        );
                     }
                 }
             }

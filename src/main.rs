@@ -27,6 +27,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -91,23 +92,47 @@ async fn run_server(
     info!("server listening on {bind}");
 
     let hs_obf = hs_obf_key_from_cfg(&cfg)?;
-    let (session, peer) = run_handshake_responder(&socket, auth.as_ref(), hs_obf.as_ref()).await?;
-    info!("session {} established with {peer}", session.session_id);
 
-    let tun = TunPair::create(&cfg.tun)?;
-    let engine = build_engine(session, &cfg);
-    chameleon::tunnel_loops::run_tunnel_loops(
-        socket,
-        engine,
-        tun,
-        peer,
-        chameleon::tunnel_loops::TunnelParams::from_config(&cfg),
-        auth.clone(),
-        hs_obf,
-        Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
-    )
-    .await;
-    Ok(())
+    // Serve sequential sessions: after one tunnel ends, listen for the next client
+    // instead of exiting. (Concurrent multi-client would need per-peer socket
+    // demux — a larger change; this alone removes the restart-per-reconnect.)
+    loop {
+        let (session, peer) =
+            match run_handshake_responder(&socket, auth.as_ref(), hs_obf.as_ref()).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    warn!("handshake failed: {e}; waiting for next client");
+                    continue;
+                }
+            };
+        let session_id = session.session_id;
+        info!("session {session_id} established with {peer}");
+
+        let tun = match TunPair::create(&cfg.tun) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("TUN create failed: {e}; waiting for next client");
+                continue;
+            }
+        };
+        let engine = build_engine(session, &cfg);
+        // CLI server: no live re-profiling, but keep a sender alive for the
+        // session so the outbound loop's control arm parks instead of erroring.
+        let (_traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        chameleon::tunnel_loops::run_tunnel_loops(
+            socket.clone(),
+            engine,
+            tun,
+            peer,
+            chameleon::tunnel_loops::TunnelParams::from_config(&cfg),
+            auth.clone(),
+            hs_obf,
+            Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
+            traffic_rx,
+        )
+        .await;
+        info!("session {session_id} ended — listening for next client");
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -126,6 +151,8 @@ async fn run_client(
 
     let tun = TunPair::create(&cfg.tun)?;
     let engine = build_engine(session, &cfg);
+    // CLI client: keep a traffic sender alive for the session (no live UI control).
+    let (_traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
     chameleon::tunnel_loops::run_tunnel_loops(
         socket,
         engine,
@@ -135,6 +162,7 @@ async fn run_client(
         auth.clone(),
         hs_obf,
         Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
+        traffic_rx,
     )
     .await;
     Ok(())
