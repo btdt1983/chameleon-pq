@@ -28,9 +28,15 @@ pub struct FullTunnelRoutes {
 }
 
 impl FullTunnelRoutes {
-    /// Route all traffic through the tunnel: pin `endpoint` to the physical
-    /// gateway, then send `0.0.0.0/1` + `128.0.0.0/1` via `peer_gw` (the peer's
-    /// TUN address). Rolls back on partial failure.
+    /// Route all traffic through the tunnel: send `0.0.0.0/1` + `128.0.0.0/1`
+    /// via `peer_gw` (the peer's TUN address). Rolls back on partial failure.
+    ///
+    /// We only pin the server `endpoint` when it is reached via the default
+    /// gateway (a remote server), so the tunnel's own UDP doesn't recurse into
+    /// the tunnel. An on-link / same-LAN server needs NO pin — its connected
+    /// `/24` route is already more specific than these `/1` routes — and pinning
+    /// it via the gateway would (wrongly) hairpin it through the router, which
+    /// breaks the endpoint on routers without NAT-loopback.
     pub fn install(peer_gw: Ipv4Addr, endpoint: IpAddr) -> Result<Self> {
         let mut me = Self {
             peer_gw,
@@ -38,13 +44,16 @@ impl FullTunnelRoutes {
             removed: false,
         };
 
-        // 1. Endpoint pin (best-effort — an on-link/LAN server needs none).
-        match default_gateway() {
-            Some(gw) => match route_op(Op::Add, &format!("{endpoint}/32"), &gw.to_string()) {
-                Ok(()) => me.endpoint = Some(endpoint),
-                Err(e) => warn!("endpoint pin via {gw} failed ({e}); assuming on-link server"),
-            },
-            None => warn!("no default gateway found; skipping endpoint pin (assuming on-link)"),
+        // 1. Endpoint pin — ONLY for a remote (via-gateway) server, never on-link.
+        if let Some(gw) = default_gateway() {
+            if endpoint_is_remote(endpoint, gw) {
+                match route_op(Op::Add, &format!("{endpoint}/32"), &gw.to_string()) {
+                    Ok(()) => me.endpoint = Some(endpoint),
+                    Err(e) => warn!("endpoint pin via {gw} failed ({e})"),
+                }
+            } else {
+                info!("server {endpoint} is on-link — no endpoint pin needed");
+            }
         }
 
         // 2. Full-tunnel /1 routes via the peer TUN address. Roll back the first
@@ -183,6 +192,17 @@ fn cidr_to_dst_mask(cidr: &str) -> Result<(String, String)> {
     }
     let mask = if p == 0 { 0u32 } else { u32::MAX << (32 - p) };
     Ok((ip.to_string(), Ipv4Addr::from(mask).to_string()))
+}
+
+/// Whether the server endpoint is reached via the gateway (remote) rather than
+/// on-link. Heuristic: on-link when it shares the default gateway's `/24` — the
+/// common LAN case, and exactly when a pin would be harmful. A genuinely remote
+/// server (different /24, reached through the router) does need the pin.
+fn endpoint_is_remote(endpoint: IpAddr, gw: Ipv4Addr) -> bool {
+    match endpoint {
+        IpAddr::V4(ep) => ep.octets()[..3] != gw.octets()[..3],
+        IpAddr::V6(_) => false, // full-tunnel here is IPv4-only; don't pin
+    }
 }
 
 fn run(mut cmd: Command, op: Op, what: &str) -> Result<()> {

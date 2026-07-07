@@ -88,20 +88,27 @@ async fn run_server(
     bind: SocketAddr,
     auth: Arc<dyn Authenticator>,
 ) -> anyhow::Result<()> {
-    let socket = Arc::new(UdpSocket::bind(bind).await?);
-    info!("server listening on {bind}");
-
     let hs_obf = hs_obf_key_from_cfg(&cfg)?;
 
-    // Serve sequential sessions: after one tunnel ends, listen for the next client
-    // instead of exiting. (Concurrent multi-client would need per-peer socket
-    // demux — a larger change; this alone removes the restart-per-reconnect.)
+    // Serve sequential sessions: after one tunnel ends, listen for the next
+    // client instead of exiting. (Concurrent multi-client would need per-peer
+    // socket demux — a larger change; this alone removes restart-per-reconnect.)
+    //
+    // Bind a FRESH socket per session. The tunnel enables UDP_GRO on the socket
+    // for throughput, and quinn-udp does not clear it afterwards — so on the
+    // re-listen the handshake responder's `recv_from` would read GRO-coalesced
+    // super-buffers (several variable-size handshake fragments glued together),
+    // which the reassembler cannot decode → the reconnect handshake never
+    // completes. A fresh socket starts GRO-clean; the old one is dropped (closed)
+    // at the end of each iteration.
     loop {
+        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        info!("server listening on {bind}");
         let (session, peer) =
             match run_handshake_responder(&socket, auth.as_ref(), hs_obf.as_ref()).await {
                 Ok(ok) => ok,
                 Err(e) => {
-                    warn!("handshake failed: {e}; waiting for next client");
+                    warn!("handshake failed: {e}; re-listening");
                     continue;
                 }
             };
