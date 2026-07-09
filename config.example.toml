@@ -25,6 +25,14 @@ address = "10.99.0.1"           # IP-adres van deze kant van de tunnel
 netmask = "255.255.255.0"
 mtu     = 1200                  # MTU-veilig voor het geobf. datapad (max 1232);
                                 # groter fragmenteert IP en verraadt/breekt de obf
+# Full-tunnel routing (CLIENT-kant, WireGuard-stijl). Met route_all = true zet de
+# client bij connect ALLE verkeer door de tunnel (0.0.0.0/0) én pint het server-
+# endpoint aan de fysieke gateway, en ruimt dat bij disconnect weer op — geen
+# handmatige `route add` meer nodig. Vereist admin (Windows) / CAP_NET_ADMIN.
+# peer_address = het TUN-adres van de ANDERE kant (de server), de gateway waar de
+# client doorheen routeert. Laat route_all weg (of false) voor split-tunnel.
+route_all    = false
+# peer_address = "10.99.0.1"     # zet dit op de client (server-TUN-adres)
 
 [engine]
 # Maximale wachttijd (µs) voor een batch voordat die geflusht wordt.

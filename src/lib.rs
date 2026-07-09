@@ -10,6 +10,7 @@ pub mod net;
 pub mod obf;
 pub mod pacer;
 pub mod rekey;
+pub mod route;
 pub mod session;
 pub mod tun_iface;
 pub mod tunnel;

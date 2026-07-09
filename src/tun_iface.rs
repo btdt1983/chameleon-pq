@@ -32,6 +32,12 @@ pub struct TunPair {
     pub from_tun: mpsc::Receiver<Bytes>,
     /// Schrijf hierheen: decrypted IP-pakketten richting kernel.
     pub to_tun: mpsc::Sender<Bytes>,
+    /// Handles to the TUN read/write tasks (None for the mock). The caller
+    /// aborts + awaits these on teardown so the device is fully released before
+    /// it is re-created — the read task blocks on `read()` and would otherwise
+    /// keep the interface open indefinitely when idle.
+    pub read_task: Option<tokio::task::JoinHandle<()>>,
+    pub write_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TunPair {
@@ -51,6 +57,8 @@ impl TunPair {
         let pair = TunPair {
             from_tun: inject_rx,
             to_tun: drain_tx,
+            read_task: None,
+            write_task: None,
         };
         (
             pair,
@@ -73,7 +81,7 @@ impl TunPair {
         let (mut reader, mut writer) = tokio::io::split(iface);
 
         // Lees-taak: TUN → engine (encrypt-kant)
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             let mut buf = vec![0u8; TUN_READ_BUF];
             loop {
                 match reader.read(&mut buf).await {
@@ -97,7 +105,7 @@ impl TunPair {
         });
 
         // Schrijf-taak: engine (decrypt-kant) → TUN
-        tokio::spawn(async move {
+        let write_task = tokio::spawn(async move {
             while let Some(pkt) = to_tun_rx.recv().await {
                 debug!("TUN write {} bytes", pkt.len());
                 if let Err(e) = writer.write_all(&pkt).await {
@@ -110,6 +118,8 @@ impl TunPair {
         TunPair {
             from_tun: from_tun_rx,
             to_tun: to_tun_tx,
+            read_task: Some(read_task),
+            write_task: Some(write_task),
         }
     }
 }
@@ -224,6 +234,7 @@ mod tests {
         let TunPair {
             mut from_tun,
             to_tun,
+            ..
         } = pair;
         let MockHandles {
             inject_tx,
