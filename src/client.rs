@@ -5,19 +5,23 @@
 //! (`tunnel_loops::run_tunnel_loops`). Een client kan zo niets verzwakken; het
 //! enige wat het beveiligingsniveau bepaalt is de CONFIG (zie `security_warnings`).
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, EffectiveTraffic};
 use crate::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
 use crate::engine::CryptoEngine;
 use crate::error::Result;
+use crate::frame::FrameType;
 use crate::net::run_handshake_initiator;
 use crate::obf::PadPolicy;
+use crate::route::FullTunnelRoutes;
 use crate::session::SessionManager;
 use crate::tun_iface::TunPair;
 use crate::tunnel_loops::{run_tunnel_loops, TunnelParams, TunnelStats};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 /// Bouw de peer-authenticator uit de config: Ed25519, of hybride Ed25519 + ML-DSA
 /// (post-quantum) als beide ML-DSA-velden gezet zijn.
@@ -89,9 +93,12 @@ pub fn security_warnings(cfg: &AppConfig) -> Vec<String> {
                 .into(),
         );
     }
-    if !cfg.traffic.enabled {
+    // Check the EFFECTIVE traffic (after profile resolution): profile="off" (or a
+    // custom profile with enabled=false) means no pacing. A stale raw `enabled`
+    // field must not trigger this when a paced profile is selected.
+    if !cfg.traffic.effective().enabled {
         w.push(
-            "traffic.enabled = false: geen timing-/cover-verkeer, dus burst- en \
+            "traffic-profiel \"off\": geen timing-/cover-verkeer, dus burst- en \
              idle-patronen blijven zichtbaar (bewuste snelheid-vs-verhulling-keuze)."
                 .into(),
         );
@@ -114,13 +121,37 @@ pub struct Status {
 
 /// Een verbonden client: de tunnel-loops draaien op de achtergrond; deze handle
 /// geeft status en kan de tunnel sluiten.
-#[derive(Debug)]
 pub struct Client {
     stats: Arc<TunnelStats>,
     task: tokio::task::JoinHandle<()>,
     peer: SocketAddr,
     session_id: u32,
     started_epoch: u64,
+    /// Live control of the traffic pacer: send a new `EffectiveTraffic` to
+    /// re-profile the running tunnel (e.g. GUI profile switch) without reconnect.
+    traffic_tx: watch::Sender<EffectiveTraffic>,
+    // Kept so `disconnect` can send an authenticated Close (fast server-side
+    // teardown → fast reconnect). The SessionManager is shared with the tunnel,
+    // so it tracks rekeys and the Close uses the current keys.
+    sessions: Arc<SessionManager>,
+    socket: Arc<UdpSocket>,
+    pad: PadPolicy,
+    obf: bool,
+    /// Full-tunnel routes (WireGuard-style), held for RAII: removed when this
+    /// Client is dropped (i.e. on disconnect). `None` in split-tunnel mode.
+    _routes: Option<FullTunnelRoutes>,
+}
+
+// Manual Debug: CryptoEngine/SessionManager aren't Debug, but a frontend's
+// Message enum derives Debug over `Arc<Client>`, so Client must be Debug.
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("peer", &self.peer)
+            .field("session_id", &self.session_id)
+            .field("started_epoch", &self.started_epoch)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -153,6 +184,14 @@ impl Client {
         // zet 'm ook, maar die taak start async — anders is er een korte race
         // waarin status() nog "niet verbonden" zou melden.)
         stats.connected.store(true, Ordering::Relaxed);
+        // Live pacer control: seeded with the connect-time profile; `set_traffic`
+        // pushes updates that the outbound loop applies without a reconnect.
+        let (traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        // Clone the shared handles `disconnect` needs to send a graceful Close,
+        // before `engine`/`socket` are moved into the tunnel task.
+        let sessions = engine.sessions().clone();
+        let socket_close = socket.clone();
+        let obf = cfg.obfuscation.enabled;
         let task = tokio::spawn(run_tunnel_loops(
             socket,
             engine,
@@ -162,7 +201,54 @@ impl Client {
             auth,
             hs_obf,
             stats.clone(),
+            traffic_rx,
         ));
+
+        // Full-tunnel routing (WireGuard-style): the tunnel is up now, so install
+        // the routes. Best-effort — a failure leaves a working split-tunnel
+        // rather than refusing the connection.
+        let routes = if cfg.tun.route_all {
+            match cfg
+                .tun
+                .peer_address
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            {
+                Some(gw) => {
+                    // The wintun IP isn't configured for a moment right after
+                    // connect, so the route install fails (no ifindex / gateway
+                    // not on-link yet). Retry with a short delay until the tun is
+                    // ready; give up to split-tunnel rather than block forever.
+                    let mut installed = None;
+                    for attempt in 1..=8u32 {
+                        match FullTunnelRoutes::install(gw, server.ip(), &cfg.tun.name) {
+                            Ok(r) => {
+                                installed = Some(r);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "full-tunnel install attempt {attempt}/8 failed ({e})"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                            }
+                        }
+                    }
+                    if installed.is_none() {
+                        tracing::warn!("full-tunnel routing failed after retries — split-tunnel");
+                    }
+                    installed
+                }
+                None => {
+                    tracing::warn!(
+                        "tun.route_all set but tun.peer_address missing/invalid — split-tunnel"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             stats,
@@ -170,6 +256,12 @@ impl Client {
             peer: server,
             session_id,
             started_epoch: now_secs(),
+            traffic_tx,
+            sessions,
+            socket: socket_close,
+            pad,
+            obf,
+            _routes: routes,
         })
     }
 
@@ -186,9 +278,33 @@ impl Client {
         }
     }
 
-    /// Sluit de tunnel: stop de achtergrond-taak. Neemt `&self` (JoinHandle::abort
-    /// is `&self`), zodat een frontend de client achter een `Arc` kan houden.
+    /// Re-profile the running tunnel's traffic pacer live, without a reconnect.
+    /// Pass the resolved `EffectiveTraffic` for the desired profile; the outbound
+    /// loop applies it on its next tick. No-op once the tunnel has stopped.
+    pub fn set_traffic(&self, traffic: EffectiveTraffic) {
+        // Err only if the tunnel task (the sole receiver) is gone — safe to ignore.
+        let _ = self.traffic_tx.send(traffic);
+    }
+
+    /// Close the tunnel: stop the background task. Takes `&self` (JoinHandle::abort
+    /// is `&self`) so a frontend can keep the client behind an `Arc`.
     pub fn disconnect(&self) {
+        // Best-effort authenticated Close so the server tears the session down
+        // immediately (instead of waiting out its dead-peer timeout) → fast
+        // reconnect. Only meaningful with obfuscation on; a cleartext Close is
+        // ignored by the peer (unauthenticated). Fire-and-forget: we abort next.
+        if self.obf {
+            if let Ok(wire) = self
+                .sessions
+                .seal_obf(FrameType::Close as u8, b"", self.pad)
+            {
+                let socket = self.socket.clone();
+                let peer = self.peer;
+                tokio::spawn(async move {
+                    let _ = socket.send_to(&wire, peer).await;
+                });
+            }
+        }
         self.task.abort();
         self.stats.connected.store(false, Ordering::Relaxed);
     }

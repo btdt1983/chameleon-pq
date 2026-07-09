@@ -149,6 +149,16 @@ pub struct TunConfig {
     pub netmask: String,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Full-tunnel routing (client): on connect, route ALL traffic through the
+    /// tunnel (WireGuard `AllowedIPs = 0.0.0.0/0`) and pin the server endpoint to
+    /// the physical gateway so tunnel packets don't loop; undo it all on
+    /// disconnect. Requires `peer_address`. Default off (split-tunnel).
+    #[serde(default)]
+    pub route_all: bool,
+    /// The peer's TUN address (the server side, e.g. `10.99.0.1`) — the gateway
+    /// the client routes through when `route_all` is set.
+    #[serde(default)]
+    pub peer_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

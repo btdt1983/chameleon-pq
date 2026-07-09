@@ -29,6 +29,9 @@ pub enum ChameleonError {
 
     #[error("Rekey required: nonce counter exhausted")]
     RekeyRequired,
+
+    #[error("Route error: {0}")]
+    Route(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChameleonError>;

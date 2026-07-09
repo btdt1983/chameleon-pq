@@ -300,7 +300,19 @@ impl App {
                 if let Some(cfg) = &mut self.config {
                     cfg.traffic.profile = p;
                 }
-                self.log(format!("Profiel: {p}"));
+                // Apply live when connected; otherwise it takes effect at Connect.
+                if let Some(client) = &self.client {
+                    let mut tc = self
+                        .config
+                        .as_ref()
+                        .map(|c| c.traffic.clone())
+                        .unwrap_or_default();
+                    tc.profile = p;
+                    client.set_traffic(tc.effective());
+                    self.log(format!("Profiel live gewijzigd → {p}"));
+                } else {
+                    self.log(format!("Profiel: {p}"));
+                }
             }
             Message::LoadConfig => match AppConfig::load(std::path::Path::new(&self.config_path)) {
                 Ok(cfg) => {
