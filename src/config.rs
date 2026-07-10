@@ -170,6 +170,16 @@ pub struct EngineConfig {
     /// voor de reactor/TUN. Alleen van invloed op het snelle (unpaced) pad.
     #[serde(default)]
     pub workers: usize,
+    /// UDP-GSO op verzenden (meerdere datagrammen in één syscall). Standaard UIT:
+    /// het bundelt reeds-verzegelde datagrammen tot één grote gesegmenteerde send,
+    /// wat op sommige paden (bv. een Hyper-V vSwitch of NIC-offload die Linux-GSO
+    /// niet doorlaat) tot MASSAAL pakketverlies leidt — gemeten: een download die
+    /// instortte van 300 naar 47 Mbit met 8000 retransmits. Per-pakket verzenden
+    /// (uit) is overal correct; de doorvoerwinst van GSO is bovendien alleen echt
+    /// als het per-pakket-syscall-pad de bottleneck is, niet de crypto/CPU. Zet
+    /// alleen `true` op een bewezen-schoon Linux↔Linux-pad.
+    #[serde(default)]
+    pub gso: bool,
 }
 
 impl Default for EngineConfig {
@@ -177,6 +187,7 @@ impl Default for EngineConfig {
         Self {
             batch_linger_us: default_linger(),
             workers: 0,
+            gso: false,
         }
     }
 }

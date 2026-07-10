@@ -28,71 +28,10 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const TUN_READ_BUF: usize = 65_536;
 const CHANNEL_DEPTH: usize = 512;
-
-/// PERF-diagnostiek: telt pakketten/bytes/werktijd over een venster van 2s en
-/// logt dan één regel (pkt/s, Mbit/s, µs/op en optioneel busy%). Logt alleen als
-/// er in het venster verkeer was, dus geen spam bij idle. Puur voor het
-/// door­voer-onderzoek; wordt na de diagnose weer verwijderd.
-pub(crate) struct PerfWindow {
-    start: std::time::Instant,
-    pkts: u64,
-    bytes: u64,
-    busy: std::time::Duration,
-}
-
-impl PerfWindow {
-    pub(crate) fn new() -> Self {
-        Self {
-            start: std::time::Instant::now(),
-            pkts: 0,
-            bytes: 0,
-            busy: std::time::Duration::ZERO,
-        }
-    }
-
-    /// Registreer één verwerkt pakket (`work` = tijd in de eigenlijke operatie;
-    /// geef `Duration::ZERO` als busy% niet zinvol is, bv. bij een blocking recv).
-    pub(crate) fn record(&mut self, bytes: usize, work: std::time::Duration) {
-        self.pkts += 1;
-        self.bytes += bytes as u64;
-        self.busy += work;
-    }
-
-    /// Als `record`, maar voor een hele batch in één keer (bv. één parallelle
-    /// decrypt- of encrypt-call over `pkts` pakketten die `work` duurde).
-    pub(crate) fn record_batch(&mut self, pkts: u64, bytes: u64, work: std::time::Duration) {
-        self.pkts += pkts;
-        self.bytes += bytes;
-        self.busy += work;
-    }
-
-    /// Log en reset zodra het venster ≥2s is. `show_busy` toont µs/op + busy%.
-    pub(crate) fn maybe_log(&mut self, tag: &str, show_busy: bool) {
-        let el = self.start.elapsed();
-        if el < std::time::Duration::from_secs(2) {
-            return;
-        }
-        let s = el.as_secs_f64();
-        let pps = self.pkts as f64 / s;
-        let mbit = self.bytes as f64 * 8.0 / 1e6 / s;
-        if show_busy && self.pkts > 0 {
-            info!(
-                "PERF {tag}: {:.0} pkt/s, {:.1} Mbit/s, avg {:.1}µs/op, busy {:.0}%",
-                pps,
-                mbit,
-                self.busy.as_micros() as f64 / self.pkts as f64,
-                self.busy.as_secs_f64() / s * 100.0
-            );
-        } else {
-            info!("PERF {tag}: {:.0} pkt/s, {:.1} Mbit/s", pps, mbit);
-        }
-        *self = Self::new();
-    }
-}
 
 /// Het publieke API-oppervlak van de TUN-laag.
 pub struct TunPair {
@@ -152,8 +91,6 @@ impl TunPair {
         // path tijdens verkeer en parkeert alleen bij idle op het OS-read-event.
         let read_task = tokio::spawn(async move {
             let mut buf = vec![0u8; TUN_READ_BUF];
-            // PERF-diag: pakket-/bytetellers, elke 2s gelogd zolang er verkeer is.
-            let mut m = PerfWindow::new();
             loop {
                 match dev_read.recv(&mut buf).await {
                     Ok(0) => {
@@ -161,14 +98,11 @@ impl TunPair {
                         break;
                     }
                     Ok(n) => {
+                        debug!("TUN read {} bytes", n);
                         let pkt = Bytes::copy_from_slice(&buf[..n]);
                         if from_tun_tx.send(pkt).await.is_err() {
                             break;
                         }
-                        // recv().await bevat idle-wachttijd, dus geen busy%; alleen
-                        // doorvoer: is de TUN-read-kant de bottleneck van de UPLOAD?
-                        m.record(n, std::time::Duration::ZERO);
-                        m.maybe_log("tun-read", false);
                     }
                     Err(e) => {
                         error!("TUN read error: {e}");
@@ -180,17 +114,12 @@ impl TunPair {
 
         // Schrijf-taak: engine (decrypt-kant) → TUN.
         let write_task = tokio::spawn(async move {
-            // PERF-diag: send() is puur werk (ring-write / OS-backpressure), dus
-            // busy% is zinvol — ~100% ⇒ de wintun-write is de DOWNLOAD-muur.
-            let mut m = PerfWindow::new();
             while let Some(pkt) = to_tun_rx.recv().await {
-                let t0 = std::time::Instant::now();
+                debug!("TUN write {} bytes", pkt.len());
                 if let Err(e) = device.send(&pkt).await {
                     error!("TUN write error: {e}");
                     break;
                 }
-                m.record(pkt.len(), t0.elapsed());
-                m.maybe_log("tun-write", true);
             }
         });
 

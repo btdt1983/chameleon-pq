@@ -43,6 +43,12 @@ batch_linger_us = 200
 # cores. Alleen van invloed op het SNELLE pad (traffic.enabled = false); met
 # timing-shaping aan capt de rate de doorvoer, dus dan is dit niet de bottleneck.
 workers = 0
+# UDP-GSO: bundel meerdere datagrammen in één send-syscall. Standaard UIT (false).
+# Aan zetten kan de doorvoer verhogen op een schoon Linux↔Linux-pad, MAAR op
+# sommige paden (Hyper-V vSwitch, bepaalde NIC-offload) wordt de gesegmenteerde
+# super-buffer in z'n geheel gedropt → massaal pakketverlies en een instortende
+# download. Laat op false tenzij je pad bewezen schoon is.
+gso = false
 
 [obfuscation]
 # Verkeersanalyse-weerstand op het DATApad (QUIC-stijl header-protection):

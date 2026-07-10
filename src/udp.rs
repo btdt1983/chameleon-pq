@@ -90,15 +90,23 @@ pub async fn batch_send(
     peer: SocketAddr,
     datagrams: &[Bytes],
     seg_size: usize,
+    gso: bool,
 ) -> io::Result<()> {
     if datagrams.is_empty() {
         return Ok(());
     }
-    // EXPERIMENT (quinn-udp 0.6): the old GSO *send* bypass for Windows is removed
-    // to test whether 0.6 fixes the native WSASendMsg access violation that killed
-    // 0.5 on Windows. quinn-udp still falls back to per-datagram sends when the
-    // platform reports max_gso_segments() == 1, so this is safe on any kernel.
-    let max_seg = state.max_gso_segments().max(1);
+    // GSO bundles several already-sealed datagrams into one segmented `sendmsg`.
+    // It's OFF by default (see EngineConfig::gso): on some paths (a Hyper-V vSwitch
+    // / NIC offload that doesn't pass Linux UDP-GSO) the segmented super-buffer is
+    // dropped wholesale — a download measured collapsing 300→47 Mbit with 8000
+    // retransmits. With `gso = false` we send one datagram per syscall, which is
+    // correct everywhere; quinn-udp also falls back to per-datagram when the
+    // platform reports max_gso_segments() == 1.
+    let max_seg = if gso {
+        state.max_gso_segments().max(1)
+    } else {
+        1
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(seg_size * datagrams.len().min(max_seg));
     let mut i = 0;
     while i < datagrams.len() {
