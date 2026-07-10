@@ -161,8 +161,15 @@ fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
         .tun_name(cfg.name.as_str())
         .address(addr)
         .netmask(mask)
-        .mtu(cfg.mtu)
         .up();
+
+    // MTU: set it on Linux/macOS, but NOT on Windows. wintun keeps its own
+    // default (1500) and tun 0.6 — the last version that worked on our Windows
+    // client — never pushed the MTU onto the interface either. The 0.8 WinAPI
+    // MTU path is an extra failure surface for no gain (the tunnel already ran
+    // fine with the wintun default), so we leave it alone there.
+    #[cfg(not(windows))]
+    tun_cfg.mtu(cfg.mtu);
 
     let device = tun::create_as_async(&tun_cfg).map_err(|e| ChameleonError::Handshake {
         state: "tun".into(),

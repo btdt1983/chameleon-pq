@@ -39,7 +39,13 @@ bytes             = "1"
 quinn-udp         = "0.6"
 
 # TUN interface (cross-platform; Windows needs wintun.dll alongside binary)
-tun               = { version = "0.8", features = ["async"] }
+# Pinned to =0.8.6 on purpose: it has the async-read fix (wintun AsyncSession,
+# no thread-per-read) but still configures the interface address via netsh
+# (`set_network_addresses_tuple`), exactly like the last-working 0.6. 0.8.8+
+# replaced that with a hand-rolled `CreateUnicastIpAddressEntry` WinAPI call that
+# fails on our Windows client with "invalid parameter" (os error 87). A plain
+# "0.8.6" would mean ^0.8.6 and resolve back up to the broken 0.8.13 — keep the `=`.
+tun               = { version = "=0.8.6", features = ["async"] }
 
 # Config
 serde             = { version = "1", features = ["derive"] }
