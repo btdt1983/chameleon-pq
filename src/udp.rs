@@ -24,8 +24,10 @@ use std::net::SocketAddr;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-/// Aantal berichten dat we per ontvangst-batch aanvragen.
-pub const RECV_BATCH: usize = 8;
+/// Aantal berichten dat we per ontvangst-batch aanvragen. Ruimer = elke
+/// recv-syscall trekt meer datagrammen uit de kernel-recv-buffer, wat helpt de
+/// buffer leeg te houden onder bursty download (minder overflow-drops).
+pub const RECV_BATCH: usize = 32;
 /// Grootte van elke ontvangst-buffer. Groot genoeg voor een flinke GRO-coalesced
 /// reeks MTU-datagrammen; te klein duwt GRO alleen naar minder coalescing (nooit
 /// dataverlies — quinn-udp legt geen half datagram in een buffer).
@@ -35,6 +37,37 @@ pub const RECV_BUF: usize = 64 * 1024;
 /// niet-ondersteunde kernel rapporteert `max_gso_segments()` gewoon 1.
 pub fn socket_state(socket: &UdpSocket) -> io::Result<UdpSocketState> {
     UdpSocketState::new(UdpSockRef::from(socket))
+}
+
+/// Gevraagde kernel-socketbuffer (SO_RCVBUF/SO_SNDBUF). De OS-default is te klein
+/// voor bursty hoge doorvoer: op Windows ~64 KB, in ~2 ms vol bij 220 Mbit. Eén
+/// korte hapering in het (trage) client-ontvangstpad → recv-buffer loopt over →
+/// kernel dropt datagrammen → TCP-retransmits → de download stort in (gemeten:
+/// 8123 retransmits, 47 Mbit). Een ruime buffer absorbeert de bursts zodat TCP
+/// op de echte doorvoer settelt i.p.v. te collapsen.
+const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Vergroot SO_RCVBUF/SO_SNDBUF op de UDP-socket (best-effort; het OS clampt naar
+/// zijn maximum — Windows honoreert grote waarden, Linux kapt op net.core.rmem_max
+/// tenzij verhoogd). Faalt niet-fataal; logt wat we daadwerkelijk kregen.
+pub fn enlarge_socket_buffers(socket: &UdpSocket) {
+    let sref = socket2::SockRef::from(socket);
+    if let Err(e) = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!("set_recv_buffer_size failed: {e}");
+    }
+    if let Err(e) = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!("set_send_buffer_size failed: {e}");
+    }
+    match (sref.recv_buffer_size(), sref.send_buffer_size()) {
+        (Ok(r), Ok(s)) => {
+            tracing::info!(
+                "UDP socket buffers: recv {} KiB, send {} KiB",
+                r / 1024,
+                s / 1024
+            )
+        }
+        _ => tracing::debug!("could not read back socket buffer sizes"),
+    }
 }
 
 /// Maak de ontvangst-buffers + metadata voor `batch_recv` (houdt `quinn_udp`

@@ -37,6 +37,10 @@ tokio             = { version = "1", features = ["full"] }
 bytes             = "1"
 # Batched UDP I/O (GSO/GRO on Linux, cross-platform + per-packet fallback).
 quinn-udp         = "0.6"
+# Raw sockopts (SO_RCVBUF/SO_SNDBUF) on the UDP socket — the OS default recv
+# buffer (~64 KB on Windows) overflows on bursty downloads → drops. Already in
+# the tree via quinn-udp; pin the same 0.6 line so no second copy is pulled.
+socket2           = "0.6"
 
 # TUN interface (cross-platform; Windows needs wintun.dll alongside binary)
 # Pinned to =0.8.6 on purpose: it has the async-read fix (wintun AsyncSession,

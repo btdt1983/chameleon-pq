@@ -167,6 +167,9 @@ impl Client {
         tun: TunPair,
     ) -> Result<Self> {
         let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+        // Ruime recv/send-buffers: de OS-default overflowt op bursty downloads
+        // (zie enlarge_socket_buffers) — dé oorzaak van de download-drops.
+        crate::udp::enlarge_socket_buffers(&socket);
         let hs_obf = hs_obf_key(cfg)?;
         let session =
             run_handshake_initiator(&socket, server, auth.as_ref(), hs_obf.as_ref()).await?;
