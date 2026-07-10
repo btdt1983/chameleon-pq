@@ -39,7 +39,7 @@ bytes             = "1"
 quinn-udp         = "0.6"
 
 # TUN interface (cross-platform; Windows needs wintun.dll alongside binary)
-tun               = { version = "0.6", features = ["async"] }
+tun               = { version = "0.8", features = ["async"] }
 
 # Config
 serde             = { version = "1", features = ["derive"] }
