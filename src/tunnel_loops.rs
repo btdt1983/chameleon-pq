@@ -199,6 +199,8 @@ pub async fn run_tunnel_loops(
     tasks.spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
+        // PERF-diag (upload-pad): encrypt-doorvoer/busy over de flush-batches.
+        let mut m_enc = crate::tun_iface::PerfWindow::new();
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
         let mut tick = interval(if paced { pace_slot } else { linger });
         let mut pacer = Pacer::new(pace_mode, pace_cooldown);
@@ -225,7 +227,7 @@ pub async fn run_tunnel_loops(
                             } else {
                                 pending.push(OutboundPacket { plaintext: pkt });
                                 if pending.len() >= MAX_BATCH {
-                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
+                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, &mut m_enc).await;
                                 }
                             }
                         }
@@ -265,7 +267,7 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else if !pending.is_empty() {
-                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
+                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, &mut m_enc).await;
                     }
 
                     // Rekey-trigger (gedeeld): drempel bereikt EN geen lopende rekey.
@@ -339,6 +341,9 @@ pub async fn run_tunnel_loops(
         let mut pending_rekey: Option<(Handshake, u32)> = None;
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
+        // PERF-diag (download-pad): decrypt-doorvoer/busy + tun-send-doorvoer/busy.
+        let mut m_dec = crate::tun_iface::PerfWindow::new();
+        let mut m_snd = crate::tun_iface::PerfWindow::new();
 
         'inbound: loop {
             tokio::select! {
@@ -364,6 +369,9 @@ pub async fn run_tunnel_loops(
                     // volume; bij een kleine batch sequentieel (vermijd overhead).
                     // Alleen de datapad-decrypt is parallel; de (zeldzame)
                     // handshake/rekey-demux blijft serieel op deze coördinator.
+                    let n_dg = datagrams.len() as u64;
+                    let b_dg: u64 = datagrams.iter().map(|(_, d)| d.len() as u64).sum();
+                    let t_dec = std::time::Instant::now();
                     let results: Vec<DecryptResult> = if datagrams.len()
                         >= PAR_THRESHOLD
                     {
@@ -386,6 +394,9 @@ pub async fn run_tunnel_loops(
                             })
                             .collect()
                     };
+                    // PERF: decrypt-tijd voor deze batch (busy% ~100% ⇒ crypto-muur).
+                    m_dec.record_batch(n_dg, b_dg, t_dec.elapsed());
+                    m_dec.maybe_log("decrypt", true);
 
                     for (src, datagram, result) in results {
                         // 1) Datapad (parallel ontsleuteld): direct afhandelen.
@@ -395,9 +406,13 @@ pub async fn run_tunnel_loops(
                             stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
                             match ft {
                                 FrameType::Data => {
-                                    debug!("inbound {} bytes -> TUN", plain.len());
-                                    stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
+                                    let plen = plain.len();
+                                    stats_in.rx_bytes.fetch_add(plen as u64, Ordering::Relaxed);
+                                    // PERF: tijd om het pakket in het naar-TUN-kanaal te
+                                    // krijgen — hoog busy% ⇒ backpressure van de tun-write.
+                                    let t_snd = std::time::Instant::now();
                                     if to_tun.send(plain).await.is_err() { break 'inbound; }
+                                    m_snd.record(plen, t_snd.elapsed());
                                 }
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
                                 FrameType::Close => { info!("peer closed session"); break 'inbound; }
@@ -516,6 +531,7 @@ pub async fn run_tunnel_loops(
                             FrameType::Padding => {}
                         }
                     }
+                    m_snd.maybe_log("tun-send", true);
                 }
             }
         }
@@ -604,11 +620,14 @@ async fn flush_outbound(
     state: &quinn_udp::UdpSocketState,
     pending: &mut Vec<OutboundPacket>,
     peer: SocketAddr,
+    m: &mut crate::tun_iface::PerfWindow,
 ) {
     let batch = std::mem::take(pending);
     let count = batch.len();
+    let b_batch: u64 = batch.iter().map(|p| p.plaintext.len() as u64).sum();
     // Kleine batch: sequentieel (vermijd de spawn_blocking+rayon-overhead).
     // Grote batch: verzegel PARALLEL over alle cores via één spawn_blocking-hop.
+    let t_enc = std::time::Instant::now();
     let sealed = if count < PAR_THRESHOLD {
         engine.encrypt_batch(batch)
     } else {
@@ -621,6 +640,9 @@ async fn flush_outbound(
             }
         }
     };
+    // PERF (upload-pad): encrypt-tijd voor deze batch (busy% ~100% ⇒ crypto-muur).
+    m.record_batch(count as u64, b_batch, t_enc.elapsed());
+    m.maybe_log("encrypt", true);
     match sealed {
         Ok(wires) => {
             // Verstuur gelijk-grote runs in zo min mogelijk syscalls (GSO waar
