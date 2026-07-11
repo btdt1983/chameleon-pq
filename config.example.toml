@@ -83,13 +83,14 @@ handshake = true
 #
 #   "stealth"    — CBR, 256×2 ≈ 5 Mbit/s. Max anti-analyse; constante bandbreedte
 #                  24/7 (≈ 1,6 TB/maand/richting). Voor licht, onopvallend verkeer.
-#   "balanced"   — STANDAARD. Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen
-#                  tijdens gebruik, STIL in rust. Goede algemene VPN-ervaring.
+#   "balanced"   — Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen tijdens
+#                  gebruik, STIL in rust. Goede algemene VPN-ervaring.
 #   "throughput" — Adaptive, 6000×8 ≈ 460 Mbit/s. Max snelheid mét pacing.
-#   "off"        — Pacer UIT: native timing/snelheid, GEEN timing-verhulling.
-#                  WireGuard-vergelijkbaar (packet-vorm-padding blijft wél aan).
+#   "off"        — STANDAARD. Pacer UIT: native timing/snelheid, GEEN timing-
+#                  verhulling. WireGuard-vergelijkbaar (packet-vorm-padding blijft
+#                  wél aan). Kies "balanced"/"stealth" voor timing-resistentie.
 #   "custom"     — gebruik de losse mode/rate_pps/burst-velden hieronder.
-profile = "balanced"
+profile = "off"
 
 # De onderstaande velden gelden ALLEEN bij profile = "custom".
 enabled  = true
