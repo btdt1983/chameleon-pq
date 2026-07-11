@@ -67,29 +67,29 @@ pub fn security_warnings(cfg: &AppConfig) -> Vec<String> {
     let mut w = Vec::new();
     if !cfg.identity.has_mldsa() {
         w.push(
-            "Geen ML-DSA-sleutels: peer-auth is Ed25519-only (KLASSIEK, niet \
-             post-quantum). Zet mldsa_* aan BEIDE kanten voor hybride PQ-auth."
+            "No ML-DSA keys: peer auth is Ed25519-only (CLASSICAL, not \
+             post-quantum). Set mldsa_* on BOTH sides for hybrid PQ auth."
                 .into(),
         );
     }
     if !cfg.obfuscation.enabled {
         w.push(
-            "obfuscation.enabled = false: het datapad is ONGEOBFUSCEERD en \
-             control-frames zijn ongeauthenticeerd — alleen voor debug op een \
-             vertrouwd netwerk."
+            "obfuscation.enabled = false: the data path is UNOBFUSCATED and \
+             control frames are unauthenticated — for debugging on a trusted \
+             network only."
                 .into(),
         );
     } else if !cfg.obfuscation.handshake {
         w.push(
-            "obfuscation.handshake = false: de handshake-envelope is niet verhuld \
-             (een DPI-tegenstander kan 'm herkennen)."
+            "obfuscation.handshake = false: the handshake envelope is not disguised \
+             (a DPI adversary can recognise it)."
                 .into(),
         );
     } else if cfg.obfuscation.psk_hex.is_none() {
         w.push(
-            "obfuscation.psk_hex niet gezet: de handshake-obf-sleutel is \
-             pubkey-afgeleid (zwakker; geen DoS-gating tegen wie de pubkeys kent). \
-             Zet psk_hex aan BEIDE kanten."
+            "obfuscation.psk_hex not set: the handshake-obfuscation key is \
+             pubkey-derived (weaker; no DoS gating against anyone who knows the \
+             pubkeys). Set psk_hex on BOTH sides."
                 .into(),
         );
     }
@@ -98,8 +98,8 @@ pub fn security_warnings(cfg: &AppConfig) -> Vec<String> {
     // field must not trigger this when a paced profile is selected.
     if !cfg.traffic.effective().enabled {
         w.push(
-            "traffic-profiel \"off\": geen timing-/cover-verkeer, dus burst- en \
-             idle-patronen blijven zichtbaar (bewuste snelheid-vs-verhulling-keuze)."
+            "traffic profile \"off\": no timing/cover traffic, so burst and idle \
+             patterns stay visible (a deliberate speed-vs-concealment choice)."
                 .into(),
         );
     }

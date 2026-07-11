@@ -1,10 +1,10 @@
-//! Chameleon-PQ desktop-GUI (iced, pure Rust). Bedraad aan de client-core
-//! (`chameleon::client::Client`): config laden → secure-by-default waarschuwingen
-//! → verbinden (async) → live status (↑tx/↓rx, uptime, laatste ontvangst).
+//! Chameleon-PQ desktop GUI (iced, pure Rust). Wired to the client core
+//! (`chameleon::client::Client`): load config → secure-by-default warnings →
+//! connect (async) → live status (↑tx/↓rx, uptime, last receive).
 //!
-//! Bouwen (los van de core-crate): `cargo build --manifest-path gui/Cargo.toml`.
-//! LET OP: een echte tunnel vereist rechten voor de TUN-adapter (Linux:
-//! CAP_NET_ADMIN/sudo; Windows: admin + wintun.dll naast de binary).
+//! Build (standalone from the core crate): `cargo build --manifest-path gui/Cargo.toml`.
+//! NOTE: a real tunnel needs privileges for the TUN adapter (Linux:
+//! CAP_NET_ADMIN/sudo; Windows: admin + wintun.dll next to the binary).
 
 use chameleon::client::{build_auth, security_warnings, Client, Status};
 use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
@@ -18,17 +18,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn main() -> iced::Result {
-    // Diagnostiek eerst: een Windows-GUI heeft geen console, dus zonder dit
-    // verdwijnt élke fout/panic met het venster. We loggen naar een bestand
-    // NAAST de binary (en, indien aanwezig, ook naar stderr).
+    // Diagnostics first: a Windows GUI has no console, so without this every
+    // error/panic vanishes with the window. We log to a file NEXT to the binary
+    // (and, if present, also to stderr).
     init_diagnostics();
     iced::application("Chameleon-PQ", App::update, App::view)
         .subscription(App::subscription)
         .run_with(App::new)
 }
 
-/// Pad van het diagnostiek-logbestand: naast de executable (op Windows waar de
-/// gebruiker de .exe start), met terugval op de huidige map.
+/// Path of the diagnostics log file: next to the executable (on Windows where the
+/// user launches the .exe), falling back to the current directory.
 fn log_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -36,7 +36,7 @@ fn log_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("chameleon-gui.log"))
 }
 
-/// Een `Write`/`MakeWriter` die naar het gedeelde logbestand schrijft.
+/// A `Write`/`MakeWriter` that writes to the shared log file.
 #[derive(Clone)]
 struct FileSink(Arc<Mutex<std::fs::File>>);
 
@@ -44,7 +44,7 @@ impl Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.0.lock() {
             Ok(mut f) => f.write(buf),
-            Err(_) => Ok(buf.len()), // nooit paniceren vanuit de logger
+            Err(_) => Ok(buf.len()), // never panic from the logger
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -55,20 +55,20 @@ impl Write for FileSink {
     }
 }
 
-/// Zet tracing naar een logbestand op én installeer een panic-hook die de panic
-/// (met locatie) naar datzelfde bestand schrijft. Zo legt de VOLGENDE reproductie
-/// vast wát er misgaat — ook op een Windows-GUI zonder console, waar nu niets
-/// zichtbaar is. De core-crate (client + tunnel-loops) logt via `tracing`, dus
-/// zodra dit staat zie je handshake-, TUN- en socket-fouten in het bestand.
+/// Set up tracing to a log file AND install a panic hook that writes the panic
+/// (with location) to that same file. This way the NEXT reproduction records what
+/// went wrong — even on a Windows GUI without a console, where nothing is visible
+/// right now. The core crate (client + tunnel loops) logs via `tracing`, so once
+/// this is set you see handshake, TUN and socket errors in the file.
 fn init_diagnostics() {
     use tracing_subscriber::EnvFilter;
 
     let path = log_path();
-    // Windows: vang NATIVE exceptions (access violation / stack overflow) die de
-    // Rust-panic-hook NIET ziet — precies waarom het venster tot nu toe spoorloos
-    // verdween en het log midden in een regel stopte. De handler schrijft de
-    // exception-code, het fault-adres én de MODULE (wintun.dll? de .exe zelf?)
-    // naar het logbestand, zodat de volgende crash zichzelf benoemt.
+    // Windows: catch NATIVE exceptions (access violation / stack overflow) that the
+    // Rust panic hook does NOT see — exactly why the window used to vanish without
+    // a trace and the log stopped mid-line. The handler writes the exception code,
+    // the fault address AND the MODULE (wintun.dll? the .exe itself?) to the log
+    // file, so the next crash names itself.
     #[cfg(windows)]
     win_crash::install(path.clone());
     let Ok(file) = std::fs::OpenOptions::new()
@@ -76,11 +76,11 @@ fn init_diagnostics() {
         .append(true)
         .open(&path)
     else {
-        return; // geen logbestand mogelijk -> laat de GUI gewoon draaien
+        return; // no log file possible -> just let the GUI run
     };
     let sink = FileSink(Arc::new(Mutex::new(file)));
 
-    // Standaard: info + debug voor onze eigen crate. Te overrulen via RUST_LOG.
+    // Default: info + debug for our own crate. Overridable via RUST_LOG.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,chameleon=debug"));
     let writer_sink = sink.clone();
@@ -90,21 +90,21 @@ fn init_diagnostics() {
         .with_writer(move || writer_sink.clone())
         .try_init();
 
-    // Panic-hook: schrijf de panic (die anders met het venster verdwijnt) naar
-    // het logbestand én stderr, en roep daarna de standaard-hook aan.
+    // Panic hook: write the panic (which would otherwise vanish with the window)
+    // to the log file AND stderr, then call the default hook.
     let default_hook = std::panic::take_hook();
     let panic_sink = sink;
     std::panic::set_hook(Box::new(move |info| {
         let loc = info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
-            .unwrap_or_else(|| "onbekend".into());
-        // Backtrace meepakken — `force_capture()` negeert RUST_BACKTRACE (dat
-        // op een dubbelgeklikte Windows-GUI nooit gezet is), zodat we ALTIJD de
-        // exacte crash-plek zien, ook diep in tun/wintun of quinn-udp.
+            .unwrap_or_else(|| "unknown".into());
+        // Capture a backtrace — `force_capture()` ignores RUST_BACKTRACE (which is
+        // never set on a double-clicked Windows GUI), so we ALWAYS see the exact
+        // crash site, even deep inside tun/wintun or quinn-udp.
         let bt = std::backtrace::Backtrace::force_capture();
         let line = format!("\n=== GUI PANIC @ {loc} ===\n{info}\nbacktrace:\n{bt}\n");
-        // best-effort: nooit zelf paniceren in de hook
+        // best effort: never panic inside the hook
         let mut s = panic_sink.clone();
         let _ = s.write_all(line.as_bytes());
         let _ = s.flush();
@@ -112,16 +112,16 @@ fn init_diagnostics() {
         default_hook(info);
     }));
 
-    tracing::info!("Chameleon-PQ GUI gestart — log: {}", path.display());
+    tracing::info!("Chameleon-PQ GUI started — log: {}", path.display());
 }
 
-/// Windows-only: een top-level exception-filter die native crashes (die de
-/// Rust-panic-hook niet vangt — access violation 0xC0000005, stack overflow
-/// 0xC00000FD, enz.) vastlegt. Zonder dit stopt het log gewoon en verdwijnt het
-/// venster; mét dit weten we de exception-code, het fault-adres én in wélke
-/// module (bv. `wintun.dll` of de `.exe` zelf, waar quinn-udp in mee-compileert)
-/// het misging. Puur diagnostisch: we loggen en laten het proces daarna gewoon
-/// crashen (EXCEPTION_CONTINUE_SEARCH).
+/// Windows-only: a top-level exception filter that records native crashes (that
+/// the Rust panic hook doesn't catch — access violation 0xC0000005, stack overflow
+/// 0xC00000FD, etc.). Without this the log just stops and the window vanishes;
+/// with it we know the exception code, the fault address AND which module (e.g.
+/// `wintun.dll` or the `.exe` itself, into which quinn-udp is compiled) it went
+/// wrong in. Purely diagnostic: we log and then let the process crash as usual
+/// (EXCEPTION_CONTINUE_SEARCH).
 #[cfg(windows)]
 mod win_crash {
     use std::io::Write;
@@ -131,7 +131,7 @@ mod win_crash {
 
     static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-    #[allow(dead_code)] // FFI-layout: niet elk veld wordt gelezen
+    #[allow(dead_code)] // FFI layout: not every field is read
     #[repr(C)]
     struct ExceptionRecord {
         code: u32,
@@ -141,7 +141,7 @@ mod win_crash {
         number_parameters: u32,
         information: [usize; 15],
     }
-    #[allow(dead_code)] // context_record wordt niet gelezen
+    #[allow(dead_code)] // context_record is not read
     #[repr(C)]
     struct ExceptionPointers {
         exception_record: *mut ExceptionRecord,
@@ -169,12 +169,15 @@ mod win_crash {
             (0u32, core::ptr::null_mut())
         };
 
-        // In wélke geladen module valt het fault-adres? Dat benoemt de dader.
+        // Which loaded module does the fault address fall in? That names the culprit.
         let mut module: Hmodule = core::ptr::null_mut();
-        let mut name = String::from("(onbekend)");
+        let mut name = String::from("(unknown)");
         if !addr.is_null()
-            && GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, addr as *const u16, &mut module)
-                != 0
+            && GetModuleHandleExW(
+                FROM_ADDRESS | UNCHANGED_REFCOUNT,
+                addr as *const u16,
+                &mut module,
+            ) != 0
         {
             let mut buf = [0u16; 260];
             let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
@@ -186,7 +189,11 @@ mod win_crash {
         }
 
         if let Some(path) = LOG_PATH.get() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 let _ = writeln!(
                     f,
                     "\n=== NATIVE EXCEPTION code=0x{code:08X} addr={addr:p} module={name} ==="
@@ -194,10 +201,10 @@ mod win_crash {
                 let _ = f.flush();
             }
         }
-        0 // EXCEPTION_CONTINUE_SEARCH: log gezet, laat het proces normaal crashen
+        0 // EXCEPTION_CONTINUE_SEARCH: log written, let the process crash normally
     }
 
-    /// Onthoud het logpad en installeer de filter. Idempotent.
+    /// Remember the log path and install the filter. Idempotent.
     pub fn install(log_path: PathBuf) {
         let _ = LOG_PATH.set(log_path);
         unsafe {
@@ -210,7 +217,7 @@ struct App {
     config_path: String,
     config: Option<AppConfig>,
     server: String,
-    /// Geselecteerd verkeersprofiel; wint bij Connect van wat in de config staat.
+    /// Selected traffic profile; wins over the config at Connect.
     profile: TrafficProfile,
     client: Option<Arc<Client>>,
     status: Option<Status>,
@@ -223,11 +230,11 @@ struct App {
 enum Message {
     ConfigPathChanged(String),
     ServerChanged(String),
-    /// Open de native bestandsdialoog om een config te kiezen.
+    /// Open the native file dialog to pick a config.
     BrowseConfig,
-    /// Resultaat van de dialoog (None = geannuleerd).
+    /// Result of the dialog (None = cancelled).
     ConfigPicked(Option<String>),
-    /// Profiel gekozen in de dropdown.
+    /// Profile chosen in the dropdown.
     ProfileChanged(TrafficProfile),
     LoadConfig,
     Connect,
@@ -247,7 +254,7 @@ impl App {
                 client: None,
                 status: None,
                 warnings: Vec::new(),
-                log: vec!["Laad een config en verbind.".into()],
+                log: vec!["Load a config and connect.".into()],
                 connecting: false,
             },
             Task::none(),
@@ -262,7 +269,7 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        // Ververs de status elke seconde zolang er een client is.
+        // Refresh the status every second while there is a client.
         if self.client.is_some() {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
         } else {
@@ -275,12 +282,12 @@ impl App {
             Message::ConfigPathChanged(v) => self.config_path = v,
             Message::ServerChanged(v) => self.server = v,
             Message::BrowseConfig => {
-                // Native dialoog async openen; resultaat komt terug als ConfigPicked.
+                // Open the native dialog async; the result comes back as ConfigPicked.
                 return Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
-                            .add_filter("TOML-config", &["toml"])
-                            .set_title("Kies een Chameleon-config")
+                            .add_filter("TOML config", &["toml"])
+                            .set_title("Choose a Chameleon config")
                             .pick_file()
                             .await
                             .map(|h| h.path().to_string_lossy().into_owned())
@@ -291,7 +298,7 @@ impl App {
             Message::ConfigPicked(picked) => {
                 if let Some(path) = picked {
                     self.config_path = path;
-                    // Meteen laden — de gebruiker koos immers expliciet een bestand.
+                    // Load right away — the user explicitly picked a file.
                     return self.update(Message::LoadConfig);
                 }
             }
@@ -309,9 +316,9 @@ impl App {
                         .unwrap_or_default();
                     tc.profile = p;
                     client.set_traffic(tc.effective());
-                    self.log(format!("Profiel live gewijzigd → {p}"));
+                    self.log(format!("Profile changed live → {p}"));
                 } else {
-                    self.log(format!("Profiel: {p}"));
+                    self.log(format!("Profile: {p}"));
                 }
             }
             Message::LoadConfig => match AppConfig::load(std::path::Path::new(&self.config_path)) {
@@ -322,53 +329,53 @@ impl App {
                             self.server = s.to_string();
                         }
                     }
-                    // Toon het profiel uit de config in de dropdown.
+                    // Show the config's profile in the dropdown.
                     self.profile = cfg.traffic.profile;
                     self.log(format!(
-                        "Config geladen: {} (profiel: {})",
+                        "Config loaded: {} (profile: {})",
                         self.config_path, cfg.traffic.profile
                     ));
                     self.config = Some(cfg);
                 }
-                Err(e) => self.log(format!("Config-fout: {e}")),
+                Err(e) => self.log(format!("Config error: {e}")),
             },
             Message::Connect => {
                 let cfg = match &self.config {
                     Some(c) => {
-                        // Het in de dropdown gekozen profiel wint van de config.
+                        // The profile chosen in the dropdown wins over the config.
                         let mut c = c.clone();
                         c.traffic.profile = self.profile;
                         c
                     }
                     None => {
-                        self.log("Laad eerst een config.");
+                        self.log("Load a config first.");
                         return Task::none();
                     }
                 };
                 let server: Option<SocketAddr> =
                     self.server.parse().ok().or(cfg.network.server_addr);
                 let Some(server) = server else {
-                    self.log("Geen geldig server-adres (host:poort).");
+                    self.log("No valid server address (host:port).");
                     return Task::none();
                 };
                 self.connecting = true;
-                self.log(format!("Verbinden met {server} …"));
+                self.log(format!("Connecting to {server} …"));
                 return Task::perform(
                     async move {
-                        // Stap-voor-stap loggen: als het proces hard sterft (een
-                        // native access-violation in wintun/quinn-udp vuurt de
-                        // Rust-panic-hook NIET), wijst de laatste regel in het log
-                        // exact aan wélke stap de crash veroorzaakte.
-                        tracing::info!("connect: stap 1/3 build_auth");
+                        // Log step by step: if the process dies hard (a native
+                        // access violation in wintun/quinn-udp does NOT fire the
+                        // Rust panic hook), the last line in the log points to
+                        // exactly which step caused the crash.
+                        tracing::info!("connect: step 1/3 build_auth");
                         let auth = build_auth(&cfg).map_err(|e| e.to_string())?;
-                        tracing::info!("connect: stap 2/3 TunPair::create (Windows: admin + wintun.dll naast .exe)");
+                        tracing::info!("connect: step 2/3 TunPair::create (Windows: admin + wintun.dll next to .exe)");
                         let tun = TunPair::create(&cfg.tun).map_err(|e| e.to_string())?;
-                        tracing::info!("connect: stap 3/3 Client::connect → {server}");
+                        tracing::info!("connect: step 3/3 Client::connect → {server}");
                         let res = Client::connect(&cfg, server, auth, tun)
                             .await
                             .map(Arc::new)
                             .map_err(|e| e.to_string());
-                        tracing::info!("connect: klaar (ok={})", res.is_ok());
+                        tracing::info!("connect: done (ok={})", res.is_ok());
                         res
                     },
                     Message::Connected,
@@ -378,11 +385,14 @@ impl App {
                 self.connecting = false;
                 match res {
                     Ok(client) => {
-                        self.log(format!("Verbonden — sessie {}", client.status().session_id));
+                        self.log(format!(
+                            "Connected — session {}",
+                            client.status().session_id
+                        ));
                         self.status = Some(client.status());
                         self.client = Some(client);
                     }
-                    Err(e) => self.log(format!("Verbinden mislukt: {e}")),
+                    Err(e) => self.log(format!("Connection failed: {e}")),
                 }
             }
             Message::Disconnect => {
@@ -391,20 +401,20 @@ impl App {
                 }
                 self.client = None;
                 self.status = None;
-                self.log("Verbinding verbroken.");
+                self.log("Disconnected.");
             }
             Message::Tick => {
                 if let Some(c) = &self.client {
                     let st = c.status();
-                    // De tunnel-loops draaien op de achtergrond; als ze sterven
-                    // (TUN-/socket-fout, dode peer, peer-close) valt `connected`
-                    // terug op false. Maak dat zichtbaar i.p.v. stil te bevriezen —
-                    // de reden staat in het logbestand (zie init_diagnostics).
+                    // The tunnel loops run in the background; if they die (TUN/socket
+                    // error, dead peer, peer close) `connected` flips to false. Make
+                    // that visible instead of silently freezing — the reason is in
+                    // the log file (see init_diagnostics).
                     if !st.connected {
-                        tracing::warn!("tunnel-loops gestopt — zie logbestand voor de reden");
+                        tracing::warn!("tunnel loops stopped — see the log file for the reason");
                         self.log(
-                            "Tunnel gesloten (achtergrond-loops gestopt). \
-                             Details staan in chameleon-gui.log naast de binary.",
+                            "Tunnel closed (background loops stopped). \
+                             Details are in chameleon-gui.log next to the binary.",
                         );
                         self.client = None;
                         self.status = None;
@@ -421,8 +431,8 @@ impl App {
         let config_row = row![
             text("Config:").width(Length::Fixed(70.0)),
             text_input("config.toml", &self.config_path).on_input(Message::ConfigPathChanged),
-            button(text("Bladeren…")).on_press(Message::BrowseConfig),
-            button(text("Laden")).on_press(Message::LoadConfig),
+            button(text("Browse…")).on_press(Message::BrowseConfig),
+            button(text("Load")).on_press(Message::LoadConfig),
         ]
         .spacing(8);
 
@@ -432,7 +442,7 @@ impl App {
         ]
         .spacing(8);
 
-        // Profiel-keuze met live plafond-indicatie (doorgerekend via effective()).
+        // Profile picker with a live ceiling indication (computed via effective()).
         let eff = TrafficConfig {
             profile: self.profile,
             ..Default::default()
@@ -440,12 +450,12 @@ impl App {
         .effective();
         let ceiling = if eff.enabled {
             let pps = eff.rate_pps as u64 * eff.burst as u64;
-            format!("≈ {} Mbit/s plafond", pps * 1232 * 8 / 1_000_000)
+            format!("≈ {} Mbit/s ceiling", pps * 1232 * 8 / 1_000_000)
         } else {
-            "geen shaping — WireGuard-vergelijkbaar".to_string()
+            "no shaping — WireGuard-comparable".to_string()
         };
         let profile_row = row![
-            text("Profiel:").width(Length::Fixed(70.0)),
+            text("Profile:").width(Length::Fixed(70.0)),
             pick_list(
                 &TrafficProfile::ALL[..],
                 Some(self.profile),
@@ -455,9 +465,9 @@ impl App {
         ]
         .spacing(8);
 
-        // Grote actie-knop: Connect / Disconnect / (bezig).
+        // Big action button: Connect / Disconnect / (busy).
         let action: Element<Message> = if self.connecting {
-            button(text("Verbinden …")).into()
+            button(text("Connecting …")).into()
         } else if self.client.is_some() {
             button(text("Disconnect"))
                 .on_press(Message::Disconnect)
@@ -466,24 +476,24 @@ impl App {
             button(text("Connect")).on_press(Message::Connect).into()
         };
 
-        // Status-paneel.
+        // Status panel.
         let status_panel: Element<Message> = match &self.status {
             Some(s) if s.connected => container(
                 column![
-                    text("● Verbonden").color(Color::from_rgb(0.1, 0.7, 0.2)),
-                    text(format!("peer: {}   sessie: {}", s.peer, s.session_id)),
+                    text("● Connected").color(Color::from_rgb(0.1, 0.7, 0.2)),
+                    text(format!("peer: {}   session: {}", s.peer, s.session_id)),
                     text(format!(
                         "↑ {}   ↓ {}",
                         human_bytes(s.tx_bytes),
                         human_bytes(s.rx_bytes)
                     )),
                     text(format!(
-                        "uptime: {}s   laatste ontvangst: {}",
+                        "uptime: {}s   last received: {}",
                         s.uptime_secs,
                         if s.last_recv_epoch == 0 {
                             "—".to_string()
                         } else {
-                            format!("{}s geleden", now_secs().saturating_sub(s.last_recv_epoch))
+                            format!("{}s ago", now_secs().saturating_sub(s.last_recv_epoch))
                         }
                     )),
                 ]
@@ -491,19 +501,18 @@ impl App {
             )
             .padding(8)
             .into(),
-            _ => text("○ Niet verbonden").into(),
+            _ => text("○ Not connected").into(),
         };
 
-        // Beveiligingsbanner: rood als er iets zwakker staat, groen als alles aan.
+        // Security banner: red if something is weaker, green if everything is on.
         let banner: Element<Message> = if self.warnings.is_empty() {
-            container(text("Beveiliging: volledig aan").color(Color::WHITE))
+            container(text("Security: fully on").color(Color::WHITE))
                 .padding(8)
                 .style(|_| box_style(Color::from_rgb(0.12, 0.45, 0.18)))
                 .width(Length::Fill)
                 .into()
         } else {
-            let mut col =
-                column![text("⚠ Beveiligingswaarschuwingen").color(Color::WHITE)].spacing(4);
+            let mut col = column![text("⚠ Security warnings").color(Color::WHITE)].spacing(4);
             for w in &self.warnings {
                 col = col.push(text(format!("• {w}")).color(Color::WHITE));
             }
@@ -544,7 +553,7 @@ impl App {
     }
 }
 
-/// Achtergrond-kleur voor een banner (witte tekst erop).
+/// Background color for a banner (white text on top).
 fn box_style(bg: Color) -> container::Style {
     container::Style {
         text_color: Some(Color::WHITE),
