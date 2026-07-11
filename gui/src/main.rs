@@ -307,6 +307,14 @@ impl App {
                 if let Some(cfg) = &mut self.config {
                     cfg.traffic.profile = p;
                 }
+                // Recompute the security banner: the "traffic profile off" warning
+                // depends on the profile, so switching to a paced profile must clear
+                // it (and vice versa). Warnings were otherwise only refreshed on load.
+                self.warnings = self
+                    .config
+                    .as_ref()
+                    .map(security_warnings)
+                    .unwrap_or_default();
                 // Apply live when connected; otherwise it takes effect at Connect.
                 if let Some(client) = &self.client {
                     let mut tc = self
