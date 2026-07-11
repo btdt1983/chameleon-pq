@@ -43,6 +43,12 @@ batch_linger_us = 200
 # cores. Alleen van invloed op het SNELLE pad (traffic.enabled = false); met
 # timing-shaping aan capt de rate de doorvoer, dus dan is dit niet de bottleneck.
 workers = 0
+# UDP-GSO: bundel meerdere datagrammen in één send-syscall. Standaard UIT (false).
+# Aan zetten kan de doorvoer verhogen op een schoon Linux↔Linux-pad, MAAR op
+# sommige paden (Hyper-V vSwitch, bepaalde NIC-offload) wordt de gesegmenteerde
+# super-buffer in z'n geheel gedropt → massaal pakketverlies en een instortende
+# download. Laat op false tenzij je pad bewezen schoon is.
+gso = false
 
 [obfuscation]
 # Verkeersanalyse-weerstand op het DATApad (QUIC-stijl header-protection):
@@ -77,13 +83,14 @@ handshake = true
 #
 #   "stealth"    — CBR, 256×2 ≈ 5 Mbit/s. Max anti-analyse; constante bandbreedte
 #                  24/7 (≈ 1,6 TB/maand/richting). Voor licht, onopvallend verkeer.
-#   "balanced"   — STANDAARD. Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen
-#                  tijdens gebruik, STIL in rust. Goede algemene VPN-ervaring.
+#   "balanced"   — Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen tijdens
+#                  gebruik, STIL in rust. Goede algemene VPN-ervaring.
 #   "throughput" — Adaptive, 6000×8 ≈ 460 Mbit/s. Max snelheid mét pacing.
-#   "off"        — Pacer UIT: native timing/snelheid, GEEN timing-verhulling.
-#                  WireGuard-vergelijkbaar (packet-vorm-padding blijft wél aan).
+#   "off"        — STANDAARD. Pacer UIT: native timing/snelheid, GEEN timing-
+#                  verhulling. WireGuard-vergelijkbaar (packet-vorm-padding blijft
+#                  wél aan). Kies "balanced"/"stealth" voor timing-resistentie.
 #   "custom"     — gebruik de losse mode/rate_pps/burst-velden hieronder.
-profile = "balanced"
+profile = "off"
 
 # De onderstaande velden gelden ALLEEN bij profile = "custom".
 enabled  = true
