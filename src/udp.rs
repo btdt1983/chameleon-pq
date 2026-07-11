@@ -24,8 +24,10 @@ use std::net::SocketAddr;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-/// Aantal berichten dat we per ontvangst-batch aanvragen.
-pub const RECV_BATCH: usize = 8;
+/// Aantal berichten dat we per ontvangst-batch aanvragen. Ruimer = elke
+/// recv-syscall trekt meer datagrammen uit de kernel-recv-buffer, wat helpt de
+/// buffer leeg te houden onder bursty download (minder overflow-drops).
+pub const RECV_BATCH: usize = 32;
 /// Grootte van elke ontvangst-buffer. Groot genoeg voor een flinke GRO-coalesced
 /// reeks MTU-datagrammen; te klein duwt GRO alleen naar minder coalescing (nooit
 /// dataverlies — quinn-udp legt geen half datagram in een buffer).
@@ -35,6 +37,37 @@ pub const RECV_BUF: usize = 64 * 1024;
 /// niet-ondersteunde kernel rapporteert `max_gso_segments()` gewoon 1.
 pub fn socket_state(socket: &UdpSocket) -> io::Result<UdpSocketState> {
     UdpSocketState::new(UdpSockRef::from(socket))
+}
+
+/// Gevraagde kernel-socketbuffer (SO_RCVBUF/SO_SNDBUF). De OS-default is te klein
+/// voor bursty hoge doorvoer: op Windows ~64 KB, in ~2 ms vol bij 220 Mbit. Eén
+/// korte hapering in het (trage) client-ontvangstpad → recv-buffer loopt over →
+/// kernel dropt datagrammen → TCP-retransmits → de download stort in (gemeten:
+/// 8123 retransmits, 47 Mbit). Een ruime buffer absorbeert de bursts zodat TCP
+/// op de echte doorvoer settelt i.p.v. te collapsen.
+const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Vergroot SO_RCVBUF/SO_SNDBUF op de UDP-socket (best-effort; het OS clampt naar
+/// zijn maximum — Windows honoreert grote waarden, Linux kapt op net.core.rmem_max
+/// tenzij verhoogd). Faalt niet-fataal; logt wat we daadwerkelijk kregen.
+pub fn enlarge_socket_buffers(socket: &UdpSocket) {
+    let sref = socket2::SockRef::from(socket);
+    if let Err(e) = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!("set_recv_buffer_size failed: {e}");
+    }
+    if let Err(e) = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES) {
+        tracing::debug!("set_send_buffer_size failed: {e}");
+    }
+    match (sref.recv_buffer_size(), sref.send_buffer_size()) {
+        (Ok(r), Ok(s)) => {
+            tracing::info!(
+                "UDP socket buffers: recv {} KiB, send {} KiB",
+                r / 1024,
+                s / 1024
+            )
+        }
+        _ => tracing::debug!("could not read back socket buffer sizes"),
+    }
 }
 
 /// Maak de ontvangst-buffers + metadata voor `batch_recv` (houdt `quinn_udp`
@@ -57,23 +90,23 @@ pub async fn batch_send(
     peer: SocketAddr,
     datagrams: &[Bytes],
     seg_size: usize,
+    gso: bool,
 ) -> io::Result<()> {
     if datagrams.is_empty() {
         return Ok(());
     }
-    // Windows: NIET via quinn-udp's GSO. Het WSASendMsg/`UDP_SEND_MSG_SIZE`-pad
-    // crasht native (access violation) op sommige Windows-adapters — reproduceer-
-    // baar zelfs over loopback — en zo'n hardware-exception ontsnapt aan de Rust-
-    // panic-hook (proces + venster weg, géén paniek-log). Verstuur daarom elk
-    // datagram met één `send_to`. Geen GSO-batchingwinst, maar stabiel; die winst
-    // was sowieso Linux-specifiek (kernel-UDP-GSO). Zie ook `batch_recv`.
-    if cfg!(windows) {
-        for d in datagrams {
-            socket.send_to(d.as_ref(), peer).await?;
-        }
-        return Ok(());
-    }
-    let max_seg = state.max_gso_segments().max(1);
+    // GSO bundles several already-sealed datagrams into one segmented `sendmsg`.
+    // It's OFF by default (see EngineConfig::gso): on some paths (a Hyper-V vSwitch
+    // / NIC offload that doesn't pass Linux UDP-GSO) the segmented super-buffer is
+    // dropped wholesale — a download measured collapsing 300→47 Mbit with 8000
+    // retransmits. With `gso = false` we send one datagram per syscall, which is
+    // correct everywhere; quinn-udp also falls back to per-datagram when the
+    // platform reports max_gso_segments() == 1.
+    let max_seg = if gso {
+        state.max_gso_segments().max(1)
+    } else {
+        1
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(seg_size * datagrams.len().min(max_seg));
     let mut i = 0;
     while i < datagrams.len() {
@@ -111,20 +144,10 @@ pub async fn batch_recv(
     storage: &mut [Vec<u8>],
     metas: &mut [RecvMeta],
 ) -> io::Result<usize> {
-    // Windows: geen quinn-udp GRO (zelfde native-crash-reden als de send-kant in
-    // `batch_send`). Ontvang één datagram met `recv_from` in de eerste buffer;
-    // `stride = 0` laat `iter_datagrams` het als één heel datagram teruggeven.
-    if cfg!(windows) {
-        let (n, addr) = socket.recv_from(&mut storage[0]).await?;
-        metas[0] = RecvMeta {
-            addr,
-            len: n,
-            stride: 0,
-            ecn: None,
-            dst_ip: None,
-        };
-        return Ok(1);
-    }
+    // EXPERIMENT (quinn-udp 0.6): re-enable GRO on Windows. The 0.5 native crash
+    // was in GSO *send* (WSASendMsg); Tailscale proves batched I/O works on
+    // Windows, so this is worth testing on the newer quinn-udp. Falls back to a
+    // single-datagram recv only if the platform lacks GRO.
     let mut iov: Vec<IoSliceMut> = storage
         .iter_mut()
         .map(|b| IoSliceMut::new(b.as_mut_slice()))
@@ -211,13 +234,12 @@ mod tests {
     }
 
     fn meta(addr: SocketAddr, len: usize, stride: usize) -> RecvMeta {
-        RecvMeta {
-            addr,
-            len,
-            stride,
-            ecn: None,
-            dst_ip: None,
-        }
+        // RecvMeta is #[non_exhaustive] in quinn-udp 0.6 → build via default.
+        let mut m = RecvMeta::default();
+        m.addr = addr;
+        m.len = len;
+        m.stride = stride;
+        m
     }
 
     #[test]

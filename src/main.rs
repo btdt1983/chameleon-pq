@@ -103,6 +103,7 @@ async fn run_server(
     // at the end of each iteration.
     loop {
         let socket = Arc::new(UdpSocket::bind(bind).await?);
+        chameleon::udp::enlarge_socket_buffers(&socket);
         info!("server listening on {bind}");
         let (session, peer) =
             match run_handshake_responder(&socket, auth.as_ref(), hs_obf.as_ref()).await {
@@ -150,6 +151,7 @@ async fn run_client(
     auth: Arc<dyn Authenticator>,
 ) -> anyhow::Result<()> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    chameleon::udp::enlarge_socket_buffers(&socket);
     info!("connecting to {server}");
 
     let hs_obf = hs_obf_key_from_cfg(&cfg)?;

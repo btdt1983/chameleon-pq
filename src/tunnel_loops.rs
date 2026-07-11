@@ -45,6 +45,7 @@ const PAR_THRESHOLD: usize = 16;
 #[derive(Debug, Clone)]
 pub struct TunnelParams {
     pub batch_linger_us: u64,
+    pub gso: bool,
     pub obf_enabled: bool,
     pub padding: PadPolicy,
     pub traffic_enabled: bool,
@@ -73,6 +74,7 @@ impl TunnelParams {
         }
         Self {
             batch_linger_us: cfg.engine.batch_linger_us,
+            gso: cfg.engine.gso,
             obf_enabled: cfg.obfuscation.enabled,
             padding: cfg.obfuscation.padding.into(),
             traffic_enabled: t.enabled,
@@ -164,6 +166,7 @@ pub async fn run_tunnel_loops(
     // Cover traffic requires obfuscation, so a live profile switch can only turn
     // pacing on when obfuscation is enabled; capture it for the outbound loop.
     let obf_on = params.obf_enabled;
+    let gso = params.gso;
     let paced = params.traffic_enabled && obf_on;
     let pace_mode = match params.traffic_mode {
         TrafficMode::Cbr => ShapeMode::Cbr,
@@ -225,7 +228,7 @@ pub async fn run_tunnel_loops(
                             } else {
                                 pending.push(OutboundPacket { plaintext: pkt });
                                 if pending.len() >= MAX_BATCH {
-                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
+                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
                                 }
                             }
                         }
@@ -259,13 +262,13 @@ pub async fn run_tunnel_loops(
                         }
                         for (run, seg) in crate::udp::group_equal_sized(&slot) {
                             if let Err(e) =
-                                crate::udp::batch_send(&socket_out, &state_out, peer_out, run, seg).await
+                                crate::udp::batch_send(&socket_out, &state_out, peer_out, run, seg, gso).await
                             {
                                 error!("UDP batch send (paced): {e}");
                             }
                         }
                     } else if !pending.is_empty() {
-                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out).await;
+                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
                     }
 
                     // Rekey-trigger (gedeeld): drempel bereikt EN geen lopende rekey.
@@ -604,6 +607,7 @@ async fn flush_outbound(
     state: &quinn_udp::UdpSocketState,
     pending: &mut Vec<OutboundPacket>,
     peer: SocketAddr,
+    gso: bool,
 ) {
     let batch = std::mem::take(pending);
     let count = batch.len();
@@ -626,7 +630,7 @@ async fn flush_outbound(
             // Verstuur gelijk-grote runs in zo min mogelijk syscalls (GSO waar
             // mogelijk). Onder Full is de hele batch één run → één GSO-call.
             for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                if let Err(e) = crate::udp::batch_send(socket, state, peer, run, seg).await {
+                if let Err(e) = crate::udp::batch_send(socket, state, peer, run, seg, gso).await {
                     error!("UDP batch send: {e}");
                 }
             }

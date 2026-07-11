@@ -1102,7 +1102,7 @@ async fn udp_batch_roundtrip() {
 
     // 5 gelijk-grote datagrammen (elk uniform gevuld met zijn index).
     let dg: Vec<Bytes> = (0..5u8).map(|i| Bytes::from(vec![i; 1280])).collect();
-    chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280)
+    chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280, true)
         .await
         .unwrap();
 
@@ -1159,7 +1159,7 @@ async fn bench_udp_gso() {
     let t = Instant::now();
     let mut sent = 0usize;
     while sent < n {
-        let _ = chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280).await;
+        let _ = chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280, true).await;
         sent += batch;
     }
     let dt = t.elapsed().as_secs_f64();

@@ -13,13 +13,20 @@
 //!   Linux:   CAP_NET_ADMIN (of sudo) om de TUN-interface aan te maken.
 //!   Windows: wintun.dll naast de binary (https://www.wintun.net).
 //!
+//! We drijven de I/O via `tun` 0.8's `AsyncDevice` (`recv`/`send`). Op Windows
+//! draait dat op `wintun-bindings`: een `try_receive`-ringfast-path die tijdens
+//! verkeer nooit blokkeert, en bij idle één pool-thread op het OS-read-event
+//! parkeert — GEEN thread-per-pakket zoals `tun` 0.6, wat de per-pakket-muur en
+//! de burst-instabiliteit veroorzaakte.
+//!
 //! In tests (zonder CAP_NET_ADMIN) kun je `TunPair::new_mock()` gebruiken;
 //! dat geeft twee in-memory kanalen die dezelfde API bieden.
 
 use crate::config::TunConfig;
 use crate::error::{ChameleonError, Result};
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::net::Ipv4Addr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -34,7 +41,7 @@ pub struct TunPair {
     pub to_tun: mpsc::Sender<Bytes>,
     /// Handles to the TUN read/write tasks (None for the mock). The caller
     /// aborts + awaits these on teardown so the device is fully released before
-    /// it is re-created — the read task blocks on `read()` and would otherwise
+    /// it is re-created — the read task parks on `recv()` and would otherwise
     /// keep the interface open indefinitely when idle.
     pub read_task: Option<tokio::task::JoinHandle<()>>,
     pub write_task: Option<tokio::task::JoinHandle<()>>,
@@ -44,8 +51,8 @@ impl TunPair {
     /// Maak een echte TUN-interface aan en start de I/O-taken.
     /// Faalt als de rechten ontbreken of het platform niet ondersteund wordt.
     pub fn create(cfg: &TunConfig) -> Result<Self> {
-        let iface = build_tun(cfg)?;
-        Ok(Self::spawn_io(iface))
+        let device = build_async_device(cfg)?;
+        Ok(Self::spawn_io(device))
     }
 
     /// In-memory mock (geen kernel-interface nodig). Bedoeld voor tests en voor
@@ -69,22 +76,23 @@ impl TunPair {
         )
     }
 
-    fn spawn_io<T>(iface: T) -> Self
-    where
-        T: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
-    {
+    fn spawn_io(device: tun::AsyncDevice) -> Self {
         let (from_tun_tx, from_tun_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
         let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
 
-        // Split the device into independent read/write halves so we can
-        // move each into its own task without a borrow conflict.
-        let (mut reader, mut writer) = tokio::io::split(iface);
+        // Share the device between the read and write tasks: `recv`/`send` both
+        // take `&self` (concurrent recv+send on one wintun session is fine), and
+        // the device is dropped — releasing the interface — only once BOTH tasks
+        // end, which is exactly what the teardown wants.
+        let device = Arc::new(device);
+        let dev_read = device.clone();
 
-        // Lees-taak: TUN → engine (encrypt-kant)
+        // Lees-taak: TUN → engine (encrypt-kant). `recv` gebruikt de ring-fast-
+        // path tijdens verkeer en parkeert alleen bij idle op het OS-read-event.
         let read_task = tokio::spawn(async move {
             let mut buf = vec![0u8; TUN_READ_BUF];
             loop {
-                match reader.read(&mut buf).await {
+                match dev_read.recv(&mut buf).await {
                     Ok(0) => {
                         error!("TUN read: EOF");
                         break;
@@ -104,11 +112,11 @@ impl TunPair {
             }
         });
 
-        // Schrijf-taak: engine (decrypt-kant) → TUN
+        // Schrijf-taak: engine (decrypt-kant) → TUN.
         let write_task = tokio::spawn(async move {
             while let Some(pkt) = to_tun_rx.recv().await {
                 debug!("TUN write {} bytes", pkt.len());
-                if let Err(e) = writer.write_all(&pkt).await {
+                if let Err(e) = device.send(&pkt).await {
                     error!("TUN write error: {e}");
                     break;
                 }
@@ -133,14 +141,12 @@ pub struct MockHandles {
     pub drain_rx: mpsc::Receiver<Bytes>,
 }
 
-// ── Platform-specifieke TUN-aanmaak ─────────────────────────────────────────
+// ── TUN-aanmaak (cross-platform via tun 0.8 `create_as_async`) ───────────────
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn build_tun(
-    cfg: &TunConfig,
-) -> Result<impl AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static> {
-    use std::net::Ipv4Addr;
-
+/// Maak een asynchrone TUN-interface aan. tun 0.8 levert op elk platform dezelfde
+/// `AsyncDevice` met `recv`/`send`; op Windows draait dat op `wintun-bindings`
+/// (ring fast-path + OS-event, geen thread-per-pakket).
+fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
     let addr: Ipv4Addr = cfg.address.parse().map_err(|e| ChameleonError::Handshake {
         state: "tun".into(),
         msg: format!("invalid tun address '{}': {e}", cfg.address),
@@ -152,17 +158,25 @@ fn build_tun(
 
     let mut tun_cfg = tun::Configuration::default();
     tun_cfg
-        .name(&cfg.name)
+        .tun_name(cfg.name.as_str())
         .address(addr)
         .netmask(mask)
-        .mtu(cfg.mtu as i32)
         .up();
 
-    // tun::create_as_async geeft een AsyncDevice die AsyncRead + AsyncWrite implementeert.
+    // MTU: set it on Linux/macOS, but NOT on Windows. wintun keeps its own
+    // default (1500) and tun 0.6 — the last version that worked on our Windows
+    // client — never pushed the MTU onto the interface either. The 0.8 WinAPI
+    // MTU path is an extra failure surface for no gain (the tunnel already ran
+    // fine with the wintun default), so we leave it alone there.
+    #[cfg(not(windows))]
+    tun_cfg.mtu(cfg.mtu);
+
     let device = tun::create_as_async(&tun_cfg).map_err(|e| ChameleonError::Handshake {
         state: "tun".into(),
         msg: format!(
-            "failed to create TUN '{}': {e} (do you have CAP_NET_ADMIN?)",
+            "failed to create TUN '{}': {e} \
+             (Linux/macOS need CAP_NET_ADMIN or sudo; \
+              Windows needs wintun.dll next to the binary — https://www.wintun.net)",
             cfg.name
         ),
     })?;
@@ -172,53 +186,6 @@ fn build_tun(
         cfg.name, addr, mask
     );
     Ok(device)
-}
-
-#[cfg(target_os = "windows")]
-fn build_tun(
-    cfg: &TunConfig,
-) -> Result<impl AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static> {
-    use std::net::Ipv4Addr;
-
-    let addr: Ipv4Addr = cfg.address.parse().map_err(|e| ChameleonError::Handshake {
-        state: "tun".into(),
-        msg: format!("invalid tun address '{}': {e}", cfg.address),
-    })?;
-    let mask: Ipv4Addr = cfg.netmask.parse().map_err(|e| ChameleonError::Handshake {
-        state: "tun".into(),
-        msg: format!("invalid netmask '{}': {e}", cfg.netmask),
-    })?;
-
-    let mut tun_cfg = tun::Configuration::default();
-    tun_cfg
-        .name(&cfg.name)
-        .address(addr)
-        .netmask(mask)
-        .mtu(cfg.mtu as i32)
-        .up();
-
-    let device = tun::create_as_async(&tun_cfg).map_err(|e| ChameleonError::Handshake {
-        state: "tun".into(),
-        msg: format!(
-            "failed to create TUN '{}': {e} \
-             (Windows requires wintun.dll in the same directory as the binary — \
-              download from https://www.wintun.net)",
-            cfg.name
-        ),
-    })?;
-
-    info!("TUN interface '{}' up (Windows/Wintun)", cfg.name);
-    Ok(device)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn build_tun(
-    _cfg: &TunConfig,
-) -> Result<impl AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static> {
-    Err(ChameleonError::Handshake {
-        state: "tun".into(),
-        msg: format!("TUN not supported on platform '{}'", std::env::consts::OS),
-    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

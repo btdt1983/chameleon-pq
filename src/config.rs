@@ -170,6 +170,16 @@ pub struct EngineConfig {
     /// voor de reactor/TUN. Alleen van invloed op het snelle (unpaced) pad.
     #[serde(default)]
     pub workers: usize,
+    /// UDP-GSO op verzenden (meerdere datagrammen in één syscall). Standaard UIT:
+    /// het bundelt reeds-verzegelde datagrammen tot één grote gesegmenteerde send,
+    /// wat op sommige paden (bv. een Hyper-V vSwitch of NIC-offload die Linux-GSO
+    /// niet doorlaat) tot MASSAAL pakketverlies leidt — gemeten: een download die
+    /// instortte van 300 naar 47 Mbit met 8000 retransmits. Per-pakket verzenden
+    /// (uit) is overal correct; de doorvoerwinst van GSO is bovendien alleen echt
+    /// als het per-pakket-syscall-pad de bottleneck is, niet de crypto/CPU. Zet
+    /// alleen `true` op een bewezen-schoon Linux↔Linux-pad.
+    #[serde(default)]
+    pub gso: bool,
 }
 
 impl Default for EngineConfig {
@@ -177,6 +187,7 @@ impl Default for EngineConfig {
         Self {
             batch_linger_us: default_linger(),
             workers: 0,
+            gso: false,
         }
     }
 }
@@ -267,16 +278,17 @@ pub enum TrafficProfile {
     /// Max anti-analyse: CBR, laag plafond (~5 Mbit/s), constante bandbreedte 24/7.
     /// Voor licht verkeer waar onzichtbaarheid boven snelheid gaat.
     Stealth,
-    /// STANDAARD: adaptive, ruim plafond (~115 Mbit/s), STIL in rust. Timing
-    /// verborgen tijdens gebruik; goede algemene VPN-ervaring.
-    #[default]
+    /// Adaptive, ruim plafond (~115 Mbit/s), STIL in rust. Timing verborgen
+    /// tijdens gebruik; goede algemene VPN-ervaring. Opt-in voor timing-resistentie.
     Balanced,
     /// Max snelheid mét timing-pacing: adaptive, hoog plafond (~460 Mbit/s).
     /// Voor wie snelheid boven maximale verhulling stelt maar tóch cover wil.
     Throughput,
-    /// GEEN timing-shaping (pacer uit). Native timing en snelheid — het
+    /// STANDAARD: GEEN timing-shaping (pacer uit). Native timing en snelheid — het
     /// WireGuard-vergelijkbare profiel (packet-vorm-obfuscatie via [obfuscation]
-    /// blijft wél aan). Geen bescherming tegen timing-/burst-analyse.
+    /// blijft wél aan). Geen bescherming tegen timing-/burst-analyse; kies
+    /// `balanced`/`stealth` als je die afweging andersom wilt.
+    #[default]
     Off,
     /// Gebruik de losse `enabled`/`mode`/`rate_pps`/`burst`-velden hieronder.
     Custom,
@@ -625,14 +637,13 @@ mod tests {
     }
 
     #[test]
-    fn default_traffic_profile_is_balanced() {
+    fn default_traffic_profile_is_off() {
         let t = TrafficConfig::default();
-        assert_eq!(t.profile, TrafficProfile::Balanced);
+        assert_eq!(t.profile, TrafficProfile::Off);
+        // "off" resolves to no pacing (WireGuard-comparable): max speed, payload
+        // obfuscation stays on but there is no timing/cover traffic.
         let e = t.effective();
-        assert!(e.enabled);
-        assert_eq!(e.mode, TrafficMode::Adaptive);
-        assert_eq!(e.rate_pps, 3000);
-        assert_eq!(e.burst, 4);
+        assert!(!e.enabled);
     }
 
     #[test]
@@ -676,8 +687,8 @@ mod tests {
         assert_eq!(t.profile, TrafficProfile::Throughput);
         let off: TrafficConfig = toml::from_str(r#"profile = "off""#).unwrap();
         assert!(!off.effective().enabled);
-        // Lege sectie → default balanced.
+        // Lege sectie → default off.
         let empty: TrafficConfig = toml::from_str("").unwrap();
-        assert_eq!(empty.profile, TrafficProfile::Balanced);
+        assert_eq!(empty.profile, TrafficProfile::Off);
     }
 }
