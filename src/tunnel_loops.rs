@@ -1,10 +1,10 @@
-//! De live tunnel-loops: outbound (TUN → engine → UDP), inbound (UDP → engine →
-//! TUN, met handshake-/rekey-demux) en keepalive/dode-peer-detectie. Uit main.rs
-//! gehaald zodat de orchestratie zowel testbaar (zie tests/e2e_tunnel.rs) als
-//! herbruikbaar is voor andere clients dan de meegeleverde binary.
+//! The live tunnel loops: outbound (TUN → engine → UDP), inbound (UDP → engine →
+//! TUN, with handshake/rekey demux) and keepalive/dead-peer detection. Pulled out
+//! of main.rs so the orchestration is both testable (see tests/e2e_tunnel.rs) and
+//! reusable for clients other than the bundled binary.
 //!
-//! De inbound-loop is de ENIGE socket-lezer (sole-reader-invariant); mid-sessie
-//! handshake-frames gaan via een kanaal naar de rekey-driver (zie rekey.rs).
+//! The inbound loop is the ONLY socket reader (sole-reader invariant); mid-session
+//! handshake frames go via a channel to the rekey driver (see rekey.rs).
 
 use crate::config::{AppConfig, EffectiveTraffic, TrafficMode};
 use crate::crypto::Authenticator;
@@ -30,18 +30,18 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 const MAX_BATCH: usize = 256;
-/// Bovengrens op de outbound-wachtrij onder pacing. Bij overvol wordt het
-/// nieuwste TUN-pakket getaild-dropt (TCP herstelt); ongebonden bufferen zou de
-/// constante rate breken en latency opstapelen.
+/// Upper bound on the outbound queue under pacing. When full, the newest TUN
+/// packet is tail-dropped (TCP recovers); unbounded buffering would break the
+/// constant rate and pile up latency.
 const MAX_QUEUE: usize = 1024;
-/// Batch-drempel voor het parallelle crypto-pad (Fase C): onder deze grootte
-/// verzegelen/ontsleutelen we sequentieel om de spawn_blocking+rayon-overhead
-/// bij licht verkeer te vermijden.
+/// Batch threshold for the parallel crypto path (Phase C): below this size we
+/// seal/decrypt sequentially to avoid the spawn_blocking+rayon overhead under
+/// light traffic.
 const PAR_THRESHOLD: usize = 16;
 
-/// De configuratie-waarden die `run_tunnel_loops` nodig heeft, OWNED (geen
-/// `&AppConfig`-borrow) zodat de loop als taak gespawned kan worden — precies wat
-/// een client-UI wil (connect → tunnel draait op de achtergrond, UI blijft leven).
+/// The configuration values that `run_tunnel_loops` needs, OWNED (no
+/// `&AppConfig` borrow) so the loop can be spawned as a task — exactly what a
+/// client UI wants (connect → tunnel runs in the background, UI stays alive).
 #[derive(Debug, Clone)]
 pub struct TunnelParams {
     pub batch_linger_us: u64,
@@ -86,26 +86,26 @@ impl TunnelParams {
     }
 }
 
-/// Live tellers voor een lopende tunnel, zodat een frontend (client-UI) status
-/// kan tonen. Lock-vrij; `run_tunnel_loops` werkt ze bij. Bytes tellen de
-/// PLAINTEXT (wat door de TUN gaat), niet de wire-grootte.
+/// Live counters for a running tunnel, so a frontend (client UI) can show
+/// status. Lock-free; `run_tunnel_loops` updates them. Bytes count the
+/// PLAINTEXT (what goes through the TUN), not the wire size.
 #[derive(Default, Debug)]
 pub struct TunnelStats {
-    /// True zolang de tunnel-loops draaien.
+    /// True while the tunnel loops are running.
     pub connected: AtomicBool,
-    /// Plaintext-bytes vanaf de TUN richting peer (uitgaand).
+    /// Plaintext bytes from the TUN toward the peer (outbound).
     pub tx_bytes: AtomicU64,
-    /// Plaintext-bytes vanaf de peer richting TUN (inkomend).
+    /// Plaintext bytes from the peer toward the TUN (inbound).
     pub rx_bytes: AtomicU64,
-    /// Epoch-seconden van het laatst ONTVANGEN pakket (0 = nog niets).
+    /// Epoch seconds of the last RECEIVED packet (0 = nothing yet).
     pub last_recv_epoch: AtomicU64,
 }
 
-/// Draai de drie tunnel-taken (outbound, inbound, keepalive) tot een van hen
-/// eindigt (peer-close, dode peer, of een gesloten TUN-kanaal). Voer eerst de
-/// handshake uit (`net::run_handshake_*`) om `engine`/`peer`/`hs_obf` te krijgen.
-// Veel argumenten, maar het is één centrale orchestratie-functie; ze bundelen in
-// een struct zou de call-sites alleen maar omslachtiger maken.
+/// Run the three tunnel tasks (outbound, inbound, keepalive) until one of them
+/// ends (peer close, dead peer, or a closed TUN channel). First run the
+/// handshake (`net::run_handshake_*`) to obtain `engine`/`peer`/`hs_obf`.
+// Many arguments, but it is one central orchestration function; bundling them in
+// a struct would only make the call sites more cumbersome.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel_loops(
     socket: Arc<UdpSocket>,
@@ -148,18 +148,18 @@ pub async fn run_tunnel_loops(
     let linger = Duration::from_micros(params.batch_linger_us);
     stats.connected.store(true, Ordering::Relaxed);
 
-    // Kanaal waarmee de inbound-loop handshake-frames doorgeeft aan een
-    // lopende rekey-driver. ZO is de inbound-loop de enige socket-lezer.
+    // Channel the inbound loop uses to pass handshake frames to a running
+    // rekey driver. THIS keeps the inbound loop the only socket reader.
     let (hs_tx, mut hs_rx) = handshake_channel();
-    // Markeert of er nu een rekey loopt (voorkomt dubbele initiatie).
+    // Marks whether a rekey is running now (prevents double initiation).
     let rekeying = Arc::new(AtomicBool::new(false));
 
-    // Keepalive / dode-peer-detectie: epoch-seconden van het laatst ontvangen
-    // pakket. Een aparte taak stuurt KeepAlive bij stilte en sluit de tunnel
-    // als er te lang niets binnenkomt.
+    // Keepalive / dead-peer detection: epoch seconds of the last received
+    // packet. A separate task sends KeepAlive on silence and closes the tunnel
+    // if nothing arrives for too long.
     let last_recv = Arc::new(AtomicU64::new(now_secs()));
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-    const PEER_DEAD_AFTER: u64 = 45; // seconden zonder enig pakket = dood
+    const PEER_DEAD_AFTER: u64 = 45; // seconds without any packet = dead
 
     // Timing-/cover-traffic pacing (phase 3). `paced` only when the data path is
     // also obfuscated (cover packets ride on it; the config validates this).
@@ -176,8 +176,8 @@ pub async fn run_tunnel_loops(
     let pace_burst = params.burst.max(1) as usize;
     let pace_cooldown = Duration::from_millis(params.cooldown_ms);
 
-    // Gedeelde GSO/GRO-state voor gebatchte UDP-I/O (quinn-udp). Faalt zelden;
-    // op een kernel zonder GSO/GRO valt quinn-udp vanzelf per-pakket terug.
+    // Shared GSO/GRO state for batched UDP I/O (quinn-udp). Rarely fails;
+    // on a kernel without GSO/GRO quinn-udp falls back to per-packet on its own.
     let sock_state = match crate::udp::socket_state(&socket) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -219,7 +219,7 @@ pub async fn run_tunnel_loops(
                         Some(pkt) => {
                             stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             if paced {
-                                // Bounded queue met tail-drop (zie MAX_QUEUE).
+                                // Bounded queue with tail-drop (see MAX_QUEUE).
                                 if pending.len() >= MAX_QUEUE {
                                     debug!("outbound queue full — tail-drop");
                                 } else {
@@ -237,11 +237,11 @@ pub async fn run_tunnel_loops(
                 }
                 _ = tick.tick() => {
                     if paced {
-                        // Emit `burst` datagrammen per slot en verstuur ze in ÉÉN
-                        // GSO-syscall: echte pakketten uit de wachtrij, lege slots
-                        // gevuld met cover — alle op constante grootte (Full), zodat
-                        // rate én grootte constant blijven en de slot-burst (die de
-                        // pacer sowieso al produceert) in één syscall past.
+                        // Emit `burst` datagrams per slot and send them in ONE
+                        // GSO syscall: real packets from the queue, empty slots
+                        // filled with cover — all at constant size (Full), so
+                        // rate and size stay constant and the slot burst (which
+                        // the pacer already produces anyway) fits in one syscall.
                         let mut slot: Vec<Bytes> = Vec::with_capacity(pace_burst);
                         for _ in 0..pace_burst {
                             match pacer.next_emit(!pending.is_empty(), Instant::now()) {
@@ -256,7 +256,7 @@ pub async fn run_tunnel_loops(
                                     Ok(wire) => slot.push(wire),
                                     Err(e) => error!("cover datagram: {e}"),
                                 },
-                                // Adaptive-idle: niets meer te sturen dit slot.
+                                // Adaptive-idle: nothing left to send this slot.
                                 Emit::Idle => break,
                             }
                         }
@@ -271,13 +271,13 @@ pub async fn run_tunnel_loops(
                         flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
                     }
 
-                    // Rekey-trigger (gedeeld): drempel bereikt EN geen lopende rekey.
+                    // Rekey trigger (shared): threshold reached AND no rekey running.
                     if engine_out.sessions().needs_rekey()
                         && !rekeying_out.swap(true, Ordering::AcqRel)
                     {
                         let new_id = crate::net::alloc_session_id();
                         info!("rekey threshold reached — starting rekey on session {new_id}");
-                        // De rekey-driver leest GEEN socket; response komt via hs_rx.
+                        // The rekey driver reads NO socket; response comes via hs_rx.
                         let r = rekey_as_initiator(
                             &socket_out, peer_out, auth_out.as_ref(),
                             engine_out.sessions(), new_id, &mut hs_rx, hs_obf.as_ref(),
@@ -286,8 +286,8 @@ pub async fn run_tunnel_loops(
                             Ok(()) => schedule_retire(engine_out.sessions().clone()),
                             Err(e) => {
                                 warn!("rekey failed: {e}");
-                                // Geef de claim in de SessionManager vrij zodat een
-                                // latere poging (na het anti-storm-interval) kan starten.
+                                // Release the claim in the SessionManager so a
+                                // later attempt (after the anti-storm interval) can start.
                                 engine_out.sessions().abort_rekey();
                             }
                         }
@@ -332,13 +332,13 @@ pub async fn run_tunnel_loops(
     let peer_in = peer;
     let stats_in = stats.clone();
     tasks.spawn(async move {
-        // Gebatchte ontvangst-buffers (GRO): één syscall levert meerdere
-        // datagrammen, die we hieronder één voor één door de bestaande demux halen.
+        // Batched receive buffers (GRO): one syscall yields multiple
+        // datagrams, which we run one by one through the existing demux below.
         let (mut recv_storage, mut recv_metas) = crate::udp::recv_buffers();
-        // Reassembler voor mid-sessie rekey-init frames (responder-kant).
+        // Reassembler for mid-session rekey-init frames (responder side).
         let mut rekey_reasm = Reassembler::default();
-        // Pending rekey-responder state: na de init bewaren we de (nog niet
-        // vertrouwde) handshake tot de Confirm binnenkomt (wederzijdse auth).
+        // Pending rekey-responder state: after the init we keep the (not yet
+        // trusted) handshake until the Confirm arrives (mutual auth).
         let mut pending_rekey: Option<(Handshake, u32)> = None;
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
@@ -346,7 +346,7 @@ pub async fn run_tunnel_loops(
         'inbound: loop {
             tokio::select! {
                 _ = prune_tick.tick() => {
-                    // State-Bloat-DoS-fix: ruim half-afgemaakte fragmenten op.
+                    // State-Bloat-DoS fix: clean up half-finished fragments.
                     rekey_reasm.prune_old(Duration::from_secs(10));
                     rekey_confirm_reasm.prune_old(Duration::from_secs(10));
                 }
@@ -355,18 +355,18 @@ pub async fn run_tunnel_loops(
                         Ok(c)  => c,
                         Err(e) => { error!("UDP recv: {e}"); continue; }
                     };
-                    // Collect de (GRO-gesplitste) datagrammen owned, zodat de
-                    // storage-borrow vrijkomt vóór de per-datagram-verwerking met
-                    // awaits. De kopie is verwaarloosbaar t.o.v. de syscall-winst.
+                    // Collect the (GRO-split) datagrams owned, so the storage
+                    // borrow is released before the per-datagram processing with
+                    // awaits. The copy is negligible vs. the syscall gain.
                     let datagrams: Vec<(std::net::SocketAddr, Bytes)> =
                         crate::udp::iter_datagrams(&recv_storage, &recv_metas, count)
                             .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
                             .collect();
 
-                    // Ontsleutel de batch PARALLEL over alle cores bij voldoende
-                    // volume; bij een kleine batch sequentieel (vermijd overhead).
-                    // Alleen de datapad-decrypt is parallel; de (zeldzame)
-                    // handshake/rekey-demux blijft serieel op deze coördinator.
+                    // Decrypt the batch in PARALLEL across all cores at
+                    // sufficient volume; for a small batch sequentially (avoid overhead).
+                    // Only the data-path decrypt is parallel; the (rare)
+                    // handshake/rekey demux stays serial on this coordinator.
                     let results: Vec<DecryptResult> = if datagrams.len()
                         >= PAR_THRESHOLD
                     {
@@ -391,7 +391,7 @@ pub async fn run_tunnel_loops(
                     };
 
                     for (src, datagram, result) in results {
-                        // 1) Datapad (parallel ontsleuteld): direct afhandelen.
+                        // 1) Data path (decrypted in parallel): handle directly.
                         if let Ok((ft, plain)) = result {
                             let now = now_secs();
                             last_recv_in.store(now, Ordering::Relaxed);
@@ -404,27 +404,27 @@ pub async fn run_tunnel_loops(
                                 }
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
                                 FrameType::Close => { info!("peer closed session"); break 'inbound; }
-                                FrameType::Handshake => {} // niet verwacht via het obf-pad
+                                FrameType::Handshake => {} // not expected via the obf path
                                 FrameType::Padding => debug!("cover packet discarded"),
                             }
                             continue;
                         }
 
-                        // Geen datapad → handshake-fragment of ruis: SERIEEL op de
-                        // coördinator (rekey-state blijft op één thread).
+                        // No data path → handshake fragment or noise: SERIAL on
+                        // the coordinator (rekey state stays on one thread).
                         //
-                        // M-1: accepteer control-/handshake-verkeer ALLEEN van de
-                        // gevestigde peer. De rekey-demux hieronder stuurt een
-                        // ~8 KB response en doet dure crypto (ML-KEM+DH+ML-DSA);
-                        // met een ongepind bron-adres zou een gespooft `src`
-                        // reflectie/amplificatie naar een slachtoffer toelaten én
-                        // rekey-crypto op ruis verspillen. Het datapad hierboven is
-                        // al door de AEAD-tag beschermd en hoeft niet gepind.
+                        // M-1: accept control/handshake traffic ONLY from the
+                        // established peer. The rekey demux below sends a
+                        // ~8 KB response and does expensive crypto (ML-KEM+DH+ML-DSA);
+                        // with an unpinned source address a spoofed `src` would
+                        // allow reflection/amplification toward a victim and
+                        // waste rekey crypto on noise. The data path above is
+                        // already protected by the AEAD tag and need not be pinned.
                         if src != peer_in {
                             continue;
                         }
 
-                        // 2) Handshake-obfuscatie AAN.
+                        // 2) Handshake obfuscation ON.
                         if let Some(k) = hs_obf {
                             if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&k, &datagram) {
                                 last_recv_in.store(now_secs(), Ordering::Relaxed);
@@ -460,7 +460,7 @@ pub async fn run_tunnel_loops(
                             continue;
                         }
 
-                        // 3) Handshake-obfuscatie UIT: klassiek cleartext frame.
+                        // 3) Handshake obfuscation OFF: classic cleartext frame.
                         let frame = match Frame::decode(datagram.clone()) {
                             Ok(f)  => f,
                             Err(e) => { warn!("bad frame: {e}"); continue; }
@@ -508,13 +508,13 @@ pub async fn run_tunnel_loops(
                                 }
                             }
                             FrameType::KeepAlive => debug!("keepalive received"),
-                            // L-7: een cleartext Close (obf uit) is ONGEAUTHENTICEERD;
-                            // niet afbreken op injectie. Een echte peer-exit wordt door
-                            // de dode-peer-detectie opgevangen. (De geobfusceerde,
-                            // geauthenticeerde Close hierboven breekt wél af.)
+                            // L-7: a cleartext Close (obf off) is UNAUTHENTICATED;
+                            // don't tear down on injection. A real peer exit is caught
+                            // by the dead-peer detection. (The obfuscated,
+                            // authenticated Close above does tear down.)
                             FrameType::Close => warn!(
-                                "cleartext Close genegeerd (obf uit = ongeauthenticeerd); \
-                                 tunnel blijft staan"
+                                "cleartext Close ignored (obf off = unauthenticated); \
+                                 tunnel stays up"
                             ),
                             FrameType::Padding => {}
                         }
@@ -524,19 +524,19 @@ pub async fn run_tunnel_loops(
         }
     });
 
-    // ── Keepalive + dode-peer-detectie ───────────────────────────
-    // Stuurt periodiek een KeepAlive-frame en sluit de tunnel als er te
-    // lang niets binnenkwam. Draait als derde taak naast in/outbound.
+    // ── Keepalive + dead-peer detection ──────────────────────────
+    // Sends a KeepAlive frame periodically and closes the tunnel if nothing
+    // arrived for too long. Runs as the third task alongside in/outbound.
     let socket_ka = socket.clone();
     let last_recv_ka = last_recv.clone();
     let peer_ka = peer;
     let engine_ka = engine.clone();
     let obf_enabled_ka = params.obf_enabled;
     let pad_policy_ka: PadPolicy = params.padding;
-    // Onder CBR-pacing stroomt er sowieso constant (cover-)verkeer, dus de
-    // periodieke keepalive-send is overbodig — we slaan 'm dan over en houden
-    // alleen de dode-peer-detectie. (Adaptive kan idle-stil vallen, dus daar
-    // blijft de keepalive-send nodig.)
+    // Under CBR pacing there is constant (cover) traffic anyway, so the
+    // periodic keepalive send is redundant — we skip it then and keep
+    // only the dead-peer detection. (Adaptive can fall idle-silent, so there
+    // the keepalive send stays necessary.)
     let ka_skip_send = paced && matches!(params.traffic_mode, TrafficMode::Cbr);
     tasks.spawn(async move {
         let mut ka_tick = interval(KEEPALIVE_INTERVAL);
@@ -548,11 +548,11 @@ pub async fn run_tunnel_loops(
                 break;
             }
             if ka_skip_send {
-                continue; // CBR-cover levert het leven-signaal al
+                continue; // CBR cover already provides the liveness signal
             }
-            // Stuur een keepalive zodat de andere kant óók weet dat wij leven.
-            // Geobfusceerd (zodat de keepalive niet als klein vast pakket
-            // opvalt) tenzij obfuscatie uit staat; dan het klassieke frame.
+            // Send a keepalive so the other side knows we are alive too.
+            // Obfuscated (so the keepalive doesn't stand out as a small fixed
+            // packet) unless obfuscation is off; then the classic frame.
             let wire = if obf_enabled_ka {
                 engine_ka
                     .sessions()
@@ -611,8 +611,8 @@ async fn flush_outbound(
 ) {
     let batch = std::mem::take(pending);
     let count = batch.len();
-    // Kleine batch: sequentieel (vermijd de spawn_blocking+rayon-overhead).
-    // Grote batch: verzegel PARALLEL over alle cores via één spawn_blocking-hop.
+    // Small batch: sequential (avoid the spawn_blocking+rayon overhead).
+    // Large batch: seal in PARALLEL across all cores via one spawn_blocking hop.
     let sealed = if count < PAR_THRESHOLD {
         engine.encrypt_batch(batch)
     } else {
@@ -627,8 +627,8 @@ async fn flush_outbound(
     };
     match sealed {
         Ok(wires) => {
-            // Verstuur gelijk-grote runs in zo min mogelijk syscalls (GSO waar
-            // mogelijk). Onder Full is de hele batch één run → één GSO-call.
+            // Send equal-sized runs in as few syscalls as possible (GSO where
+            // possible). Under Full the whole batch is one run → one GSO call.
             for (run, seg) in crate::udp::group_equal_sized(&wires) {
                 if let Err(e) = crate::udp::batch_send(socket, state, peer, run, seg, gso).await {
                     error!("UDP batch send: {e}");

@@ -5,23 +5,23 @@ edition = "2021"
 publish = false
 description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
 
-# Eigen crate (net als fuzz/): houdt de zware GUI-deps buiten de core-crate.
-# De root is geen workspace, dus `cargo build` in de root negeert deze crate;
-# bouw expliciet met: `cargo build --manifest-path gui/Cargo.toml`.
+# Own crate (like fuzz/): keeps the heavy GUI deps out of the core crate.
+# The root is not a workspace, so `cargo build` in the root ignores this crate;
+# build it explicitly with: `cargo build --manifest-path gui/Cargo.toml`.
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 chameleon-pq = { path = ".." }
-# Diagnostiek: de GUI heeft (anders dan de CLI) geen console op Windows, dus
-# schrijven we tracing-logs én panics naar een logbestand naast de binary.
+# Diagnostics: the GUI (unlike the CLI) has no console on Windows, so we write
+# tracing logs and panics to a log file next to the binary.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# Native bestandsdialoog om de config.toml te kiezen — TARGET-SPECIFIEK:
-# Windows/macOS gebruiken hun native dialoog (geen extra systeemlibs); Linux de
-# xdg-desktop-portal i.p.v. GTK, zodat het op de headless buildbox (en CI-ubuntu)
-# compileert zonder GTK-dev-libs. Zo trekt de Windows-CI-job GEEN ashpd/zbus binnen.
+# Native file dialog to pick the config.toml — TARGET-SPECIFIC:
+# Windows/macOS use their native dialog (no extra system libs); Linux uses the
+# xdg-desktop-portal instead of GTK, so it compiles on the headless build box (and
+# CI ubuntu) without GTK dev libs. This way the Windows CI job pulls in NO ashpd/zbus.
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 

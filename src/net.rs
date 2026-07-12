@@ -1,7 +1,7 @@
-//! Netwerk-glue: de UDP-bedrading van de INITIËLE handshake (initiator +
-//! responder, met fragmentatie/obfuscatie) plus kleine helpers. De live in/
-//! outbound-datapadloops draaien in `main.rs::run_tunnel_loops`; die is de enige
-//! socket-lezer (sole-reader-invariant, zie rekey.rs).
+//! Network glue: the UDP wiring of the INITIAL handshake (initiator +
+//! responder, with fragmentation/obfuscation) plus small helpers. The live in/
+//! outbound datapath loops run in `main.rs::run_tunnel_loops`; that is the sole
+//! socket reader (sole-reader invariant, see rekey.rs).
 
 use crate::crypto::Authenticator;
 use crate::error::{ChameleonError, Result};
@@ -21,21 +21,21 @@ use tracing::{debug, info, warn};
 
 const UDP_BUF: usize = 65_536;
 
-/// Timeouts voor de INITIËLE handshake (M-2). De initiator herverzendt zijn init
-/// bij uitblijvende response (bounded retry, ephemeral sleutels blijven gelijk).
-/// De responder wacht bounded op de Confirm en gaat daarna terug naar luisteren,
-/// zodat een bogus/incomplete init hem niet permanent kan vastzetten.
+/// Timeouts for the INITIAL handshake (M-2). The initiator resends its init
+/// when no response arrives (bounded retry, ephemeral keys stay the same).
+/// The responder waits bounded for the Confirm and then returns to listening,
+/// so a bogus/incomplete init cannot lock it up permanently.
 const HS_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(800);
 const HS_MAX_ATTEMPTS: usize = 8;
 const HS_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Geldigheidsvenster van een return-routability cookie (L-4). Een handshake is
-/// binnen seconden rond, dus 120s is ruim; we accepteren huidig + vorig venster.
+/// Validity window of a return-routability cookie (L-4). A handshake completes
+/// within seconds, so 120s is ample; we accept the current + previous window.
 const COOKIE_WINDOW_SECS: u64 = 120;
 
-/// Stateless cookie-uitgifte voor de responder (L-4). Eén per-proces geheim; de
-/// cookie zelf = HMAC(geheim, src ‖ tijdvenster), dus er is GEEN per-initiator
-/// state vóór de cookie valideert — precies wat de anti-DoS-eigenschap geeft.
+/// Stateless cookie issuance for the responder (L-4). One per-process secret; the
+/// cookie itself = HMAC(secret, src ‖ time window), so there is NO per-initiator
+/// state before the cookie validates — exactly what the anti-DoS property gives.
 struct CookieState {
     secret: [u8; 32],
 }
@@ -58,10 +58,10 @@ impl CookieState {
         crate::crypto::compute_cookie(&self.secret, src, Self::bucket())
     }
 
-    /// Geldig als de cookie matcht met het huidige of vorige tijdvenster (zodat
-    /// een cookie rond een vensterwissel niet meteen ongeldig wordt). Constant-
-    /// time vergelijking — het is een MAC-vergelijking, dus een timing-lek zou
-    /// byte-voor-byte forging toelaten.
+    /// Valid if the cookie matches the current or previous time window (so a
+    /// cookie around a window boundary does not instantly become invalid).
+    /// Constant-time comparison — it's a MAC comparison, so a timing leak would
+    /// allow byte-by-byte forging.
     fn valid(&self, src: &SocketAddr, cookie: &[u8; 16]) -> bool {
         let b = Self::bucket();
         let ct_eq = |bucket: u64| {
@@ -76,7 +76,7 @@ impl CookieState {
     }
 }
 
-/// Genereert oplopende session-ids voor nieuwe sessies (rekey).
+/// Generates increasing session ids for new sessions (rekey).
 static SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
 pub fn alloc_session_id() -> u32 {
     next_session_id()
@@ -85,12 +85,12 @@ fn next_session_id() -> u32 {
     SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-// ── Handshake-bedrading over UDP (met fragmentatie) ──────────────────────────
+// ── Handshake wiring over UDP (with fragmentation) ───────────────────────────
 
-/// Bouw de wire-klare datagrammen voor een handshake-bericht: geobfusceerd via
-/// hsobf (statische sleutel, wrap-then-fragment) als `hs_obf` gezet is, anders
-/// het klassieke cleartext `Frame::new_handshake`-pad. Los van het versturen,
-/// zodat een rekey-retry dezelfde datagrammen kan herverzenden.
+/// Build the wire-ready datagrams for a handshake message: obfuscated via
+/// hsobf (static key, wrap-then-fragment) if `hs_obf` is set, otherwise the
+/// classic cleartext `Frame::new_handshake` path. Separate from sending, so
+/// that a rekey retry can resend the same datagrams.
 pub(crate) fn build_handshake_datagrams(
     session_id: u32,
     wire: &[u8],
@@ -105,7 +105,7 @@ pub(crate) fn build_handshake_datagrams(
     }
 }
 
-/// Verstuur een handshake-bericht over de wire (obf of cleartext, zie
+/// Send a handshake message over the wire (obf or cleartext, see
 /// `build_handshake_datagrams`).
 pub(crate) async fn send_handshake(
     socket: &UdpSocket,
@@ -120,10 +120,10 @@ pub(crate) async fn send_handshake(
     Ok(())
 }
 
-/// Push één binnengekomen datagram in de handshake-reassembler; geef het volledige
-/// bericht terug zodra compleet. Op het obf-pad is dit RUIS-TOLERANT: korte of
-/// onbekende datagrammen (en zelfs een compleet-maar-niet-openend blob) leveren
-/// `Ok(None)` op, zodat losse ruis de handshake nooit afbreekt.
+/// Push one incoming datagram into the handshake reassembler; return the full
+/// message once complete. On the obf path this is NOISE-TOLERANT: short or
+/// unknown datagrams (and even a complete-but-not-opening blob) yield
+/// `Ok(None)`, so stray noise never breaks off the handshake.
 pub(crate) fn push_handshake(
     reasm: &mut Reassembler,
     raw: &[u8],
@@ -150,10 +150,10 @@ pub(crate) fn push_handshake(
     }
 }
 
-/// CLIENT/INITIATOR: voer de handshake uit en geef de Established sessie terug.
-/// M-2: bounded retry — bij uitblijvende response wordt hetzelfde init opnieuw
-/// verstuurd; na `HS_MAX_ATTEMPTS` faalt de handshake schoon i.p.v. te hangen.
-/// De response wordt alleen van de `peer` geaccepteerd.
+/// CLIENT/INITIATOR: run the handshake and return the Established session.
+/// M-2: bounded retry — when no response arrives the same init is resent;
+/// after `HS_MAX_ATTEMPTS` the handshake fails cleanly instead of hanging.
+/// The response is only accepted from the `peer`.
 pub async fn run_handshake_initiator(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -162,9 +162,9 @@ pub async fn run_handshake_initiator(
 ) -> Result<crate::session::Session> {
     let session_id = next_session_id();
     let (hs, init_wire) = Handshake::start(auth)?;
-    // Bouw de init-datagrammen één keer en herverzend dezelfde bytes per poging
-    // (ephemeral sleutels blijven constant, net als in de rekey-driver). Bij een
-    // CookieChallenge (L-4) worden ze herbouwd met de cookie erin.
+    // Build the init datagrams once and resend the same bytes per attempt
+    // (ephemeral keys stay constant, as in the rekey driver). On a
+    // CookieChallenge (L-4) they are rebuilt with the cookie inside.
     let mut init_datagrams = build_handshake_datagrams(session_id, &init_wire, hs_obf)?;
 
     let mut buf = vec![0u8; UDP_BUF];
@@ -178,7 +178,7 @@ pub async fn run_handshake_initiator(
             loop {
                 let (n, src) = socket.recv_from(&mut buf).await?;
                 if src != peer {
-                    continue; // accepteer de response alleen van de peer
+                    continue; // accept the response only from the peer
                 }
                 if let Some(w) = push_handshake(&mut reasm, &buf[..n], hs_obf)? {
                     return Ok::<Option<Bytes>, ChameleonError>(Some(w));
@@ -188,9 +188,9 @@ pub async fn run_handshake_initiator(
         .await;
         match got {
             Ok(Ok(Some(w))) => {
-                // L-4: een CookieChallenge i.p.v. een Response — echo de cookie in
-                // de Init en herverzend (volgende lus-iteratie). Zo bewijzen we
-                // return-routability vóór de responder dure crypto doet.
+                // L-4: a CookieChallenge instead of a Response — echo the cookie
+                // in the Init and resend (next loop iteration). This proves
+                // return-routability before the responder does expensive crypto.
                 if w.len() == HANDSHAKE_MSG_LEN && w[1] == HandshakeType::CookieChallenge as u8 {
                     if let Ok(ch) = HandshakeMessage::decode(w) {
                         let mut m = HandshakeMessage::decode(init_wire.clone())?;
@@ -204,8 +204,8 @@ pub async fn run_handshake_initiator(
                     break;
                 }
             }
-            Ok(Ok(None)) => unreachable!("closure geeft Some of een fout"),
-            Ok(Err(e)) => return Err(e), // socket-fout
+            Ok(Ok(None)) => unreachable!("closure yields Some or an error"),
+            Ok(Err(e)) => return Err(e), // socket error
             Err(_) => debug!("handshake init attempt {attempt} timed out, retrying"),
         }
     }
@@ -214,11 +214,11 @@ pub async fn run_handshake_initiator(
         msg: "no handshake response after retries (peer unreachable?)".into(),
     })?;
 
-    // finalize verifieert de responder EN geeft het Confirm-bericht terug.
+    // finalize verifies the responder AND returns the Confirm message.
     match hs.finalize(resp_wire, auth)? {
         (Handshake::Established { session }, confirm_wire) => {
-            // Verstuur het Confirm-bericht zodat de responder óns kan
-            // authenticeren (wederzijdse auth).
+            // Send the Confirm message so the responder can authenticate US
+            // (mutual auth).
             send_handshake(socket, peer, session_id, &confirm_wire, hs_obf).await?;
             info!(
                 "handshake complete (initiator, mutual), session {}",
@@ -233,16 +233,15 @@ pub async fn run_handshake_initiator(
     }
 }
 
-/// SERVER/RESPONDER: wacht op init, stuur response, wacht op confirm,
-/// authenticeer de initiator, geef dan pas de vertrouwde sessie terug.
+/// SERVER/RESPONDER: wait for init, send response, wait for confirm,
+/// authenticate the initiator, only then return the trusted session.
 ///
-/// M-2: robuust tegen een bogus/incomplete init. Fase 1 wacht (onbegrensd — een
-/// server luistert nu eenmaal op zijn peer) op een init die opent én door
-/// `respond` komt; een init die dat niet doet wordt overgeslagen i.p.v. de
-/// server te laten crashen. Fase 2 wacht BOUNDED (`HS_CONFIRM_TIMEOUT`) op de
-/// Confirm van dat ene adres; bij timeout of een ongeldige Confirm vervalt de
-/// half-open handshake en luisteren we opnieuw — zo kan een aanvaller ons niet
-/// permanent vastzetten.
+/// M-2: robust against a bogus/incomplete init. Phase 1 waits (unbounded — a
+/// server simply listens on its peer) for an init that opens AND passes through
+/// `respond`; an init that does not is skipped instead of letting the server
+/// crash. Phase 2 waits BOUNDED (`HS_CONFIRM_TIMEOUT`) for the Confirm from
+/// that one address; on timeout or an invalid Confirm the half-open handshake
+/// lapses and we listen again — so an attacker cannot lock us up permanently.
 pub async fn run_handshake_responder(
     socket: &UdpSocket,
     auth: &dyn Authenticator,
@@ -250,19 +249,19 @@ pub async fn run_handshake_responder(
 ) -> Result<(crate::session::Session, SocketAddr)> {
     let session_id = next_session_id();
     let mut buf = vec![0u8; UDP_BUF];
-    // L-4: per-proces cookie-geheim. De responder doet pas dure crypto ná een
-    // geldige return-routability cookie (zie CookieState).
+    // L-4: per-process cookie secret. The responder only does expensive crypto
+    // after a valid return-routability cookie (see CookieState).
     let cookies = CookieState::new();
 
     'listen: loop {
-        // Fase 1: wacht op een complete, verwerkbare Init.
+        // Phase 1: wait for a complete, processable Init.
         let mut reasm = Reassembler::default();
         let (hs, peer_addr) = loop {
             let (n, src) = socket.recv_from(&mut buf).await?;
             match push_handshake(&mut reasm, &buf[..n], hs_obf) {
                 Ok(Some(init_wire)) => {
-                    // Decode goedkoop om het type + de cookie te lezen VÓÓR we dure
-                    // ML-KEM/DH/ML-DSA-crypto doen (L-4).
+                    // Decode cheaply to read the type + cookie BEFORE we do
+                    // expensive ML-KEM/DH/ML-DSA crypto (L-4).
                     let init_msg = match HandshakeMessage::decode(init_wire.clone()) {
                         Ok(m) => m,
                         Err(e) => {
@@ -275,9 +274,9 @@ pub async fn run_handshake_responder(
                         reasm = Reassembler::default();
                         continue;
                     }
-                    // Geen geldige cookie -> stuur een goedkope CookieChallenge en
-                    // wacht op een herzonden Init. Zo doet een gespoofte bron ons
-                    // NOOIT de dure crypto/grote Response ontlokken.
+                    // No valid cookie -> send a cheap CookieChallenge and wait
+                    // for a resent Init. This way a spoofed source NEVER lures
+                    // us into the expensive crypto/large Response.
                     if !cookies.valid(&src, &init_msg.cookie) {
                         match HandshakeMessage::new_cookie_challenge(cookies.issue(&src)) {
                             Ok(ch) => match ch.encode() {
@@ -292,13 +291,13 @@ pub async fn run_handshake_responder(
                         reasm = Reassembler::default();
                         continue;
                     }
-                    // Geldige cookie -> return-routable -> doe de dure handshake.
+                    // Valid cookie -> return-routable -> do the expensive handshake.
                     match Handshake::respond(init_wire, auth) {
                         Ok((hs, resp_wire)) => {
                             send_handshake(socket, src, session_id, &resp_wire, hs_obf).await?;
                             break (hs, src);
                         }
-                        // Ongeldige init (bv. kapotte ML-KEM-key): overslaan.
+                        // Invalid init (e.g. broken ML-KEM key): skip.
                         Err(e) => {
                             warn!("ignoring bad handshake init from {src}: {e}");
                             reasm = Reassembler::default();
@@ -310,13 +309,13 @@ pub async fn run_handshake_responder(
             }
         };
 
-        // Fase 2: wacht bounded op de Confirm van peer_addr.
+        // Phase 2: wait bounded for the Confirm from peer_addr.
         let mut confirm_reasm = Reassembler::default();
         let confirmed = timeout(HS_CONFIRM_TIMEOUT, async {
             loop {
                 let (n, src) = socket.recv_from(&mut buf).await?;
                 if src != peer_addr {
-                    continue; // negeer andere bronnen tijdens de confirm-fase
+                    continue; // ignore other sources during the confirm phase
                 }
                 if let Some(w) = push_handshake(&mut confirm_reasm, &buf[..n], hs_obf)? {
                     return Ok::<Bytes, ChameleonError>(w);
@@ -343,7 +342,7 @@ pub async fn run_handshake_responder(
                     continue 'listen;
                 }
             },
-            Ok(Err(e)) => return Err(e), // socket-fout
+            Ok(Err(e)) => return Err(e), // socket error
             Err(_) => {
                 warn!("responder: timed out awaiting confirm from {peer_addr} — re-listening");
                 continue 'listen;

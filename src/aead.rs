@@ -1,26 +1,26 @@
-//! Pluggable AEAD-laag voor het datapad.
+//! Pluggable AEAD layer for the data path.
 //!
-//! Het datapad gebruikt één AEAD-cipher per sessie. Twee opties zitten achter
-//! de `Aead`-trait:
+//! The data path uses one AEAD cipher per session. Two options sit behind the
+//! `Aead` trait:
 //!
-//!   • ChaCha20-Poly1305 (via `ring`) — constant-time op ALLE hardware, de
-//!     veilige universele standaard en terugval.
-//!   • AEGIS-256X2 — sneller én een sterkere AEAD dan AES-GCM op CPU's MET
-//!     AES-hardware-instructies; CAESAR-winnaar, open, IETF-draft voor TLS 1.3.
-//!     Zonder AES-hardware valt AEGIS terug op software-AES (trager én
-//!     timing-gevoelig), dus we kiezen 'm ALLEEN als de CPU het ondersteunt.
+//!   • ChaCha20-Poly1305 (via `ring`) — constant-time on ALL hardware, the
+//!     safe universal standard and fallback.
+//!   • AEGIS-256X2 — faster and a stronger AEAD than AES-GCM on CPUs WITH
+//!     AES hardware instructions; CAESAR winner, open, IETF draft for TLS 1.3.
+//!     Without AES hardware AEGIS falls back to software AES (slower and
+//!     timing-sensitive), so we pick it ONLY if the CPU supports it.
 //!
-//! De keuze valt bij sessie-opbouw via `AeadAlgo::preferred()`, die de CPU
-//! bevraagt. De gekozen algoritme-id wordt in de handshake-transcript gebonden
-//! (zie tunnel.rs), zodat een aanvaller de keuze niet naar de zwakkere optie
-//! kan downgraden zonder de MAC te breken.
+//! The choice is made at session setup via `AeadAlgo::preferred()`, which
+//! queries the CPU. The chosen algorithm id is bound into the handshake
+//! transcript (see tunnel.rs), so an attacker cannot downgrade the choice to
+//! the weaker option without breaking the MAC.
 
 use crate::error::{ChameleonError, Result};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use zeroize::Zeroizing;
 
-/// Welke AEAD een sessie gebruikt. Het wire-id (u8) wordt in het transcript
-/// gebonden, dus de getallen zijn stabiel en mogen niet wijzigen.
+/// Which AEAD a session uses. The wire id (u8) is bound into the transcript,
+/// so the numbers are stable and must not change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AeadAlgo {
@@ -44,7 +44,7 @@ impl AeadAlgo {
         self as u8
     }
 
-    /// Nonce-lengte in bytes voor dit algoritme.
+    /// Nonce length in bytes for this algorithm.
     pub fn nonce_len(self) -> usize {
         match self {
             AeadAlgo::ChaCha20Poly1305 => 12, // 96-bit
@@ -52,39 +52,39 @@ impl AeadAlgo {
         }
     }
 
-    /// AEAD-tag-lengte in bytes. De obfuscatie-laag (obf.rs) gebruikt dit om de
-    /// MTU-veilige padding-limiet te berekenen; de tag is ook de bron van de
-    /// header-protection sample (altijd >= SAMPLE_LEN = 16).
+    /// AEAD tag length in bytes. The obfuscation layer (obf.rs) uses this to
+    /// compute the MTU-safe padding limit; the tag is also the source of the
+    /// header-protection sample (always >= SAMPLE_LEN = 16).
     pub fn tag_len(self) -> usize {
         match self {
             AeadAlgo::ChaCha20Poly1305 => 16, // Poly1305 tag
-            AeadAlgo::Aegis256X2 => 32,       // 256-bit tag (zie AEGIS_TAG_LEN)
+            AeadAlgo::Aegis256X2 => 32,       // 256-bit tag (see AEGIS_TAG_LEN)
         }
     }
 
-    /// De voorkeurskeuze voor DEZE machine, EENMALIG bepaald en gecached.
+    /// The preferred choice for THIS machine, determined ONCE and cached.
     ///
-    /// "Heeft AES-NI" bleek een te grove maat: op oudere AES-NI-CPU's zonder
-    /// brede SIMD (bv. Westmere) valt de `aegis`-crate terug op traag software-
-    /// AES en is AEGIS wél 30× LANGZAMER dan ChaCha (die via `ring` eigen
-    /// assembly heeft). Daarom kiezen we niet blind op een feature-vlag maar
-    /// meten we bij startup welke cipher hier écht sneller is. Op moderne
-    /// hardware wint AEGIS-256X2 ruim (AES-NI blijft daar de facto de default);
-    /// op deze machine wint ChaCha — automatisch, zonder config.
+    /// "Has AES-NI" turned out too coarse a measure: on older AES-NI CPUs
+    /// without wide SIMD (e.g. Westmere) the `aegis` crate falls back to slow
+    /// software AES and AEGIS is in fact 30× SLOWER than ChaCha (which has its
+    /// own assembly via `ring`). So we don't pick blindly on a feature flag but
+    /// measure at startup which cipher is really faster here. On modern
+    /// hardware AEGIS-256X2 wins comfortably (AES-NI stays the de facto default
+    /// there); on this machine ChaCha wins — automatically, without config.
     ///
-    /// Belangrijk: dit is een lokale voorkeur. Beide peers moeten hetzelfde
-    /// algoritme draaien (zie `negotiate`), want de sessiesleutels en nonce-
-    /// lengtes verschillen per cipher.
+    /// Important: this is a local preference. Both peers must run the same
+    /// algorithm (see `negotiate`), because the session keys and nonce lengths
+    /// differ per cipher.
     pub fn preferred() -> Self {
         use std::sync::OnceLock;
         static PREFERRED: OnceLock<AeadAlgo> = OnceLock::new();
         *PREFERRED.get_or_init(pick_preferred)
     }
 
-    /// Onderhandel het te gebruiken algoritme tussen de eigen voorkeur en die
-    /// van de peer. Regel: gebruik AEGIS alleen als BEIDE kanten het kunnen;
-    /// val anders terug op ChaCha20. Zo werkt een sterke server samen met een
-    /// zwakke client zonder dat iemand een onveilige software-AES draait.
+    /// Negotiate the algorithm to use between our own preference and the
+    /// peer's. Rule: use AEGIS only if BOTH sides can; otherwise fall back to
+    /// ChaCha20. This way a strong server works with a weak client without
+    /// anyone running an unsafe software AES.
     pub fn negotiate(local: Self, peer: Self) -> Self {
         if local == AeadAlgo::Aegis256X2 && peer == AeadAlgo::Aegis256X2 {
             AeadAlgo::Aegis256X2
@@ -94,15 +94,15 @@ impl AeadAlgo {
     }
 }
 
-/// Kan deze CPU AEGIS-256X2 (de 2-laans "X2"-variant) daadwerkelijk uitvoeren?
-/// x86/x86_64: AES-NI ÉN AVX2. AES-NI alléén is NIET genoeg — de X2-variant
-/// verwerkt twee lanes in 256-bits (AVX2) registers, dus op een CPU mét AES-NI
-/// maar ZONDER AVX2 (bv. Xeon X5660 / Westmere, of Sandy/Ivy Bridge) voert de
-/// `aegis`-crate een AVX2-instructie uit die de CPU niet kent → een native
-/// STATUS_ILLEGAL_INSTRUCTION (0xC000001D): een harde crash die géén panic-hook
-/// vangt, en die zelfs de startup-benchmark al velt (die moet AEGIS immers
-/// dráaien om 'm te meten). Daarom gaten we hier, vóór AEGIS ook maar één keer
-/// wordt aangeroepen. aarch64: de AES-crypto-extensie (NEON; geen AVX2-nodig).
+/// Can this CPU actually run AEGIS-256X2 (the 2-lane "X2" variant)?
+/// x86/x86_64: AES-NI AND AVX2. AES-NI alone is NOT enough — the X2 variant
+/// processes two lanes in 256-bit (AVX2) registers, so on a CPU WITH AES-NI
+/// but WITHOUT AVX2 (e.g. Xeon X5660 / Westmere, or Sandy/Ivy Bridge) the
+/// `aegis` crate executes an AVX2 instruction the CPU does not know → a native
+/// STATUS_ILLEGAL_INSTRUCTION (0xC000001D): a hard crash that no panic hook
+/// catches, and that even the startup benchmark trips (it must, after all, run
+/// AEGIS to measure it). So we gate here, before AEGIS is called even once.
+/// aarch64: the AES crypto extension (NEON; no AVX2 needed).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn cpu_can_aegis() -> bool {
     std::arch::is_x86_feature_detected!("aes") && std::arch::is_x86_feature_detected!("avx2")
@@ -115,19 +115,19 @@ fn cpu_can_aegis() -> bool {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 fn cpu_can_aegis() -> bool {
-    false // onbekende architectuur: kies de veilige, universele cipher (ChaCha20)
+    false // unknown architecture: pick the safe, universal cipher (ChaCha20)
 }
 
-/// Bepaal (eenmalig) de snelste veilige cipher voor deze machine.
+/// Determine (once) the fastest safe cipher for this machine.
 fn pick_preferred() -> AeadAlgo {
-    // Kan deze CPU AEGIS niet veilig draaien (geen AES-NI+AVX2), dan is AEGIS
-    // geen optie — en we mogen 'm niet eens BENCHMARKEN, want dat draait AEGIS
-    // en crasht al (illegale instructie). ChaCha20 (via ring) is overal
-    // constant-time en snel.
+    // If this CPU cannot run AEGIS safely (no AES-NI+AVX2), then AEGIS is not
+    // an option — and we may not even BENCHMARK it, because that runs AEGIS
+    // and already crashes (illegal instruction). ChaCha20 (via ring) is
+    // constant-time and fast everywhere.
     if !cpu_can_aegis() {
         return AeadAlgo::ChaCha20Poly1305;
     }
-    // Mét AES-NI: meet welke écht sneller is (lager = sneller).
+    // With AES-NI: measure which is really faster (lower = faster).
     let chacha = bench_seal(AeadAlgo::ChaCha20Poly1305);
     let aegis = bench_seal(AeadAlgo::Aegis256X2);
     let choice = if aegis <= chacha {
@@ -144,15 +144,15 @@ fn pick_preferred() -> AeadAlgo {
     choice
 }
 
-/// Micro-benchmark: tijd om een reeks MTU-pakketten met dit algoritme te
-/// verzegelen. Klein gehouden zodat de startup-kost verwaarloosbaar is
-/// (< ~5 ms op moderne hardware; tientallen ms op een trage AES-NI-CPU).
+/// Micro-benchmark: time to seal a batch of MTU packets with this algorithm.
+/// Kept small so the startup cost is negligible (< ~5 ms on modern hardware;
+/// tens of ms on a slow AES-NI CPU).
 fn bench_seal(algo: AeadAlgo) -> std::time::Duration {
     use std::time::Instant;
     let key = Zeroizing::new([0u8; 32]);
     let dir = match make_directional(algo, &key) {
         Ok(d) => d,
-        Err(_) => return std::time::Duration::MAX, // niet bruikbaar → nooit kiezen
+        Err(_) => return std::time::Duration::MAX, // unusable → never chosen
     };
     let nonce = vec![0u8; algo.nonce_len()];
     let pt = [0u8; 1200];
@@ -167,17 +167,17 @@ fn bench_seal(algo: AeadAlgo) -> std::time::Duration {
     t.elapsed()
 }
 
-// ── De Aead-trait ────────────────────────────────────────────────────────────
+// ── The Aead trait ───────────────────────────────────────────────────────────
 
-/// Eén richting (tx óf rx) van een sessie-cipher. Versleutelt/ontsleutelt
-/// in-place-achtig met een per-pakket nonce die uit (salt, counter) komt.
-/// `aad` (associated data) wordt mee-geauthenticeerd maar niet versleuteld;
-/// het datapad bindt hier de frame-header in (type/session_id/counter), zodat
-/// knoeien met de zichtbare header de tag-verificatie laat falen.
+/// One direction (tx or rx) of a session cipher. Encrypts/decrypts in an
+/// in-place-like manner with a per-packet nonce derived from (salt, counter).
+/// `aad` (associated data) is authenticated but not encrypted; the data path
+/// binds the frame header in here (type/session_id/counter), so tampering with
+/// the visible header makes tag verification fail.
 pub trait DirectionalAead: Send + Sync {
-    /// Versleutel `plaintext`, geef ciphertext+tag terug.
+    /// Encrypt `plaintext`, return ciphertext+tag.
     fn seal(&self, nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>>;
-    /// Ontsleutel `ciphertext` (incl. tag), geef plaintext terug.
+    /// Decrypt `ciphertext` (incl. tag), return plaintext.
     fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>>;
 }
 
@@ -224,7 +224,7 @@ impl DirectionalAead for ChaChaDir {
 
 use aegis::aegis256x2::Aegis256X2;
 
-const AEGIS_TAG_LEN: usize = 32; // we gebruiken de 256-bit tag
+const AEGIS_TAG_LEN: usize = 32; // we use the 256-bit tag
 
 pub struct AegisDir {
     key: [u8; 32],
@@ -245,7 +245,7 @@ impl DirectionalAead for AegisDir {
         n.copy_from_slice(nonce);
         let cipher = Aegis256X2::<AEGIS_TAG_LEN>::new(&self.key, &n);
         let (mut ct, tag) = cipher.encrypt(plaintext, aad);
-        // Wire-formaat: ciphertext || tag (zelfde stijl als ring's append-tag).
+        // Wire format: ciphertext || tag (same style as ring's append-tag).
         ct.extend_from_slice(&tag);
         Ok(ct)
     }
@@ -267,9 +267,9 @@ impl DirectionalAead for AegisDir {
     }
 }
 
-// De AEGIS-sleutel staat als plain [u8;32] in het proces (de `aegis`-crate neemt
-// geen Zeroizing-sleutel). Wis 'm expliciet bij drop zodat hij niet in een core
-// dump/swap achterblijft. ChaCha via `ring` wist zijn eigen sleutel al bij drop.
+// The AEGIS key lives as plain [u8;32] in the process (the `aegis` crate takes
+// no Zeroizing key). Wipe it explicitly on drop so it does not linger in a core
+// dump/swap. ChaCha via `ring` already wipes its own key on drop.
 impl Drop for AegisDir {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -277,7 +277,7 @@ impl Drop for AegisDir {
     }
 }
 
-// ── Constructor: bouw de juiste richting-cipher voor een algoritme ───────────
+// ── Constructor: build the right direction cipher for an algorithm ───────────
 
 pub fn make_directional(
     algo: AeadAlgo,
@@ -298,9 +298,9 @@ mod tests {
         let key = Zeroizing::new([0x11u8; 32]);
         let dir = ChaChaDir::new(&key).unwrap();
         let nonce = [0x22u8; 12];
-        let ct = dir.seal(&nonce, b"hdr", b"geheim bericht").unwrap();
+        let ct = dir.seal(&nonce, b"hdr", b"secret message").unwrap();
         let pt = dir.open(&nonce, b"hdr", &ct).unwrap();
-        assert_eq!(&pt[..], b"geheim bericht");
+        assert_eq!(&pt[..], b"secret message");
     }
 
     #[test]
@@ -308,9 +308,9 @@ mod tests {
         let key = Zeroizing::new([0x33u8; 32]);
         let dir = AegisDir::new(&key).unwrap();
         let nonce = [0x44u8; 32];
-        let ct = dir.seal(&nonce, b"hdr", b"geheim bericht").unwrap();
+        let ct = dir.seal(&nonce, b"hdr", b"secret message").unwrap();
         let pt = dir.open(&nonce, b"hdr", &ct).unwrap();
-        assert_eq!(&pt[..], b"geheim bericht");
+        assert_eq!(&pt[..], b"secret message");
     }
 
     #[test]
@@ -319,20 +319,20 @@ mod tests {
         let dir = AegisDir::new(&key).unwrap();
         let nonce = [0x66u8; 32];
         let mut ct = dir.seal(&nonce, b"hdr", b"abc").unwrap();
-        ct[0] ^= 0xFF; // knoei met de ciphertext
+        ct[0] ^= 0xFF; // tamper with the ciphertext
         assert!(dir.open(&nonce, b"hdr", &ct).is_err());
     }
 
     #[test]
     fn aad_mismatch_is_rejected() {
-        // Geauthenticeerde header: wijzigen van de AAD (bv. een vervalst
-        // session_id/type in de frame-header) moet de verificatie laten falen.
+        // Authenticated header: changing the AAD (e.g. a forged session_id/type
+        // in the frame header) must make verification fail.
         // ChaCha20: 12-byte nonce.
         let c = ChaChaDir::new(&Zeroizing::new([0x77u8; 32])).unwrap();
         let ct = c.seal(&[0x01u8; 12], b"header-A", b"payload").unwrap();
         assert!(
             c.open(&[0x01u8; 12], b"header-B", &ct).is_err(),
-            "ChaCha: andere AAD moet falen"
+            "ChaCha: different AAD must fail"
         );
         assert_eq!(
             &c.open(&[0x01u8; 12], b"header-A", &ct).unwrap()[..],
@@ -344,7 +344,7 @@ mod tests {
         let ct = a.seal(&[0x02u8; 32], b"header-A", b"payload").unwrap();
         assert!(
             a.open(&[0x02u8; 32], b"header-B", &ct).is_err(),
-            "AEGIS: andere AAD moet falen"
+            "AEGIS: different AAD must fail"
         );
         assert_eq!(
             &a.open(&[0x02u8; 32], b"header-A", &ct).unwrap()[..],

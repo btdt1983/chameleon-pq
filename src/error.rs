@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Centrale fout-hiërarchie voor het hele systeem.
+/// Central error hierarchy for the whole system.
 #[derive(Debug, Error)]
 pub enum ChameleonError {
     #[error("UDP / IO error: {0}")]

@@ -1,5 +1,5 @@
-//! Cryptografische kern: pluggable peer-authenticatie (Authenticator-trait),
-//! het handshake-transcript, en key-derivation helpers.
+//! Cryptographic core: pluggable peer authentication (Authenticator trait),
+//! the handshake transcript, and key-derivation helpers.
 
 use crate::error::{ChameleonError, Result};
 use pqcrypto_mldsa::mldsa65;
@@ -10,23 +10,23 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use zeroize::Zeroizing;
 
-// ── Authenticator-trait: het uitbreidingspunt voor hybride auth ──────────────
+// ── Authenticator trait: the extension point for hybrid auth ─────────────────
 
-/// Een ondertekenings-/verificatieschema voor het handshake-transcript.
-/// ML-DSA klikt er later naast via HybridAuth zonder de state machine te raken.
+/// A signing/verification scheme for the handshake transcript. ML-DSA later
+/// clicks in alongside via HybridAuth without touching the state machine.
 pub trait Authenticator: Send + Sync {
     fn sign(&self, transcript_hash: &[u8; 32]) -> Result<Vec<u8>>;
     fn verify(&self, transcript_hash: &[u8; 32], signature: &[u8]) -> Result<()>;
     fn signature_len(&self) -> usize;
     fn scheme(&self) -> &'static str;
 
-    /// Een SYMMETRISCHE binding aan de identiteiten van beide partijen (eigen +
-    /// peer, byte-lexicografisch gesorteerd zodat initiator en responder dezelfde
-    /// waarde afleiden). Wordt in het transcript geabsorbeerd (L-6) zodat de
-    /// handtekeningen niet alleen de ephemeral sleutels binden maar ook WIE er
-    /// tekent — dat sluit unknown-key-share af. Mag leeg zijn voor een leg die
-    /// geen symmetrische binding kan leveren (bv. ML-DSA, dat de eigen pub niet
-    /// bewaart); een andere leg draagt de binding dan.
+    /// A SYMMETRIC binding to the identities of both parties (own + peer,
+    /// byte-lexicographically sorted so initiator and responder derive the same
+    /// value). Absorbed into the transcript (L-6) so the signatures bind not
+    /// only the ephemeral keys but also WHO is signing — this closes off
+    /// unknown-key-share. May be empty for a leg that cannot provide a
+    /// symmetric binding (e.g. ML-DSA, which does not keep its own pub);
+    /// another leg then carries the binding.
     fn identity_binding(&self) -> Vec<u8>;
 }
 
@@ -35,7 +35,7 @@ pub trait Authenticator: Send + Sync {
 pub const ED25519_SIG_LEN: usize = 64;
 pub const ED25519_PUB_LEN: usize = 32;
 
-/// Eigen keypair + VOORGEDEELDE peer-pub (uit config, out-of-band).
+/// Own keypair + PRE-SHARED peer pub (from config, out-of-band).
 pub struct Ed25519Auth {
     keypair: Ed25519KeyPair,
     peer_pub: [u8; ED25519_PUB_LEN],
@@ -52,8 +52,8 @@ impl Ed25519Auth {
         self.keypair.public_key().as_ref()
     }
 
-    /// Leid de publieke sleutel af uit een seed, zonder een peer-sleutel nodig
-    /// te hebben. Handig voor keygen en voor tests die beide kanten opzetten.
+    /// Derive the public key from a seed, without needing a peer key. Handy
+    /// for keygen and for tests that set up both sides.
     pub fn derive_public(seed: &[u8]) -> [u8; ED25519_PUB_LEN] {
         let keypair = Ed25519KeyPair::from_seed_unchecked(seed)
             .expect("invalid Ed25519 seed in derive_public");
@@ -91,8 +91,8 @@ impl Authenticator for Ed25519Auth {
     }
 
     fn identity_binding(&self) -> Vec<u8> {
-        // Sorteer eigen + peer Ed25519-pubkey zodat beide kanten dezelfde binding
-        // afleiden (symmetrisch: initiator en responder hebben own/peer omgekeerd).
+        // Sort own + peer Ed25519 pubkey so both sides derive the same binding
+        // (symmetric: initiator and responder have own/peer reversed).
         let own: &[u8] = self.public_key();
         let peer: &[u8] = &self.peer_pub;
         let (lo, hi) = if own <= peer {
@@ -109,13 +109,13 @@ impl Authenticator for Ed25519Auth {
 
 // ── ML-DSA-65 (FIPS 204) via pqcrypto-mldsa ──────────────────────────────────
 //
-// De post-quantum tegenhanger van Ed25519. ML-DSA's veiligheid berust op
-// roostergebaseerde aannames die (anders dan de discrete-log van Ed25519)
-// naar verwachting óók tegen een kwantumcomputer standhouden. We draaien 'm
-// als TWEEDE leg naast Ed25519 in een HybridAuth: de handtekening geldt pas
-// als BEIDE legs valideren, dus de authenticatie blijft staan zolang er ten
-// minste één schema heel is. Sleutels zijn voorgedeeld (out-of-band), net als
-// de Ed25519-identiteiten — er is dus geen trust-on-first-use-venster.
+// The post-quantum counterpart of Ed25519. ML-DSA's security rests on
+// lattice-based assumptions that (unlike the discrete log of Ed25519) are
+// expected to hold up against a quantum computer too. We run it as a SECOND
+// leg alongside Ed25519 in a HybridAuth: the signature only holds if BOTH
+// legs validate, so the authentication stands as long as at least one scheme
+// is intact. Keys are pre-shared (out-of-band), just like the Ed25519
+// identities — so there is no trust-on-first-use window.
 
 pub struct MlDsaAuth {
     secret: mldsa65::SecretKey,
@@ -123,15 +123,15 @@ pub struct MlDsaAuth {
 }
 
 impl MlDsaAuth {
-    /// Genereer een nieuw ML-DSA-65 keypair. Geeft (public, secret) als rauwe
-    /// bytes terug — geschikt om hex te coderen voor keygen/config.
+    /// Generate a new ML-DSA-65 keypair. Returns (public, secret) as raw
+    /// bytes — suitable to hex-encode for keygen/config.
     pub fn generate() -> (Vec<u8>, Vec<u8>) {
         let (pk, sk) = mldsa65::keypair();
         (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
     }
 
-    /// Bouw uit de eigen secret key en de VOORGEDEELDE publieke sleutel van
-    /// de peer (beide rauwe bytes, bv. uit hex in config).
+    /// Build from our own secret key and the PRE-SHARED public key of the
+    /// peer (both raw bytes, e.g. from hex in config).
     pub fn from_keys(secret: &[u8], peer_pub: &[u8]) -> Result<Self> {
         let secret = mldsa65::SecretKey::from_bytes(secret)
             .map_err(|_| ChameleonError::Kdf("invalid ML-DSA secret key".into()))?;
@@ -140,7 +140,7 @@ impl MlDsaAuth {
         Ok(Self { secret, peer_pub })
     }
 
-    /// Verwachte lengtes van de sleutelmaterialen, voor validatie/diagnostiek.
+    /// Expected lengths of the key materials, for validation/diagnostics.
     pub fn public_key_len() -> usize {
         mldsa65::public_key_bytes()
     }
@@ -170,8 +170,8 @@ impl Authenticator for MlDsaAuth {
         })
     }
 
-    // ML-DSA-handtekeningen hebben een vaste lengte; HybridAuth kan er daarom
-    // veilig op offset op slicen.
+    // ML-DSA signatures have a fixed length; HybridAuth can therefore safely
+    // slice them at an offset.
     fn signature_len(&self) -> usize {
         mldsa65::signature_bytes()
     }
@@ -180,15 +180,15 @@ impl Authenticator for MlDsaAuth {
     }
 
     fn identity_binding(&self) -> Vec<u8> {
-        // ML-DSA bewaart alleen de eigen SECRET key (de config levert geen eigen
-        // pub, en pqcrypto leidt 'm niet uit de secret af), dus deze leg kan geen
-        // symmetrische binding leveren. De Ed25519-leg draagt de identiteitsbinding;
-        // beide identiteiten zijn hoe dan ook gepind en worden geverifieerd.
+        // ML-DSA only keeps its own SECRET key (the config provides no own pub,
+        // and pqcrypto does not derive it from the secret), so this leg cannot
+        // provide a symmetric binding. The Ed25519 leg carries the identity
+        // binding; both identities are pinned and verified anyway.
         Vec::new()
     }
 }
 
-// ── HybridAuth: combineert N legs, eist dat ALLE valideren ───────────────────
+// ── HybridAuth: combines N legs, requires that ALL validate ──────────────────
 
 pub struct HybridAuth {
     legs: Vec<Box<dyn Authenticator>>,
@@ -237,8 +237,8 @@ impl Authenticator for HybridAuth {
     }
 
     fn identity_binding(&self) -> Vec<u8> {
-        // Concateneer de bindingen van alle legs (in vaste volgorde). In de
-        // praktijk draagt de Ed25519-leg de binding en levert ML-DSA een lege.
+        // Concatenate the bindings of all legs (in fixed order). In practice
+        // the Ed25519 leg carries the binding and ML-DSA provides an empty one.
         let mut v = Vec::new();
         for leg in &self.legs {
             v.extend_from_slice(&leg.identity_binding());
@@ -247,7 +247,7 @@ impl Authenticator for HybridAuth {
     }
 }
 
-// ── Transcript: rollende hash die de hele handshake bindt ────────────────────
+// ── Transcript: rolling hash binding the entire handshake ────────────────────
 
 #[derive(Clone)]
 pub struct Transcript {
@@ -289,11 +289,11 @@ pub fn derive_shared(x_ss: &[u8], mlkem_ss: &[u8]) -> Zeroizing<[u8; 32]> {
     okm
 }
 
-/// Bind een transcript-handtekening aan een ROL (initiator vs responder) via
-/// domeinscheiding. Zonder dit tekenen beide kanten exact dezelfde transcript-
-/// hash `th`, wat een gereflecteerde handtekening zou toelaten als de peers ooit
-/// een identiteitssleutel delen. Door per rol een eigen label vóór `th` te
-/// hashen gaan de twee handtekeningen aantoonbaar over verschillende berichten.
+/// Bind a transcript signature to a ROLE (initiator vs responder) via domain
+/// separation. Without this, both sides sign the exact same transcript hash
+/// `th`, which would allow a reflected signature if the peers ever share an
+/// identity key. By hashing a per-role label before `th`, the two signatures
+/// provably cover different messages.
 pub fn role_bound_hash(label: &[u8], transcript_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(label);
@@ -301,11 +301,11 @@ pub fn role_bound_hash(label: &[u8], transcript_hash: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Leid een GEDEELD session_id af uit het gedeelde geheim (I-13). Beide kanten
-/// hebben na de handshake hetzelfde `shared` en komen dus op hetzelfde id uit —
-/// geen proces-globale teller meer die kan desyncen. Vers per handshake
-/// (ephemeral shared), dus uniek over rekeys. Niet-geheim: puur een demux-tag,
-/// net als WireGuards receiver-index; de veiligheid is de AEAD-tag.
+/// Derive a SHARED session_id from the shared secret (I-13). After the
+/// handshake both sides have the same `shared` and thus arrive at the same id
+/// — no more process-global counter that can desync. Fresh per handshake
+/// (ephemeral shared), so unique across rekeys. Non-secret: purely a demux tag,
+/// like WireGuard's receiver index; the security is the AEAD tag.
 pub fn derive_session_id(shared: &[u8; 32]) -> u32 {
     let mut h = Sha256::new();
     h.update(b"Chameleon-PQ-v1 session-id");
@@ -314,11 +314,11 @@ pub fn derive_session_id(shared: &[u8; 32]) -> u32 {
     u32::from_le_bytes([d[0], d[1], d[2], d[3]])
 }
 
-/// Bereken een return-routability cookie voor een bronadres (L-4). Puur een
-/// anti-DoS-token: bewijst dat de afzender op `src` kan ontvangen vóór de
-/// responder dure ML-KEM/DH/ML-DSA-crypto doet of een grote Response stuurt.
-/// HMAC-SHA256 over (ip ‖ poort ‖ tijdvenster), afgekapt tot 16 bytes; niet in
-/// het transcript (raakt de sleutelafleiding niet).
+/// Compute a return-routability cookie for a source address (L-4). Purely an
+/// anti-DoS token: proves the sender can receive on `src` before the responder
+/// does expensive ML-KEM/DH/ML-DSA crypto or sends a large Response.
+/// HMAC-SHA256 over (ip ‖ port ‖ time window), truncated to 16 bytes; not in
+/// the transcript (does not affect key derivation).
 pub fn compute_cookie(secret: &[u8; 32], src: &SocketAddr, time_bucket: u64) -> [u8; 16] {
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
     let mut ctx = hmac::Context::with_key(&key);
@@ -351,7 +351,7 @@ mod tests {
     fn mldsa_sign_verify_roundtrip() {
         let (a_pub, a_sk) = MlDsaAuth::generate();
         let (b_pub, b_sk) = MlDsaAuth::generate();
-        // a ondertekent, b verifieert a's handtekening met a's publieke sleutel.
+        // a signs, b verifies a's signature with a's public key.
         let a = MlDsaAuth::from_keys(&a_sk, &b_pub).unwrap();
         let b = MlDsaAuth::from_keys(&b_sk, &a_pub).unwrap();
 
@@ -359,21 +359,21 @@ mod tests {
         let sig = a.sign(&th).unwrap();
         assert_eq!(sig.len(), a.signature_len());
         b.verify(&th, &sig)
-            .expect("geldige ML-DSA-handtekening verifieert");
+            .expect("valid ML-DSA signature verifies");
 
-        // Een gewijzigd transcript moet falen.
+        // A changed transcript must fail.
         let mut other = th;
         other[0] ^= 0xFF;
         assert!(
             b.verify(&other, &sig).is_err(),
-            "ander transcript -> verificatie faalt"
+            "different transcript -> verification fails"
         );
     }
 
     #[test]
     fn hybrid_requires_all_legs() {
-        // Hybride van Ed25519 + ML-DSA. De verifier krijgt een GELDIGE Ed25519-leg
-        // maar een KAPOTTE ML-DSA-leg -> het geheel moet falen.
+        // Hybrid of Ed25519 + ML-DSA. The verifier gets a VALID Ed25519 leg
+        // but a BROKEN ML-DSA leg -> the whole thing must fail.
         let signer_seed = [7u8; 32];
         let signer_ed_pub = Ed25519Auth::derive_public(&signer_seed);
         let (signer_pq_pub, signer_pq_sk) = MlDsaAuth::generate();
@@ -383,7 +383,7 @@ mod tests {
             Box::new(Ed25519Auth::new(&signer_seed, signer_ed_pub).unwrap()),
             Box::new(MlDsaAuth::from_keys(&signer_pq_sk, &verifier_pq_pub).unwrap()),
         ]);
-        // Verifier verwacht signer's Ed25519 (correct) maar een VERKEERDE PQ-pub.
+        // Verifier expects signer's Ed25519 (correct) but a WRONG PQ pub.
         let (wrong_pq_pub, _) = MlDsaAuth::generate();
         let verifier = HybridAuth::new(vec![
             Box::new(Ed25519Auth::new(&[8u8; 32], signer_ed_pub).unwrap()),
@@ -393,11 +393,11 @@ mod tests {
         let th = [0x11u8; 32];
         let sig = signer.sign(&th).unwrap();
         assert_eq!(sig.len(), signer.signature_len());
-        // Ed25519-leg klopt, ML-DSA-leg niet -> hybride verificatie faalt.
+        // Ed25519 leg valid, ML-DSA leg invalid -> hybrid verification fails.
         assert!(
             verifier.verify(&th, &sig).is_err(),
-            "hybride auth moet falen als ook maar één leg niet valideert"
+            "hybrid auth must fail if even a single leg does not validate"
         );
-        let _ = signer_pq_pub; // (publieke sleutel van signer, hier niet nodig)
+        let _ = signer_pq_pub; // (signer's public key, not needed here)
     }
 }
