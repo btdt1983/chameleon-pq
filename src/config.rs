@@ -1,14 +1,14 @@
-//! TOML-configuratie en CLI voor Chameleon-PQ.
+//! TOML configuration and CLI for Chameleon-PQ.
 //!
-//! Voorbeeld config.toml:
+//! Example config.toml:
 //!
 //!   [identity]
-//!   ed25519_seed_hex   = "0101...01"   # 32 bytes hex = eigen private seed
-//!   peer_ed25519_pub_hex = "0909...09" # 32 bytes hex = peer's publieke sleutel
+//!   ed25519_seed_hex   = "0101...01"   # 32 bytes hex = own private seed
+//!   peer_ed25519_pub_hex = "0909...09" # 32 bytes hex = peer's public key
 //!
 //!   [network]
 //!   bind_addr   = "0.0.0.0:51820"
-//!   server_addr = "1.2.3.4:51820"   # alleen nodig in client-modus
+//!   server_addr = "1.2.3.4:51820"   # only needed in client mode
 //!
 //!   [tun]
 //!   name    = "chameleon0"
@@ -35,11 +35,11 @@ use zeroize::Zeroizing;
     about   = "Hybrid post-quantum VPN (ML-KEM-768 + X25519 + Ed25519)",
 )]
 pub struct Cli {
-    /// Pad naar config.toml
+    /// Path to config.toml
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
-    /// Verhoog verbositeit (-v = debug, -vv = trace)
+    /// Increase verbosity (-v = debug, -vv = trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -49,19 +49,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Start als server (wacht op inkomende verbindingen)
+    /// Start as server (wait for incoming connections)
     Server {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
-    /// Start als client (verbindt naar server)
+    /// Start as client (connect to server)
     Client {
         #[arg(long)]
         server: Option<SocketAddr>,
     },
-    /// Genereer een nieuw Ed25519 keypair (print naar stdout)
+    /// Generate a new Ed25519 keypair (print to stdout)
     Keygen,
-    /// Valideer het configuratiebestand
+    /// Validate the configuration file
     Check,
 }
 
@@ -82,24 +82,24 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdentityConfig {
-    /// Eigen Ed25519 seed: 32 bytes als lowercase hex-string.
+    /// Own Ed25519 seed: 32 bytes as a lowercase hex string.
     pub ed25519_seed_hex: String,
-    /// Voorgedeelde publieke sleutel van de peer: 32 bytes hex.
+    /// Peer's pre-shared public key: 32 bytes hex.
     pub peer_ed25519_pub_hex: String,
-    /// Eigen ML-DSA-65 secret key (hex). Optioneel: aanwezig => hybride
-    /// (Ed25519 + ML-DSA) peer-authenticatie; afwezig => alleen Ed25519.
-    /// Moet samen met `peer_mldsa_pub_hex` worden gezet.
+    /// Own ML-DSA-65 secret key (hex). Optional: present => hybrid
+    /// (Ed25519 + ML-DSA) peer authentication; absent => Ed25519 only.
+    /// Must be set together with `peer_mldsa_pub_hex`.
     #[serde(default)]
     pub mldsa_secret_hex: Option<String>,
-    /// Voorgedeelde ML-DSA-65 publieke sleutel van de peer (hex).
+    /// Peer's pre-shared ML-DSA-65 public key (hex).
     #[serde(default)]
     pub peer_mldsa_pub_hex: Option<String>,
 }
 
 impl IdentityConfig {
     pub fn seed_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
-        // Zeroizing: de private seed wordt gewist zodra de caller 'm laat vallen,
-        // zodat hij niet in een core dump/swap achterblijft.
+        // Zeroizing: the private seed is wiped as soon as the caller drops it,
+        // so it doesn't linger in a core dump/swap.
         Ok(Zeroizing::new(hex_to_32(
             &self.ed25519_seed_hex,
             "identity.ed25519_seed_hex",
@@ -109,8 +109,8 @@ impl IdentityConfig {
         hex_to_32(&self.peer_ed25519_pub_hex, "identity.peer_ed25519_pub_hex")
     }
 
-    /// Eigen ML-DSA secret key als bytes, indien geconfigureerd. Zeroizing zodat
-    /// de secret key bij drop uit het geheugen wordt gewist.
+    /// Own ML-DSA secret key as bytes, if configured. Zeroizing so the
+    /// secret key is wiped from memory on drop.
     pub fn mldsa_secret_bytes(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         self.mldsa_secret_hex
             .as_deref()
@@ -118,7 +118,7 @@ impl IdentityConfig {
             .transpose()
     }
 
-    /// Voorgedeelde ML-DSA publieke sleutel van de peer als bytes, indien geconfigureerd.
+    /// Peer's pre-shared ML-DSA public key as bytes, if configured.
     pub fn peer_mldsa_pub_bytes(&self) -> Result<Option<Vec<u8>>> {
         self.peer_mldsa_pub_hex
             .as_deref()
@@ -126,7 +126,7 @@ impl IdentityConfig {
             .transpose()
     }
 
-    /// True als beide ML-DSA-velden zijn gezet (hybride auth gevraagd).
+    /// True if both ML-DSA fields are set (hybrid auth requested).
     pub fn has_mldsa(&self) -> bool {
         self.mldsa_secret_hex.is_some() && self.peer_mldsa_pub_hex.is_some()
     }
@@ -165,19 +165,19 @@ pub struct TunConfig {
 pub struct EngineConfig {
     #[serde(default = "default_linger")]
     pub batch_linger_us: u64,
-    /// Aantal crypto-worker-threads voor parallelle seal/open (Fase C).
-    /// 0 = automatisch = alle logische cores. Verlaag om cores vrij te houden
-    /// voor de reactor/TUN. Alleen van invloed op het snelle (unpaced) pad.
+    /// Number of crypto worker threads for parallel seal/open (Phase C).
+    /// 0 = automatic = all logical cores. Lower it to keep cores free
+    /// for the reactor/TUN. Only affects the fast (unpaced) path.
     #[serde(default)]
     pub workers: usize,
-    /// UDP-GSO op verzenden (meerdere datagrammen in één syscall). Standaard UIT:
-    /// het bundelt reeds-verzegelde datagrammen tot één grote gesegmenteerde send,
-    /// wat op sommige paden (bv. een Hyper-V vSwitch of NIC-offload die Linux-GSO
-    /// niet doorlaat) tot MASSAAL pakketverlies leidt — gemeten: een download die
-    /// instortte van 300 naar 47 Mbit met 8000 retransmits. Per-pakket verzenden
-    /// (uit) is overal correct; de doorvoerwinst van GSO is bovendien alleen echt
-    /// als het per-pakket-syscall-pad de bottleneck is, niet de crypto/CPU. Zet
-    /// alleen `true` op een bewezen-schoon Linux↔Linux-pad.
+    /// UDP GSO on send (multiple datagrams in one syscall). Default OFF: it
+    /// bundles already-sealed datagrams into one large segmented send, which
+    /// on some paths (e.g. a Hyper-V vSwitch or NIC offload that doesn't pass
+    /// Linux GSO) causes MASSIVE packet loss — measured: a download that
+    /// collapsed from 300 to 47 Mbit with 8000 retransmits. Per-packet send
+    /// (off) is correct everywhere; GSO's throughput gain is moreover only
+    /// real when the per-packet syscall path is the bottleneck, not the
+    /// crypto/CPU. Set `true` only on a proven-clean Linux↔Linux path.
     #[serde(default)]
     pub gso: bool,
 }
@@ -192,47 +192,47 @@ impl Default for EngineConfig {
     }
 }
 
-// ── Obfuscatie (verkeersanalyse-weerstand op het datapad) ────────────────────
+// ── Obfuscation (traffic-analysis resistance on the data path) ───────────────
 
-/// Padding-beleid voor het geobfusceerde datapad. Verbergt de pakketgrootte
-/// (die anders exact de plaintext-lengte lekt) ten koste van bandbreedte.
-/// Wordt afgebeeld op `obf::PadPolicy`.
+/// Padding policy for the obfuscated data path. Hides the packet size
+/// (which otherwise leaks the exact plaintext length) at the cost of bandwidth.
+/// Maps to `obf::PadPolicy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PaddingPolicy {
-    /// Geen padding — laagste overhead, grootte lekt de lengte.
+    /// No padding — lowest overhead, size leaks the length.
     Off,
-    /// Pad naar grootteklassen — verbergt de exacte lengte, matige overhead.
+    /// Pad to size classes — hides the exact length, moderate overhead.
     #[default]
     Bucketed,
-    /// Pad elk pakket naar de MTU-veilige maximumgrootte — beste obfuscatie,
-    /// hoogste bandbreedte-kost.
+    /// Pad every packet to the MTU-safe maximum size — best obfuscation,
+    /// highest bandwidth cost.
     Full,
 }
 
-/// `[obfuscation]`-sectie. Standaard AAN met bucketed padding (clean break t.o.v.
-/// 0.1.0; zie ook de PROTO_VERSION-bump). Zet `enabled = false` voor het
-/// klassieke, niet-geobfusceerde datapad-frame (bv. voor debugging).
+/// `[obfuscation]` section. Default ON with bucketed padding (clean break from
+/// 0.1.0; see also the PROTO_VERSION bump). Set `enabled = false` for the
+/// classic, non-obfuscated data-path frame (e.g. for debugging).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObfuscationConfig {
     #[serde(default = "default_obf_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub padding: PaddingPolicy,
-    /// Obfusceer óók de handshake-envelope (Fase 2, hsobf.rs). Standaard aan;
-    /// wijzigt het wireformat, dus beide kanten moeten dit aan hebben staan.
+    /// Also obfuscate the handshake envelope (Phase 2, hsobf.rs). Default on;
+    /// changes the wire format, so both sides must have this enabled.
     #[serde(default = "default_hs_obf_enabled")]
     pub handshake: bool,
-    /// Optioneel gedeeld obfuscatie-geheim (hex) voor de handshake. Afwezig =>
-    /// de handshake-obfuscatiesleutel wordt afgeleid uit de voorgedeelde
-    /// Ed25519-pubkeys (nul config). Aanwezig => sterker (een tegenstander die
-    /// alleen de pubkeys heeft kan dan niet de-obfusceren). Op beide kanten gelijk.
+    /// Optional shared obfuscation secret (hex) for the handshake. Absent =>
+    /// the handshake obfuscation key is derived from the pre-shared
+    /// Ed25519 pubkeys (zero config). Present => stronger (an adversary who
+    /// only has the pubkeys then cannot de-obfuscate). Identical on both sides.
     #[serde(default)]
     pub psk_hex: Option<String>,
 }
 
 impl ObfuscationConfig {
-    /// Het optionele handshake-obfuscatie-geheim als bytes, indien gezet.
+    /// The optional handshake obfuscation secret as bytes, if set.
     pub fn psk_bytes(&self) -> Result<Option<Vec<u8>>> {
         self.psk_hex
             .as_deref()
@@ -252,50 +252,50 @@ impl Default for ObfuscationConfig {
     }
 }
 
-// ── Traffic shaping (timing-/cover-traffic-obfuscatie, Fase 3) ───────────────
+// ── Traffic shaping (timing/cover-traffic obfuscation, Phase 3) ──────────────
 
-/// Vorm-modus voor de constant-rate pacer. Afgebeeld op `pacer::ShapeMode`.
+/// Shape mode for the constant-rate pacer. Maps to `pacer::ShapeMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrafficMode {
-    /// Constant bit-rate: altijd op tempo, ook idle. Sterkste timing-verberging,
-    /// maar constante bandbreedtekost 24/7 (ook wanneer er niets stroomt).
+    /// Constant bit-rate: always at tempo, even when idle. Strongest timing
+    /// concealment, but constant bandwidth cost 24/7 (even when nothing flows).
     Cbr,
-    /// Adaptief: pace tijdens activiteit + cooldown, stil wanneer echt idle.
-    /// De STANDAARD: geen bandbreedte in rust, wél burst-verberging tijdens
-    /// activiteit. Grof actief-vs-idle lekt weer (bewuste afweging vs. CBR).
+    /// Adaptive: pace during activity + cooldown, silent when truly idle.
+    /// The DEFAULT: no bandwidth at rest, but burst concealment during
+    /// activity. Coarse active-vs-idle leaks again (deliberate trade-off vs. CBR).
     #[default]
     Adaptive,
 }
 
-/// Voorgedefinieerd verkeersprofiel: zet `mode`/`rate_pps`/`burst` in één keer
-/// goed zodat een gebruiker niet zelf de doorvoer-vs-verhulling-afweging hoeft te
-/// rekenen. Het profiel WINT; de losse velden hieronder gelden alleen bij
-/// `custom`. Zie `effective()` voor de exacte waarden per profiel.
+/// Predefined traffic profile: sets `mode`/`rate_pps`/`burst` correctly in
+/// one go so a user doesn't have to work out the throughput-vs-concealment
+/// trade-off themselves. The profile WINS; the individual fields below apply
+/// only with `custom`. See `effective()` for the exact values per profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrafficProfile {
-    /// Max anti-analyse: CBR, laag plafond (~5 Mbit/s), constante bandbreedte 24/7.
-    /// Voor licht verkeer waar onzichtbaarheid boven snelheid gaat.
+    /// Max anti-analysis: CBR, low ceiling (~5 Mbit/s), constant bandwidth 24/7.
+    /// For light traffic where invisibility outweighs speed.
     Stealth,
-    /// Adaptive, ruim plafond (~115 Mbit/s), STIL in rust. Timing verborgen
-    /// tijdens gebruik; goede algemene VPN-ervaring. Opt-in voor timing-resistentie.
+    /// Adaptive, generous ceiling (~115 Mbit/s), SILENT at rest. Timing hidden
+    /// during use; good general VPN experience. Opt-in for timing resistance.
     Balanced,
-    /// Max snelheid mét timing-pacing: adaptive, hoog plafond (~460 Mbit/s).
-    /// Voor wie snelheid boven maximale verhulling stelt maar tóch cover wil.
+    /// Max speed with timing pacing: adaptive, high ceiling (~460 Mbit/s).
+    /// For those who put speed above maximal concealment but still want cover.
     Throughput,
-    /// STANDAARD: GEEN timing-shaping (pacer uit). Native timing en snelheid — het
-    /// WireGuard-vergelijkbare profiel (packet-vorm-obfuscatie via [obfuscation]
-    /// blijft wél aan). Geen bescherming tegen timing-/burst-analyse; kies
-    /// `balanced`/`stealth` als je die afweging andersom wilt.
+    /// DEFAULT: NO timing shaping (pacer off). Native timing and speed — the
+    /// WireGuard-comparable profile (packet-shape obfuscation via [obfuscation]
+    /// stays on). No protection against timing/burst analysis; choose
+    /// `balanced`/`stealth` if you want that trade-off the other way.
     #[default]
     Off,
-    /// Gebruik de losse `enabled`/`mode`/`rate_pps`/`burst`-velden hieronder.
+    /// Use the individual `enabled`/`mode`/`rate_pps`/`burst` fields below.
     Custom,
 }
 
 impl TrafficProfile {
-    /// Alle profielen in vaste volgorde — voor UI-keuzelijsten (client-GUI).
+    /// All profiles in fixed order — for UI selection lists (client GUI).
     pub const ALL: [TrafficProfile; 5] = [
         TrafficProfile::Stealth,
         TrafficProfile::Balanced,
@@ -317,8 +317,8 @@ impl std::fmt::Display for TrafficProfile {
     }
 }
 
-/// De uiteindelijke, doorgerekende traffic-parameters nadat het profiel is
-/// toegepast. Dit is wat het datapad (`tunnel_loops`) daadwerkelijk gebruikt.
+/// The final, resolved traffic parameters after the profile has been
+/// applied. This is what the data path (`tunnel_loops`) actually uses.
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveTraffic {
     pub enabled: bool,
@@ -328,28 +328,28 @@ pub struct EffectiveTraffic {
     pub cooldown_ms: u64,
 }
 
-/// `[traffic]`-sectie: constant-rate pacing + cover-traffic tegen timing-analyse.
-/// Kies een `profile` (standaard `off`); alleen bij `profile = "custom"`
-/// gelden de losse `mode`/`rate_pps`/`burst`-velden. De effectieve rate
-/// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte (CBR) ALS het
-/// doorvoerplafond.
+/// `[traffic]` section: constant-rate pacing + cover traffic against timing
+/// analysis. Choose a `profile` (default `off`); only with `profile = "custom"`
+/// do the individual `mode`/`rate_pps`/`burst` fields apply. The effective rate
+/// (`rate_pps` × `burst`) is BOTH the constant bandwidth (CBR) AND the
+/// throughput ceiling.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrafficConfig {
-    /// Voorgedefinieerd profiel; standaard `off`. Wint van de losse velden
-    /// tenzij op `custom` gezet.
+    /// Predefined profile; default `off`. Wins over the individual fields
+    /// unless set to `custom`.
     #[serde(default)]
     pub profile: TrafficProfile,
     #[serde(default = "default_traffic_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub mode: TrafficMode,
-    /// Emissie-slots per seconde (het tempo van de ticker).
+    /// Emission slots per second (the ticker's tempo).
     #[serde(default = "default_rate_pps")]
     pub rate_pps: u32,
-    /// Pakketten per slot (token-bucket-diepte). Constante rate = rate_pps × burst.
+    /// Packets per slot (token-bucket depth). Constant rate = rate_pps × burst.
     #[serde(default = "default_burst")]
     pub burst: u16,
-    /// Adaptive: hoelang na het laatste echte pakket cover blijft doorlopen (ms).
+    /// Adaptive: how long cover keeps running after the last real packet (ms).
     #[serde(default = "default_cooldown_ms")]
     pub cooldown_ms: u64,
 }
@@ -368,9 +368,9 @@ impl Default for TrafficConfig {
 }
 
 impl TrafficConfig {
-    /// Reken het profiel uit naar concrete parameters. De preset-profielen
-    /// negeren de losse `enabled`/`mode`/`rate_pps`/`burst`-velden (op
-    /// `cooldown_ms` na); alleen `custom` gebruikt ze rechtstreeks.
+    /// Resolve the profile into concrete parameters. The preset profiles
+    /// ignore the individual `enabled`/`mode`/`rate_pps`/`burst` fields
+    /// (except `cooldown_ms`); only `custom` uses them directly.
     pub fn effective(&self) -> EffectiveTraffic {
         use TrafficProfile::*;
         let cd = self.cooldown_ms;
@@ -383,7 +383,7 @@ impl TrafficConfig {
                 burst: 2,
                 cooldown_ms: cd,
             },
-            // 3000×4 = 12k pps × ~1232 B ≈ 115 Mbit/s, alleen tijdens activiteit.
+            // 3000×4 = 12k pps × ~1232 B ≈ 115 Mbit/s, only during activity.
             Balanced => EffectiveTraffic {
                 enabled: true,
                 mode: TrafficMode::Adaptive,
@@ -391,7 +391,7 @@ impl TrafficConfig {
                 burst: 4,
                 cooldown_ms: cd,
             },
-            // 6000×8 = 48k pps × ~1232 B ≈ 460 Mbit/s, alleen tijdens activiteit.
+            // 6000×8 = 48k pps × ~1232 B ≈ 460 Mbit/s, only during activity.
             Throughput => EffectiveTraffic {
                 enabled: true,
                 mode: TrafficMode::Adaptive,
@@ -399,7 +399,7 @@ impl TrafficConfig {
                 burst: 8,
                 cooldown_ms: cd,
             },
-            // Pacer uit — WireGuard-vergelijkbaar (native timing/snelheid).
+            // Pacer off — WireGuard-comparable (native timing/speed).
             Off => EffectiveTraffic {
                 enabled: false,
                 mode: self.mode,
@@ -407,7 +407,7 @@ impl TrafficConfig {
                 burst: self.burst,
                 cooldown_ms: cd,
             },
-            // Volledig handmatig.
+            // Fully manual.
             Custom => EffectiveTraffic {
                 enabled: self.enabled,
                 mode: self.mode,
@@ -434,9 +434,9 @@ fn default_netmask() -> String {
     "255.255.255.0".into()
 }
 fn default_mtu() -> u16 {
-    // MTU-veilig voor het geobfusceerde datapad: pakket + obf-overhead moet in
-    // één ≤1280-byte datagram passen (zie SAFE_TUN_MTU in validate). Net als
-    // WireGuard (tunnel-MTU = pad − overhead) sturen we niet groter dan past.
+    // MTU-safe for the obfuscated data path: packet + obf overhead must fit
+    // in one ≤1280-byte datagram (see SAFE_TUN_MTU in validate). Like
+    // WireGuard (tunnel MTU = path − overhead) we don't send larger than fits.
     1200
 }
 fn default_linger() -> u64 {
@@ -480,15 +480,15 @@ impl AppConfig {
     fn validate(&self) -> Result<()> {
         self.identity.seed_bytes()?;
         self.identity.peer_pub_bytes()?;
-        // ML-DSA is optioneel, maar de twee velden horen bij elkaar: een halve
-        // configuratie (alleen secret óf alleen peer-pub) is bijna zeker een
-        // vergissing en zou stilletjes naar Ed25519-only terugvallen.
+        // ML-DSA is optional, but the two fields belong together: a half
+        // configuration (only secret or only peer-pub) is almost certainly a
+        // mistake and would silently fall back to Ed25519 only.
         match (
             &self.identity.mldsa_secret_hex,
             &self.identity.peer_mldsa_pub_hex,
         ) {
             (Some(_), Some(_)) | (None, None) => {
-                // Valideer dat de sleutels parsen als ze er zijn.
+                // Validate that the keys parse if they are present.
                 self.identity.mldsa_secret_bytes()?;
                 self.identity.peer_mldsa_pub_bytes()?;
             }
@@ -507,11 +507,11 @@ impl AppConfig {
                 msg: format!("tun.mtu {} is below minimum 576", self.tun.mtu),
             });
         }
-        // Bovengrens voor het geobfusceerde datapad: een IP-pakket + de
-        // obf-overhead moet in één MTU-veilig datagram (1280) passen, anders
-        // fragmenteert IP — dat breekt de constante grootte én is zelf een
-        // vingerafdruk. 1280 − header(13) − max AEAD-tag(32, AEGIS) − inner(3)
-        // = 1232. (WireGuard doet hetzelfde: tunnel-MTU nooit groter dan past.)
+        // Upper bound for the obfuscated data path: an IP packet + the
+        // obf overhead must fit in one MTU-safe datagram (1280), otherwise
+        // IP fragments — which breaks the constant size and is itself a
+        // fingerprint. 1280 − header(13) − max AEAD tag(32, AEGIS) − inner(3)
+        // = 1232. (WireGuard does the same: tunnel MTU never larger than fits.)
         const SAFE_TUN_MTU: u16 = 1232;
         if self.obfuscation.enabled && self.tun.mtu > SAFE_TUN_MTU {
             return Err(ChameleonError::Handshake {
@@ -524,8 +524,8 @@ impl AppConfig {
                 ),
             });
         }
-        // Optioneel handshake-obfuscatie-PSK: als gezet, moet hij parseren en
-        // niet absurd kort zijn (te weinig entropie zou de obfuscatie verzwakken).
+        // Optional handshake obfuscation PSK: if set, it must parse and
+        // not be absurdly short (too little entropy would weaken the obfuscation).
         if let Some(psk) = self.obfuscation.psk_bytes()? {
             if psk.len() < 16 {
                 return Err(ChameleonError::Handshake {
@@ -537,18 +537,18 @@ impl AppConfig {
                 });
             }
         }
-        // Handshake-obfuscatie zonder datapad-obfuscatie is zinloos én breekt de
-        // demux (cleartext data zou als handshake-ruis worden gedropt).
+        // Handshake obfuscation without data-path obfuscation is pointless and
+        // breaks the demux (cleartext data would be dropped as handshake noise).
         if self.obfuscation.handshake && !self.obfuscation.enabled {
             return Err(ChameleonError::Handshake {
                 state: "config".into(),
                 msg: "obfuscation.handshake requires obfuscation.enabled = true".into(),
             });
         }
-        // Traffic shaping (Fase 3): cover-pakketten rijden op het geobfusceerde
-        // datapad, dus vereist obfuscation.enabled; rate/burst moeten >= 1.
-        // Valideer op de EFFECTIEVE waarden (na profiel-resolutie), zodat een
-        // `custom`-profiel met onzin-waarden alsnog gevangen wordt.
+        // Traffic shaping (Phase 3): cover packets ride on the obfuscated
+        // data path, so it requires obfuscation.enabled; rate/burst must be >= 1.
+        // Validate on the EFFECTIVE values (after profile resolution), so a
+        // `custom` profile with nonsense values is still caught.
         let eff = self.traffic.effective();
         if eff.enabled {
             if !self.obfuscation.enabled {
@@ -587,8 +587,8 @@ fn hex_to_32(s: &str, field: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Decodeer een hex-string van willekeurige (even) lengte naar bytes.
-/// Gebruikt voor ML-DSA-sleutels, die veel groter zijn dan 32 bytes.
+/// Decode a hex string of arbitrary (even) length into bytes.
+/// Used for ML-DSA keys, which are much larger than 32 bytes.
 fn hex_to_vec(s: &str, field: &str) -> Result<Vec<u8>> {
     let s = s.trim();
     if s.len() % 2 != 0 {
@@ -655,15 +655,15 @@ mod tests {
             }
             .effective()
         };
-        // stealth: CBR, laag plafond.
+        // stealth: CBR, low ceiling.
         let s = eff(TrafficProfile::Stealth);
         assert!(s.enabled && s.mode == TrafficMode::Cbr && s.rate_pps == 256 && s.burst == 2);
-        // throughput: adaptive, hoog plafond.
+        // throughput: adaptive, high ceiling.
         let th = eff(TrafficProfile::Throughput);
         assert!(
             th.enabled && th.mode == TrafficMode::Adaptive && th.rate_pps == 6000 && th.burst == 8
         );
-        // off: pacer uit (WireGuard-vergelijkbaar).
+        // off: pacer off (WireGuard-comparable).
         assert!(!eff(TrafficProfile::Off).enabled);
     }
 
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(t.profile, TrafficProfile::Throughput);
         let off: TrafficConfig = toml::from_str(r#"profile = "off""#).unwrap();
         assert!(!off.effective().enabled);
-        // Lege sectie → default off.
+        // Empty section → default off.
         let empty: TrafficConfig = toml::from_str("").unwrap();
         assert_eq!(empty.profile, TrafficProfile::Off);
     }
