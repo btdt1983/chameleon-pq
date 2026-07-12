@@ -1,7 +1,7 @@
 #![no_main]
-//! Fuzz het volledige inbound datapad (session.rs): trial-decryptie van een
-//! geobfusceerd datagram over de actieve sessie (unmask → session_id-filter →
-//! AEAD-open → inner unpack). Attacker-input: elk inkomend datagram.
+//! Fuzz the full inbound data path (session.rs): trial-decryption of an
+//! obfuscated datagram over the active session (unmask → session_id filter →
+//! AEAD-open → inner unpack). Attacker input: any incoming datagram.
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 

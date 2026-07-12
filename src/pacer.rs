@@ -1,47 +1,47 @@
-//! Constant-rate pacer (Fase 3): timing-/cover-traffic-obfuscatie.
+//! Constant-rate pacer (Phase 3): timing / cover-traffic obfuscation.
 //!
-//! ACHTERGROND: Fase 1 en 2 maakten elk datagram qua VORM onherkenbaar (geen
-//! zichtbare velden, verborgen groottes). Wat overbleef is de TIMING: een
-//! passieve waarnemer ziet nog steeds WANNEER data stroomt (bursts, idle-gaten).
-//! Deze laag verstuurt pakketten op een VAST ritme en vult lege slots met
-//! dummy/cover-pakketten die de ontvanger stil weggooit, zodat bursts en
-//! idle-vs-actief oplossen in een gelijkmatige stroom.
+//! BACKGROUND: Phases 1 and 2 made every datagram unrecognisable in SHAPE (no
+//! visible fields, hidden sizes). What remained is the TIMING: a passive
+//! observer still sees WHEN data flows (bursts, idle gaps). This layer sends
+//! packets at a FIXED rhythm and fills empty slots with dummy/cover packets
+//! that the receiver silently discards, so bursts and idle-vs-active dissolve
+//! into an even stream.
 //!
-//! Deze module bevat alleen de PURE beslislogica (geen tokio), zodat ze
-//! deterministisch te unit-testen is. De async-lus in main.rs bezit de ticker
-//! en roept `next_emit` per emissie-slot aan.
+//! This module holds only the PURE decision logic (no tokio), so it can be
+//! unit-tested deterministically. The async loop in main.rs owns the ticker
+//! and calls `next_emit` per emission slot.
 //!
-//! EERLIJKE GRENS: constant-rate verbergt de VORM van het verkeer, niet het
-//! BESTAAN van de tunnel (de endpoints zijn bekend, site-to-site) of de totale
-//! duur. Het kost constante bandbreedte en voegt tot ~1/rate latency per pakket
-//! toe; de geconfigureerde rate is zowel de bodem als het plafond.
+//! HONEST LIMIT: constant-rate hides the SHAPE of the traffic, not the
+//! EXISTENCE of the tunnel (the endpoints are known, site-to-site) or the total
+//! duration. It costs constant bandwidth and adds up to ~1/rate latency per
+//! packet; the configured rate is both the floor and the ceiling.
 
 use std::time::{Duration, Instant};
 
-/// Vorm-modus van de pacer.
+/// Shape mode of the pacer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeMode {
-    /// Constant bit-rate: vul ELK slot met een pakket (echt of cover), ook
-    /// wanneer idle. Sterkste timing-verberging; constante bandbreedtekost.
+    /// Constant bit-rate: fill EVERY slot with a packet (real or cover), even
+    /// when idle. Strongest timing concealment; constant bandwidth cost.
     Cbr,
-    /// Adaptief: pace tijdens activiteit en nog `cooldown` daarna; ga stil
-    /// wanneer echt idle. Goedkoper, maar grof actief-vs-idle lekt weer.
+    /// Adaptive: pace during activity and for `cooldown` afterwards; go quiet
+    /// when truly idle. Cheaper, but coarse active-vs-idle leaks again.
     Adaptive,
 }
 
-/// Wat er in één emissie-slot moet gebeuren.
+/// What must happen in one emission slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Emit {
-    /// Er staat een echt pakket klaar → stuur dat.
+    /// A real packet is ready → send it.
     Real,
-    /// Geen echt pakket → stuur een cover/dummy-pakket.
+    /// No real packet → send a cover/dummy packet.
     Cover,
-    /// Geen echt pakket en geen cover nodig (Adaptive, idle) → stuur niets.
+    /// No real packet and no cover needed (Adaptive, idle) → send nothing.
     Idle,
 }
 
-/// De pure pacer-toestand. Houdt alleen bij wanneer het laatste ECHTE pakket
-/// vertrok, voor de Adaptive-cooldown.
+/// The pure pacer state. Tracks only when the last REAL packet left, for the
+/// Adaptive cooldown.
 pub struct Pacer {
     mode: ShapeMode,
     cooldown: Duration,
@@ -57,11 +57,11 @@ impl Pacer {
         }
     }
 
-    /// Beslis (en registreer) wat er in één emissie-slot gebeurt.
-    /// `has_real` = of er NU nog een echt pakket in de wachtrij staat;
-    /// `now` = huidige tijd (bepaalt de Adaptive-cooldown). Een `Real` reset
-    /// meteen de cooldown, zodat cover-verkeer nog `cooldown` doorloopt na de
-    /// laatste echte activiteit.
+    /// Decide (and record) what happens in one emission slot.
+    /// `has_real` = whether a real packet is queued RIGHT NOW;
+    /// `now` = current time (drives the Adaptive cooldown). A `Real` resets
+    /// the cooldown immediately, so cover traffic keeps running for `cooldown`
+    /// after the last real activity.
     pub fn next_emit(&mut self, has_real: bool, now: Instant) -> Emit {
         if has_real {
             self.last_real = Some(now);
@@ -85,9 +85,9 @@ mod tests {
     fn cbr_covers_when_idle() {
         let mut p = Pacer::new(ShapeMode::Cbr, Duration::from_millis(500));
         let now = Instant::now();
-        // Echt pakket klaar -> Real.
+        // Real packet ready -> Real.
         assert_eq!(p.next_emit(true, now), Emit::Real);
-        // Niets klaar, CBR -> altijd Cover (ook idle).
+        // Nothing ready, CBR -> always Cover (even idle).
         assert_eq!(p.next_emit(false, now), Emit::Cover);
         assert_eq!(
             p.next_emit(false, now + Duration::from_secs(3600)),
@@ -100,12 +100,12 @@ mod tests {
         let mut p = Pacer::new(ShapeMode::Adaptive, Duration::from_millis(500));
         let t0 = Instant::now();
         assert_eq!(p.next_emit(true, t0), Emit::Real);
-        // Binnen de cooldown na het laatste echte pakket -> nog Cover.
+        // Within the cooldown after the last real packet -> still Cover.
         assert_eq!(
             p.next_emit(false, t0 + Duration::from_millis(100)),
             Emit::Cover
         );
-        // Voorbij de cooldown -> Idle (stil).
+        // Past the cooldown -> Idle (quiet).
         assert_eq!(
             p.next_emit(false, t0 + Duration::from_millis(600)),
             Emit::Idle
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn adaptive_idle_from_start() {
         let mut p = Pacer::new(ShapeMode::Adaptive, Duration::from_millis(500));
-        // Nog nooit een echt pakket -> meteen Idle.
+        // Never a real packet yet -> Idle right away.
         assert_eq!(p.next_emit(false, Instant::now()), Emit::Idle);
     }
 
@@ -124,12 +124,12 @@ mod tests {
         let mut p = Pacer::new(ShapeMode::Adaptive, Duration::from_millis(500));
         let t0 = Instant::now();
         assert_eq!(p.next_emit(true, t0), Emit::Real);
-        // Net voorbij cooldown zonder echt verkeer -> Idle.
+        // Just past cooldown with no real traffic -> Idle.
         assert_eq!(
             p.next_emit(false, t0 + Duration::from_millis(600)),
             Emit::Idle
         );
-        // Nieuw echt pakket reset de klok -> daarna weer Cover binnen cooldown.
+        // A new real packet resets the clock -> Cover again within cooldown.
         let t1 = t0 + Duration::from_secs(1);
         assert_eq!(p.next_emit(true, t1), Emit::Real);
         assert_eq!(

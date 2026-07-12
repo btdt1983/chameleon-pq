@@ -1,25 +1,24 @@
-//! Wire-frame voor het DATApad (blijft onder de MTU).
+//! Wire-frame for the DATA path (stays below the MTU).
 //!
-//! DPI-overwegingen: er is BEWUST geen vaste magic-waarde en geen apart
-//! lengteveld meer. Een constante magic op offset 0 van elk pakket is een
-//! triviaal matchbaar fingerprint; die is verwijderd. De UDP-datagramgrootte
-//! levert de payload-lengte, dus een eigen lengteveld is overbodig. De
-//! resterende headervelden (type, session_id, sequence) zijn nodig om de
-//! sessie/sleutel en de nonce-counter te kiezen — net als WireGuard houden we
-//! die zichtbaar — maar voor Data-frames worden ze als AEAD associated data
-//! meegeauthenticeerd (zie session.rs), zodat knoeien met de header de
-//! tag-verificatie breekt.
+//! DPI considerations: there is DELIBERATELY no fixed magic-value and no
+//! separate length-field anymore. A constant magic at offset 0 of every packet
+//! is a trivially matchable fingerprint; it has been removed. The UDP-datagram
+//! size provides the payload-length, so a dedicated length-field is redundant.
+//! The remaining header-fields (type, session_id, sequence) are needed to
+//! choose the session/key and the nonce-counter — like WireGuard we keep those
+//! visible — but for Data-frames they are authenticated as AEAD associated data
+//! (see session.rs), so tampering with the header breaks the tag-verification.
 //!
-//! EERLIJKE GRENS: dit verkleint de vingerafdruk (geen statische magic, header
-//! geauthenticeerd), maar het is GEEN volledige verkeersanalyse-weerstand —
-//! het type-byte en de timing/grootte-patronen blijven zichtbaar. Volledige
-//! obfuscatie (obfs4-/Shadowsocks-stijl) is toekomstig werk.
+//! HONEST LIMIT: this shrinks the fingerprint (no static magic, header
+//! authenticated), but it is NOT full traffic-analysis resistance — the
+//! type-byte and the timing/size-patterns stay visible. Full obfuscation
+//! (obfs4-/Shadowsocks-style) is future work.
 
 use crate::error::{ChameleonError, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const HEADER_LEN: usize = 13; // type(1) + session_id(4) + sequence(8)
-pub const MAX_PAYLOAD: usize = 1280 - HEADER_LEN; // MTU-veilig datapad
+pub const MAX_PAYLOAD: usize = 1280 - HEADER_LEN; // MTU-safe data path
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +27,10 @@ pub enum FrameType {
     Handshake = 0x02,
     KeepAlive = 0x03,
     Close = 0x04,
-    /// Cover/dummy-verkeer (Fase 3): een inner-type dat de ontvanger stil
-    /// weggooit. Gebruikt door de constant-rate pacer om lege slots te vullen,
-    /// zodat burst- en idle-patronen verdwijnen. Zit alleen in de INNER framing
-    /// (obf.rs), nooit als zichtbaar wire-byte.
+    /// Cover/dummy-traffic (Phase 3): an inner-type that the receiver silently
+    /// discards. Used by the constant-rate pacer to fill empty slots, so that
+    /// burst- and idle-patterns disappear. Sits only in the INNER framing
+    /// (obf.rs), never as a visible wire-byte.
     Padding = 0x05,
 }
 
@@ -98,8 +97,8 @@ impl Frame {
         let frame_type = FrameType::from_u8(raw.get_u8())?;
         let session_id = raw.get_u32_le();
         let sequence = raw.get_u64_le();
-        // Geen apart lengteveld: het UDP-datagram levert de grens, dus de
-        // rest van de buffer is de payload.
+        // No separate length-field: the UDP-datagram provides the boundary, so
+        // the rest of the buffer is the payload.
         let payload = raw.copy_to_bytes(raw.remaining());
         Ok(Self {
             frame_type,
@@ -118,7 +117,7 @@ mod tests {
     fn frame_type_from_u8_covers_padding() {
         assert_eq!(FrameType::from_u8(0x05).unwrap(), FrameType::Padding);
         assert_eq!(FrameType::Padding as u8, 0x05);
-        // Onbekend type blijft een fout (fail-closed).
+        // Unknown type stays an error (fail-closed).
         assert!(FrameType::from_u8(0x06).is_err());
     }
 }

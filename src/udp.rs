@@ -1,20 +1,20 @@
-//! Gebatchte UDP-I/O via `quinn-udp` (GSO op verzenden, GRO op ontvangen), met
-//! graceful per-pakket fallback op oude kernels / niet-Linux.
+//! Batched UDP I/O via `quinn-udp` (GSO on send, GRO on receive), with
+//! graceful per-packet fallback on old kernels / non-Linux.
 //!
-//! ACHTERGROND: een microbenchmark liet zien dat `send_to` (één syscall per
-//! pakket) een harde muur is (~0,18 Mpps op de devbox), *onder* de crypto. Door
-//! meerdere datagrammen in één syscall te versturen (Linux UDP-GSO geeft de
-//! kernel één grote buffer die hij in segmenten splitst) en te ontvangen (GRO
-//! coalesceert meerdere datagrammen) verdwijnt die muur — precies wat
-//! wireguard-go zijn Gbit/s-sprong gaf.
+//! BACKGROUND: a microbenchmark showed that `send_to` (one syscall per
+//! packet) is a hard wall (~0.18 Mpps on the devbox), *below* the crypto. By
+//! sending multiple datagrams in one syscall (Linux UDP-GSO hands the kernel
+//! one large buffer that it splits into segments) and receiving (GRO
+//! coalesces multiple datagrams) that wall disappears — exactly what gave
+//! wireguard-go its Gbit/s jump.
 //!
-//! GEEN wireformat-wijziging: GSO plakt alleen reeds-verzegelde datagrammen aan
-//! elkaar, GRO splitst ontvangen bytes weer in dezelfde datagrammen. De crypto
-//! zit boven deze laag. `quinn-udp` detecteert GSO/GRO en valt vanzelf terug op
-//! per-pakket waar het niet ondersteund wordt.
+//! NO wireformat change: GSO only glues already-sealed datagrams together,
+//! GRO splits received bytes back into the same datagrams. The crypto sits
+//! above this layer. `quinn-udp` detects GSO/GRO and automatically falls back
+//! to per-packet where it is not supported.
 //!
-//! Deze module is de ENIGE plek die de dependency aanraakt; de rest praat met
-//! onze kleine API (`batch_send` / `batch_recv` / `iter_datagrams` /
+//! This module is the ONLY place that touches the dependency; the rest talks
+//! to our small API (`batch_send` / `batch_recv` / `iter_datagrams` /
 //! `group_equal_sized`).
 
 use bytes::Bytes;
@@ -24,32 +24,32 @@ use std::net::SocketAddr;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-/// Aantal berichten dat we per ontvangst-batch aanvragen. Ruimer = elke
-/// recv-syscall trekt meer datagrammen uit de kernel-recv-buffer, wat helpt de
-/// buffer leeg te houden onder bursty download (minder overflow-drops).
+/// Number of messages we request per receive batch. Larger = each recv-syscall
+/// pulls more datagrams out of the kernel recv buffer, which helps keep the
+/// buffer drained under bursty download (fewer overflow drops).
 pub const RECV_BATCH: usize = 32;
-/// Grootte van elke ontvangst-buffer. Groot genoeg voor een flinke GRO-coalesced
-/// reeks MTU-datagrammen; te klein duwt GRO alleen naar minder coalescing (nooit
-/// dataverlies — quinn-udp legt geen half datagram in een buffer).
+/// Size of each receive buffer. Large enough for a sizeable GRO-coalesced run
+/// of MTU datagrams; too small only pushes GRO toward less coalescing (never
+/// data loss — quinn-udp never puts half a datagram in a buffer).
 pub const RECV_BUF: usize = 64 * 1024;
 
-/// Bouw de per-socket GSO/GRO-state (zet de sockopts). Faalt zelden; bij een
-/// niet-ondersteunde kernel rapporteert `max_gso_segments()` gewoon 1.
+/// Build the per-socket GSO/GRO state (sets the sockopts). Rarely fails; on an
+/// unsupported kernel `max_gso_segments()` simply reports 1.
 pub fn socket_state(socket: &UdpSocket) -> io::Result<UdpSocketState> {
     UdpSocketState::new(UdpSockRef::from(socket))
 }
 
-/// Gevraagde kernel-socketbuffer (SO_RCVBUF/SO_SNDBUF). De OS-default is te klein
-/// voor bursty hoge doorvoer: op Windows ~64 KB, in ~2 ms vol bij 220 Mbit. Eén
-/// korte hapering in het (trage) client-ontvangstpad → recv-buffer loopt over →
-/// kernel dropt datagrammen → TCP-retransmits → de download stort in (gemeten:
-/// 8123 retransmits, 47 Mbit). Een ruime buffer absorbeert de bursts zodat TCP
-/// op de echte doorvoer settelt i.p.v. te collapsen.
+/// Requested kernel socket buffer (SO_RCVBUF/SO_SNDBUF). The OS default is too
+/// small for bursty high throughput: on Windows ~64 KB, full in ~2 ms at 220
+/// Mbit. One short stall in the (slow) client receive path → recv buffer
+/// overflows → kernel drops datagrams → TCP retransmits → the download
+/// collapses (measured: 8123 retransmits, 47 Mbit). A large buffer absorbs the
+/// bursts so TCP settles on the real throughput instead of collapsing.
 const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-/// Vergroot SO_RCVBUF/SO_SNDBUF op de UDP-socket (best-effort; het OS clampt naar
-/// zijn maximum — Windows honoreert grote waarden, Linux kapt op net.core.rmem_max
-/// tenzij verhoogd). Faalt niet-fataal; logt wat we daadwerkelijk kregen.
+/// Enlarge SO_RCVBUF/SO_SNDBUF on the UDP socket (best-effort; the OS clamps to
+/// its maximum — Windows honors large values, Linux caps at net.core.rmem_max
+/// unless raised). Fails non-fatally; logs what we actually got.
 pub fn enlarge_socket_buffers(socket: &UdpSocket) {
     let sref = socket2::SockRef::from(socket);
     if let Err(e) = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
@@ -70,8 +70,8 @@ pub fn enlarge_socket_buffers(socket: &UdpSocket) {
     }
 }
 
-/// Maak de ontvangst-buffers + metadata voor `batch_recv` (houdt `quinn_udp`
-/// buiten de aanroeper).
+/// Create the receive buffers + metadata for `batch_recv` (keeps `quinn_udp`
+/// out of the caller).
 pub fn recv_buffers() -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
     (
         vec![vec![0u8; RECV_BUF]; RECV_BATCH],
@@ -79,11 +79,11 @@ pub fn recv_buffers() -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
     )
 }
 
-/// Verstuur een reeks GELIJK-GROTE datagrammen naar één peer in zo min mogelijk
-/// syscalls. Onder GSO gaan tot `max_gso_segments()` segmenten in één `sendmsg`;
-/// anders valt quinn-udp terug op per-pakket. `seg_size` is de grootte van elk
-/// datagram (bij GSO moet elk segment behalve eventueel het laatste die grootte
-/// hebben — gegarandeerd omdat de aanroeper gelijk-grote runs doorgeeft).
+/// Send a run of EQUAL-SIZED datagrams to one peer in as few syscalls as
+/// possible. Under GSO up to `max_gso_segments()` segments go in one `sendmsg`;
+/// otherwise quinn-udp falls back to per-packet. `seg_size` is the size of each
+/// datagram (under GSO every segment except possibly the last must have that
+/// size — guaranteed because the caller passes equal-sized runs).
 pub async fn batch_send(
     socket: &UdpSocket,
     state: &UdpSocketState,
@@ -115,7 +115,7 @@ pub async fn batch_send(
         for d in &datagrams[i..end] {
             buf.extend_from_slice(d);
         }
-        // segment_size None bij één datagram (geen GSO nodig), anders seg_size.
+        // segment_size None for a single datagram (no GSO needed), else seg_size.
         let segment_size = if end - i > 1 { Some(seg_size) } else { None };
         let transmit = Transmit {
             destination: peer,
@@ -134,10 +134,10 @@ pub async fn batch_send(
     Ok(())
 }
 
-/// Ontvang een batch datagrammen (GRO-coalesced waar mogelijk). Vult `storage`
-/// (RECV_BATCH buffers) en `metas`, en geeft het aantal berichten terug. Gebruik
-/// daarna `iter_datagrams(storage, metas, count)` om de losse datagrammen te
-/// doorlopen.
+/// Receive a batch of datagrams (GRO-coalesced where possible). Fills `storage`
+/// (RECV_BATCH buffers) and `metas`, and returns the number of messages. Then
+/// use `iter_datagrams(storage, metas, count)` to walk the individual
+/// datagrams.
 pub async fn batch_recv(
     socket: &UdpSocket,
     state: &UdpSocketState,
@@ -152,8 +152,8 @@ pub async fn batch_recv(
         .iter_mut()
         .map(|b| IoSliceMut::new(b.as_mut_slice()))
         .collect();
-    // `iov` (en dus de &mut op storage) leeft alleen tot het eind van deze fn;
-    // daarna leest de aanroeper storage veilig via `iter_datagrams`.
+    // `iov` (and thus the &mut on storage) lives only until the end of this fn;
+    // afterwards the caller safely reads storage via `iter_datagrams`.
     socket
         .async_io(Interest::READABLE, || {
             state.recv(UdpSockRef::from(socket), &mut iov, metas)
@@ -161,9 +161,9 @@ pub async fn batch_recv(
         .await
 }
 
-/// Doorloop de individuele datagrammen uit een ontvangen batch. Elk bericht kan
-/// (met GRO) meerdere datagrammen bevatten, op `stride`-grenzen; het laatste mag
-/// korter zijn.
+/// Walk the individual datagrams from a received batch. Each message can (with
+/// GRO) contain multiple datagrams, on `stride` boundaries; the last one may be
+/// shorter.
 pub fn iter_datagrams<'a>(
     storage: &'a [Vec<u8>],
     metas: &'a [RecvMeta],
@@ -174,16 +174,16 @@ pub fn iter_datagrams<'a>(
         .zip(storage.iter())
         .flat_map(|(m, buf)| {
             let len = m.len.min(buf.len());
-            // stride 0 (geen GRO) => het hele bericht is één datagram.
+            // stride 0 (no GRO) => the whole message is one datagram.
             let stride = if m.stride == 0 { len } else { m.stride }.max(1);
             let addr = m.addr;
             buf[..len].chunks(stride).map(move |dg| (addr, dg))
         })
 }
 
-/// Splits een batch datagrammen in maximale runs van GELIJKE grootte. Onder
-/// `PadPolicy::Full` is alles even groot → één run → één GSO-call. Onder
-/// Bucketed/Off variëren de groottes → kleinere runs (of runs van 1 = per-pakket).
+/// Split a batch of datagrams into maximal runs of EQUAL size. Under
+/// `PadPolicy::Full` everything is the same size → one run → one GSO call.
+/// Under Bucketed/Off the sizes vary → smaller runs (or runs of 1 = per-packet).
 pub fn group_equal_sized(datagrams: &[Bytes]) -> Vec<(&[Bytes], usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn iter_splits_gro_coalesced_buffer() {
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        // Eén bericht met 3 datagrammen van stride 4, laatste korter (2).
+        // One message with 3 datagrams of stride 4, last one shorter (2).
         let mut storage = vec![vec![0u8; RECV_BUF]; RECV_BATCH];
         storage[0][..10].copy_from_slice(&[1, 1, 1, 1, 2, 2, 2, 2, 3, 3]);
         let mut metas = [meta(addr, 0, 0); RECV_BATCH];
@@ -266,7 +266,7 @@ mod tests {
         storage[0][..5].copy_from_slice(&[9, 9, 9, 9, 9]);
         storage[1][..3].copy_from_slice(&[7, 7, 7]);
         let mut metas = [meta(addr, 0, 0); RECV_BATCH];
-        metas[0] = meta(addr, 5, 0); // stride 0 => één datagram van 5
+        metas[0] = meta(addr, 5, 0); // stride 0 => one datagram of 5
         metas[1] = meta(addr, 3, 0);
         let got: Vec<Vec<u8>> = iter_datagrams(&storage, &metas, 2)
             .map(|(_, d)| d.to_vec())

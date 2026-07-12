@@ -1,8 +1,8 @@
-//! End-to-end tunnel-test over loopback-UDP met een mock-TUN. Draait de ECHTE
-//! tunnel-loops (`chameleon::tunnel_loops::run_tunnel_loops`) aan beide kanten en
-//! stuurt plaintext door de tunnel — dit dekt het volledige datapad dat de
-//! unit-tests niet raken: handshake → encrypt/seal → GSO-send → GRO-recv →
-//! decrypt → mock-TUN, plus de bounded queue / batch-linger flush.
+//! End-to-end tunnel test over loopback UDP with a mock TUN. Runs the REAL
+//! tunnel loops (`chameleon::tunnel_loops::run_tunnel_loops`) on both sides and
+//! sends plaintext through the tunnel — this covers the full data path that the
+//! unit tests don't touch: handshake → encrypt/seal → GSO-send → GRO-recv →
+//! decrypt → mock-TUN, plus the bounded queue / batch-linger flush.
 
 use chameleon::config::AppConfig;
 use chameleon::crypto::{Authenticator, Ed25519Auth};
@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-/// Minimale config: data-obfuscatie AAN, handshake-obfuscatie UIT, pacing UIT
-/// (deterministisch, meteen flushen via de batch-linger). De identity-hex is
-/// dummy — run_tunnel_loops gebruikt alleen [engine]/[obfuscation]/[traffic].
+/// Minimal config: data obfuscation ON, handshake obfuscation OFF, pacing OFF
+/// (deterministic, flush immediately via the batch-linger). The identity hex is
+/// dummy — run_tunnel_loops only uses [engine]/[obfuscation]/[traffic].
 fn test_config() -> AppConfig {
     let toml = r#"
 [identity]
@@ -37,7 +37,7 @@ handshake = false
 [traffic]
 enabled = false
 "#;
-    toml::from_str(toml).expect("test-config parseert")
+    toml::from_str(toml).expect("test config parses")
 }
 
 fn build_engine(session: chameleon::session::Session) -> Arc<CryptoEngine> {
@@ -47,7 +47,7 @@ fn build_engine(session: chameleon::session::Session) -> Arc<CryptoEngine> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnel_e2e_data_flows_both_ways() {
-    // ── Sleutels: server S, client C; beide kennen elkaars pubkey. ──
+    // ── Keys: server S, client C; both know each other's pubkey. ──
     let s_seed = [11u8; 32];
     let c_seed = [22u8; 32];
     let s_pub = Ed25519Auth::derive_public(&s_seed);
@@ -55,21 +55,21 @@ async fn tunnel_e2e_data_flows_both_ways() {
     let server_auth: Arc<dyn Authenticator> = Arc::new(Ed25519Auth::new(&s_seed, c_pub).unwrap());
     let client_auth: Arc<dyn Authenticator> = Arc::new(Ed25519Auth::new(&c_seed, s_pub).unwrap());
 
-    // ── Sockets op loopback. ──
+    // ── Sockets on loopback. ──
     let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let server_addr = server_sock.local_addr().unwrap();
 
-    // ── Handshake: beide kanten concurrent (join! op deze taak, geen spawn, dus
-    //    de sockets hoeven niet 'static te zijn). De initiator retryt + doet de
-    //    L-4-cookie-round-trip tegen de meelopende responder. ──
+    // ── Handshake: both sides concurrent (join! on this task, no spawn, so the
+    //    sockets don't need to be 'static). The initiator retries + does the
+    //    L-4 cookie round-trip against the concurrent responder. ──
     let (resp_res, init_res) = tokio::join!(
         run_handshake_responder(&server_sock, server_auth.as_ref(), None),
         run_handshake_initiator(&client_sock, server_addr, client_auth.as_ref(), None),
     );
     let (server_session, client_addr) = resp_res.expect("responder handshake ok");
     let client_session = init_res.expect("initiator handshake ok");
-    // I-13: beide kanten leiden hetzelfde session_id af → het obf-datapad matcht.
+    // I-13: both sides derive the same session_id → the obf data path matches.
     assert_eq!(server_session.session_id, client_session.session_id);
 
     // ── Engines + mock-TUNs. ──
@@ -78,8 +78,8 @@ async fn tunnel_e2e_data_flows_both_ways() {
     let (server_tun, mut server_handles) = TunPair::new_mock();
     let (client_tun, mut client_handles) = TunPair::new_mock();
 
-    // ── Draai de ECHTE tunnel-loops aan beide kanten (gespawned; TunnelParams is
-    //    owned, dus geen Box::leak meer nodig). ──
+    // ── Run the REAL tunnel loops on both sides (spawned; TunnelParams is
+    //    owned, so no more Box::leak needed). ──
     let params = chameleon::tunnel_loops::TunnelParams::from_config(&test_config());
     let server_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
     let client_stats = Arc::new(chameleon::tunnel_loops::TunnelStats::default());
@@ -111,40 +111,40 @@ async fn tunnel_e2e_data_flows_both_ways() {
         client_traffic_rx,
     ));
 
-    // ── Client → server: injecteer in de client-TUN, lees uit de server-TUN. ──
+    // ── Client → server: inject into the client-TUN, read from the server-TUN. ──
     let up = bytes::Bytes::from_static(b"client says hello through the pq tunnel");
     client_handles.inject_tx.send(up.clone()).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
         .await
-        .expect("server-TUN kreeg binnen 5s data")
-        .expect("kanaal open");
-    assert_eq!(got, up, "client→server plaintext komt intact aan");
+        .expect("server-TUN received data within 5s")
+        .expect("channel open");
+    assert_eq!(got, up, "client→server plaintext arrives intact");
 
-    // ── Server → client (andere richting). ──
+    // ── Server → client (other direction). ──
     let down = bytes::Bytes::from_static(b"server replies over the same tunnel");
     server_handles.inject_tx.send(down.clone()).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), client_handles.drain_rx.recv())
         .await
-        .expect("client-TUN kreeg binnen 5s data")
-        .expect("kanaal open");
-    assert_eq!(got, down, "server→client plaintext komt intact aan");
+        .expect("client-TUN received data within 5s")
+        .expect("channel open");
+    assert_eq!(got, down, "server→client plaintext arrives intact");
 
-    // ── Stats: beide kanten registreerden verkeer (voor de client-UI). ──
+    // ── Stats: both sides registered traffic (for the client UI). ──
     use std::sync::atomic::Ordering;
     assert!(client_stats.connected.load(Ordering::Relaxed));
     assert!(
         client_stats.tx_bytes.load(Ordering::Relaxed) >= up.len() as u64,
-        "client telde de verzonden bytes"
+        "client counted the sent bytes"
     );
     assert!(
         client_stats.rx_bytes.load(Ordering::Relaxed) >= down.len() as u64,
-        "client telde de ontvangen bytes"
+        "client counted the received bytes"
     );
     assert!(client_stats.last_recv_epoch.load(Ordering::Relaxed) > 0);
 }
 
-/// De client-core (`chameleon::client::Client`) verbindt via de publieke API en
-/// stuurt data door de tunnel; de server-kant is handmatig opgezet.
+/// The client core (`chameleon::client::Client`) connects via the public API and
+/// sends data through the tunnel; the server side is set up manually.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn client_core_connects_and_flows() {
     use chameleon::client::Client;
@@ -162,7 +162,7 @@ async fn client_core_connects_and_flows() {
     let server_addr = server_sock.local_addr().unwrap();
     let (server_tun, mut server_handles) = TunPair::new_mock();
 
-    // Server: responder-handshake + tunnel-loops op de achtergrond.
+    // Server: responder handshake + tunnel loops in the background.
     let params = TunnelParams::from_config(&test_config());
     let sa = server_auth.clone();
     let (_srv_traffic_tx, srv_traffic_rx) =
@@ -186,30 +186,30 @@ async fn client_core_connects_and_flows() {
         .await;
     });
 
-    // Client: via de client-core API (bindt zelf een socket, doet de handshake,
-    // start de tunnel-loops, keert terug met een handle).
+    // Client: via the client-core API (binds its own socket, does the handshake,
+    // starts the tunnel loops, returns with a handle).
     let (client_tun, client_handles) = TunPair::new_mock();
     let client = Client::connect(&test_config(), server_addr, client_auth, client_tun)
         .await
-        .expect("client verbindt");
+        .expect("client connects");
     let st = client.status();
-    assert!(st.connected, "client meldt verbonden");
+    assert!(st.connected, "client reports connected");
     assert_eq!(st.peer, server_addr);
 
-    // Data client → server via de mock-TUN.
-    let msg = bytes::Bytes::from_static(b"via de client-core");
+    // Data client → server via the mock-TUN.
+    let msg = bytes::Bytes::from_static(b"via the client-core");
     client_handles.inject_tx.send(msg.clone()).await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
         .await
-        .expect("server kreeg data")
-        .expect("kanaal open");
+        .expect("server received data")
+        .expect("channel open");
     assert_eq!(got, msg);
 
-    // De client-UI ziet de tellers oplopen.
+    // The client UI sees the counters go up.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         client.status().tx_bytes >= msg.len() as u64,
-        "tx_bytes geteld"
+        "tx_bytes counted"
     );
 
     client.disconnect();
