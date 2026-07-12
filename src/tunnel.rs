@@ -1,6 +1,6 @@
-//! Handshake: 2048-byte gepadde berichten met één gedeeld KEM-slot,
-//! fragmentatie voor MTU-veilig transport, en de state machine met
-//! transcript-ondertekening (Ed25519 via de Authenticator-trait).
+//! Handshake: 2048-byte padded messages with one shared KEM slot,
+//! fragmentation for MTU-safe transport, and the state machine with
+//! transcript signing (Ed25519 via the Authenticator trait).
 
 use crate::aead::AeadAlgo;
 use crate::crypto::{
@@ -16,54 +16,54 @@ use ring::hmac;
 use std::collections::HashMap;
 use x25519_dalek::{EphemeralSecret, PublicKey as XPub};
 
-// Vaste berichtgrootte, ruim genoeg voor de HYBRIDE handtekening
-// (Ed25519 64 B + ML-DSA-65 3309 B = 3373 B) bovenop de ML-KEM-pubkey/ct in het
-// KEM-slot. Init/Response/Confirm zijn allemaal even groot en met ruis gepad,
-// zodat de berichtgrootte niets over het type of het gekozen auth-schema
-// verraadt. Post-quantum sleutels zijn nu eenmaal groot; een handshake is een
-// eenmalige gebeurtenis, dus de extra fragmenten kosten niets wezenlijks.
+// Fixed message size, ample for the HYBRID signature
+// (Ed25519 64 B + ML-DSA-65 3309 B = 3373 B) on top of the ML-KEM pubkey/ct in
+// the KEM slot. Init/Response/Confirm are all the same size and noise-padded, so
+// the message size reveals nothing about the type or the chosen auth scheme.
+// Post-quantum keys are simply large; a handshake is a one-time event, so the
+// extra fragments cost nothing meaningful.
 pub const HANDSHAKE_MSG_LEN: usize = 8192;
-// v3: naast het geobfusceerde datapad (v2, obf.rs) is nu ook de HANDSHAKE-
-// envelope geobfusceerd (hsobf.rs, statische-sleutel wrap-then-fragment).
-// v4: de twee transcript-handtekeningen zijn ROL-gebonden (SIG_LABEL_*), zodat
-// responder en initiator niet langer over identieke bytes tekenen (L-5).
-// v5: het transcript absorbeert nu ook de IDENTITEITEN van beide partijen
-// (auth.identity_binding(), L-6), zodat de handtekeningen binden wie er tekent
-// (unknown-key-share-afweer).
-// v6: de KEM is nu FIPS 203 ML-KEM-768 (pqcrypto-mlkem) i.p.v. het pre-standaard
-// Kyber768 (I-11). Zelfde key/ct-groottes (1184/1088) maar een ander algoritme.
-// v7: de handshake draagt nu een return-routability cookie (L-4) en kent een
-// CookieChallenge-berichttype; de responder doet pas dure crypto ná een geldige
-// cookie. Elke versie-bump verandert de handshake; een peer met een oudere
-// handshake faalt daardoor meteen schoon i.p.v. met een verwarrende MAC-fout.
+// v3: besides the obfuscated data path (v2, obf.rs), the HANDSHAKE envelope is
+// now obfuscated too (hsobf.rs, static-key wrap-then-fragment).
+// v4: the two transcript signatures are ROLE-bound (SIG_LABEL_*), so responder
+// and initiator no longer sign over identical bytes (L-5).
+// v5: the transcript now also absorbs the IDENTITIES of both parties
+// (auth.identity_binding(), L-6), so the signatures bind who is signing
+// (unknown-key-share defense).
+// v6: the KEM is now FIPS 203 ML-KEM-768 (pqcrypto-mlkem) instead of pre-standard
+// Kyber768 (I-11). Same key/ct sizes (1184/1088) but a different algorithm.
+// v7: the handshake now carries a return-routability cookie (L-4) and a
+// CookieChallenge message type; the responder does expensive crypto only after
+// a valid cookie. Every version bump changes the handshake, so an older peer
+// fails immediately and cleanly instead of with a confusing MAC error.
 pub const PROTO_VERSION: u8 = 7;
 
-/// Rol-labels voor de domeinscheiding van de transcript-handtekeningen (L-5):
-/// de responder tekent de Response, de initiator de Confirm — nooit over
-/// dezelfde bytes. Ze worden vóór de transcript-hash gehasht (`role_bound_hash`).
+/// Role labels for the domain separation of the transcript signatures (L-5):
+/// the responder signs the Response, the initiator the Confirm — never over
+/// the same bytes. They are hashed before the transcript hash (`role_bound_hash`).
 const SIG_LABEL_RESPONDER: &[u8] = b"Chameleon-PQ-v1 responder proof";
 const SIG_LABEL_INITIATOR: &[u8] = b"Chameleon-PQ-v1 initiator proof";
 
-/// Bovengrens op het aantal gelijktijdig onvoltooide berichten in één
-/// Reassembler. Sinds Fase 2 wordt (bij handshake-obfuscatie) elk niet-data-
-/// datagram een kandidaat-fragment, dus een msg_id-flood zou anders geheugen
-/// kunnen opblazen. Nieuwe msg_id's boven de cap worden genegeerd; samen met
-/// `prune_old` blijft het geheugen begrensd.
+/// Upper bound on the number of simultaneously incomplete messages in one
+/// Reassembler. Since Phase 2, every non-data datagram becomes a candidate
+/// fragment (with handshake obfuscation), so a msg_id flood could otherwise
+/// blow up memory. New msg_ids above the cap are ignored; together with
+/// `prune_old` the memory stays bounded.
 const MAX_PENDING_MSGS: usize = 64;
 
 const X25519_PUB_LEN: usize = 32;
 const MLKEM_PK_LEN: usize = 1184;
 const MLKEM_CT_LEN: usize = 1088;
-const KEM_SLOT_LEN: usize = MLKEM_PK_LEN; // grootste van pub/ct
+const KEM_SLOT_LEN: usize = MLKEM_PK_LEN; // largest of pub/ct
 const MAC_LEN: usize = 32;
-/// Lengte van de return-routability cookie (L-4). HMAC-SHA256 over het bronadres,
-/// afgekapt tot 16 bytes — genoeg tegen forging, niet in het transcript.
+/// Length of the return-routability cookie (L-4). HMAC-SHA256 over the source
+/// address, truncated to 16 bytes — enough against forging, not in the transcript.
 const COOKIE_LEN: usize = 16;
 
 const FRAG_PAYLOAD: usize = 1024;
 const FRAG_HEADER_LEN: usize = 8;
 
-// ── Fragmentatie (alleen handshake) ──────────────────────────────────────────
+// ── Fragmentation (handshake only) ───────────────────────────────────────────
 
 pub fn fragment(msg_id: u32, full: &[u8]) -> Vec<Bytes> {
     let chunks: Vec<&[u8]> = full.chunks(FRAG_PAYLOAD).collect();
@@ -90,16 +90,16 @@ pub struct Reassembler {
 struct PartialMsg {
     total: u16,
     chunks: HashMap<u16, Bytes>,
-    /// Tijdstip waarop het EERSTE fragment binnenkwam. Bewust niet
-    /// ververst bij latere fragmenten: anders kan een aanvaller een
-    /// incomplete entry eindeloos levend houden door af en toe één
-    /// fragment te sturen (precies de DoS die we willen voorkomen).
+    /// Timestamp when the FIRST fragment arrived. Deliberately not
+    /// refreshed on later fragments: otherwise an attacker could keep an
+    /// incomplete entry alive forever by sending one fragment now and
+    /// then (exactly the DoS we want to prevent).
     first_seen: std::time::Instant,
 }
 
 impl Reassembler {
-    /// Cleartext-pad: parse de 8-byte fragment-header en push de delen.
-    /// Gebruikt door de niet-geobfusceerde (fallback) handshake-weg.
+    /// Cleartext path: parse the 8-byte fragment header and push the parts.
+    /// Used by the non-obfuscated (fallback) handshake path.
     pub fn push(&mut self, raw: &[u8]) -> Result<Option<Bytes>> {
         if raw.len() < FRAG_HEADER_LEN {
             return Err(ChameleonError::PacketTooShort {
@@ -115,9 +115,9 @@ impl Reassembler {
         self.push_parts(msg_id, index, total, payload)
     }
 
-    /// Push reeds-geparseerde fragment-delen. Gebruikt door de geobfusceerde
-    /// handshake-weg (hsobf.rs ontmaskert de header vóór deze aanroep). Zelfde
-    /// partial/complete-logica als `push`, met een cap tegen msg_id-floods.
+    /// Push already-parsed fragment parts. Used by the obfuscated handshake
+    /// path (hsobf.rs unmasks the header before this call). Same
+    /// partial/complete logic as `push`, with a cap against msg_id floods.
     pub fn push_parts(
         &mut self,
         msg_id: u32,
@@ -131,8 +131,8 @@ impl Reassembler {
                 msg: "invalid fragment index/total".into(),
             });
         }
-        // DoS-cap: een NIEUW msg_id boven de grens wordt genegeerd, zodat een
-        // stroom willekeurige datagrammen het geheugen niet kan opblazen.
+        // DoS cap: a NEW msg_id above the limit is ignored, so a stream of
+        // random datagrams cannot blow up memory.
         if !self.partials.contains_key(&msg_id) && self.partials.len() >= MAX_PENDING_MSGS {
             return Ok(None);
         }
@@ -166,16 +166,16 @@ impl Reassembler {
         Ok(None)
     }
 
-    /// Verwijder entries die te lang incompleet bleven. Roep dit periodiek
-    /// aan (bv. via een tokio interval) zodat half-afgemaakte berichten geen
-    /// geheugen blijven vasthouden — de State-Bloat-DoS-fix.
+    /// Remove entries that stayed incomplete too long. Call this periodically
+    /// (e.g. via a tokio interval) so half-finished messages don't keep
+    /// holding memory — the State-Bloat-DoS fix.
     pub fn prune_old(&mut self, max_age: std::time::Duration) {
         let now = std::time::Instant::now();
         self.partials
             .retain(|_id, msg| now.duration_since(msg.first_seen) < max_age);
     }
 
-    /// Aantal incomplete berichten dat nu in de buffer staat (voor metrics/tests).
+    /// Number of incomplete messages currently in the buffer (for metrics/tests).
     pub fn pending_count(&self) -> usize {
         self.partials.len()
     }
@@ -188,13 +188,13 @@ impl Reassembler {
 pub enum HandshakeType {
     Init = 0x01,
     Response = 0x02,
-    /// Derde bericht: initiator bevestigt zijn identiteit aan de responder.
-    /// Draagt de handtekening van de initiator over het volledige transcript.
-    /// Maakt de handshake wederzijds geauthenticeerd.
+    /// Third message: the initiator proves its identity to the responder.
+    /// Carries the initiator's signature over the full transcript.
+    /// Makes the handshake mutually authenticated.
     Confirm = 0x03,
-    /// Return-routability challenge (L-4): de responder stuurt dit i.p.v. een
-    /// Response wanneer de Init geen geldige cookie draagt. Kost geen handshake-
-    /// crypto; draagt alleen de cookie (in het `cookie`-veld), rest is noise.
+    /// Return-routability challenge (L-4): the responder sends this instead of a
+    /// Response when the Init carries no valid cookie. Costs no handshake
+    /// crypto; carries only the cookie (in the `cookie` field), the rest is noise.
     CookieChallenge = 0x04,
 }
 
@@ -217,17 +217,17 @@ impl HandshakeType {
 pub struct HandshakeMessage {
     pub version: u8,
     pub msg_type: HandshakeType,
-    /// Voorgestelde/onderhandelde AEAD-cipher (AeadAlgo wire-id). In Init de
-    /// voorkeur van de initiator; in Response de definitieve onderhandelde keuze.
-    /// Zit in het transcript -> downgrade-bestendig.
+    /// Proposed/negotiated AEAD cipher (AeadAlgo wire-id). In Init the
+    /// initiator's preference; in Response the final negotiated choice.
+    /// Included in the transcript -> downgrade-resistant.
     pub aead_algo: u8,
     pub x25519_pub: [u8; X25519_PUB_LEN],
     pub kem: [u8; KEM_SLOT_LEN],
     pub sig: Vec<u8>,
     pub mac: [u8; MAC_LEN],
-    /// Return-routability cookie (L-4). Nul in de eerste Init; door de initiator
-    /// gevuld met de door de responder uitgegeven cookie op de retry. Niet in het
-    /// transcript — puur een anti-DoS-token.
+    /// Return-routability cookie (L-4). Zero in the first Init; filled by the
+    /// initiator with the cookie issued by the responder on the retry. Not in the
+    /// transcript — purely an anti-DoS token.
     pub cookie: [u8; COOKIE_LEN],
 }
 
@@ -300,10 +300,10 @@ impl HandshakeMessage {
         &self.kem[..MLKEM_CT_LEN]
     }
 
-    /// Confirm-bericht: draagt alleen de initiator-handtekening (+ MAC).
-    /// x25519_pub en kem zijn noise — ze dragen geen betekenis in deze fase
-    /// en vallen buiten de transcript-binding. De sig wordt door de caller
-    /// gezet ná het berekenen van het transcript.
+    /// Confirm message: carries only the initiator signature (+ MAC).
+    /// x25519_pub and kem are noise — they carry no meaning in this phase
+    /// and fall outside the transcript binding. The sig is set by the caller
+    /// after computing the transcript.
     pub fn new_confirm(sig_len: usize) -> Result<Self> {
         let mut x25519_pub = [0u8; X25519_PUB_LEN];
         Self::fill_noise(&mut x25519_pub);
@@ -312,7 +312,7 @@ impl HandshakeMessage {
         Ok(Self {
             version: PROTO_VERSION,
             msg_type: HandshakeType::Confirm,
-            aead_algo: 0, // niet van toepassing op Confirm
+            aead_algo: 0, // not applicable to Confirm
             x25519_pub,
             kem,
             sig: vec![0u8; sig_len],
@@ -321,11 +321,11 @@ impl HandshakeMessage {
         })
     }
 
-    /// Bouw een CookieChallenge (L-4): de responder stuurt dit i.p.v. een Response
-    /// als de Init geen geldige cookie draagt. Kost geen handshake-crypto — het
-    /// draagt alleen de uitgegeven `cookie`; x25519_pub/kem/mac zijn noise en de
-    /// sig is leeg, zodat het op de wire (zelfde 8192-byte grootte, geobfusceerd)
-    /// niet van een echte handshake te onderscheiden is.
+    /// Build a CookieChallenge (L-4): the responder sends this instead of a
+    /// Response if the Init carries no valid cookie. Costs no handshake crypto —
+    /// it carries only the issued `cookie`; x25519_pub/kem/mac are noise and the
+    /// sig is empty, so on the wire (same 8192-byte size, obfuscated) it is
+    /// indistinguishable from a real handshake.
     pub fn new_cookie_challenge(cookie: [u8; COOKIE_LEN]) -> Result<Self> {
         let mut x25519_pub = [0u8; X25519_PUB_LEN];
         Self::fill_noise(&mut x25519_pub);
@@ -421,17 +421,17 @@ impl HandshakeMessage {
         b.put_slice(&self.x25519_pub);
         match self.msg_type {
             HandshakeType::Init => {
-                b.put_u8(self.aead_algo); // bind voorgestelde cipher
+                b.put_u8(self.aead_algo); // bind proposed cipher
                 b.put_slice(self.mlkem_pub());
             }
             HandshakeType::Response => {
-                b.put_u8(self.aead_algo); // bind onderhandelde cipher
+                b.put_u8(self.aead_algo); // bind negotiated cipher
                 b.put_slice(self.mlkem_ct());
             }
-            // Confirm voegt geen sleutelmateriaal toe: het transcript is na
-            // de Response bevroren, en Confirm ondertekent juist dat transcript.
-            // Deze functie hoort niet op een Confirm/CookieChallenge te worden
-            // aangeroepen, maar we houden de match compleet en veilig.
+            // Confirm adds no key material: the transcript is frozen after
+            // the Response, and Confirm signs exactly that transcript.
+            // This function should not be called on a Confirm/CookieChallenge,
+            // but we keep the match complete and safe.
             HandshakeType::Confirm | HandshakeType::CookieChallenge => {}
         }
         b.freeze()
@@ -440,33 +440,33 @@ impl HandshakeMessage {
 
 // ── State machine ────────────────────────────────────────────────────────────
 //
-// Wederzijds geauthenticeerde 3-berichten-handshake:
+// Mutually authenticated 3-message handshake:
 //
-//   1. Init     (initiator -> responder)  : ephemeral sleutels
-//   2. Response (responder -> initiator)  : ephemeral sleutels + responder-sig
-//   3. Confirm  (initiator -> responder)  : initiator-sig over het transcript
+//   1. Init     (initiator -> responder)  : ephemeral keys
+//   2. Response (responder -> initiator)  : ephemeral keys + responder sig
+//   3. Confirm  (initiator -> responder)  : initiator sig over the transcript
 //
-// De responder gaat na Response naar SentResponse en VERTROUWT de sessie
-// pas zodra de Confirm-handtekening klopt. Zo authenticeren beide kanten
-// elkaar, niet alleen de responder.
+// After Response the responder moves to SentResponse and does NOT TRUST the
+// session until the Confirm signature checks out. This way both sides
+// authenticate each other, not just the responder.
 
 pub enum Handshake {
     Idle,
-    /// Initiator: init verstuurd, wacht op response.
+    /// Initiator: init sent, waiting for response.
     SentInit {
         eph_x: EphemeralSecret,
-        // Geboxed: de ML-KEM-secret-key is ~2.4 KB; los gehouden zou hij elke
-        // Handshake-variant (en dus elke move) onnodig groot maken.
+        // Boxed: the ML-KEM secret key is ~2.4 KB; kept inline it would make
+        // every Handshake variant (and thus every move) needlessly large.
         eph_mlkem_sk: Box<mlkem768::SecretKey>,
         transcript: Transcript,
     },
-    /// Responder: response verstuurd, wacht op confirm. Houdt de (nog niet
-    /// vertrouwde) sessie en de transcript-hash vast tot de confirm klopt.
+    /// Responder: response sent, waiting for confirm. Holds the (not yet
+    /// trusted) session and the transcript hash until the confirm checks out.
     SentResponse {
         session: Session,
         transcript_hash: [u8; 32],
     },
-    /// Volledig wederzijds geauthenticeerd.
+    /// Fully mutually authenticated.
     Established {
         session: Session,
     },
@@ -486,7 +486,7 @@ impl Handshake {
             AeadAlgo::preferred().as_u8(),
         )?;
         let mut transcript = Transcript::new();
-        // L-6: bind de identiteiten (eigen + peer, symmetrisch) vóór de rest.
+        // L-6: bind the identities (own + peer, symmetric) before the rest.
         transcript.absorb(&auth.identity_binding());
         transcript.absorb(&msg.transcript_bytes());
         let wire = msg.encode()?;
@@ -500,8 +500,8 @@ impl Handshake {
         ))
     }
 
-    /// RESPONDER stap 1: verwerk Init, bouw Response. Gaat naar SentResponse
-    /// (nog NIET Established — de initiator moet zich eerst bewijzen).
+    /// RESPONDER step 1: process Init, build Response. Moves to SentResponse
+    /// (not yet Established — the initiator must prove itself first).
     pub fn respond(raw: Bytes, auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
         let init = HandshakeMessage::decode(raw)?;
         if init.msg_type != HandshakeType::Init {
@@ -518,12 +518,12 @@ impl Handshake {
         })?;
 
         let mut transcript = Transcript::new();
-        // L-6: bind de identiteiten (eigen + peer, symmetrisch) vóór de rest.
+        // L-6: bind the identities (own + peer, symmetric) before the rest.
         transcript.absorb(&auth.identity_binding());
         transcript.absorb(&init.transcript_bytes());
 
-        // Onderhandel de cipher: initiator-voorstel vs. onze eigen voorkeur.
-        // AEGIS alleen als beide kanten het kunnen, anders ChaCha20.
+        // Negotiate the cipher: initiator proposal vs. our own preference.
+        // AEGIS only if both sides can do it, otherwise ChaCha20.
         let peer_pref = AeadAlgo::from_u8(init.aead_algo).unwrap_or(AeadAlgo::ChaCha20Poly1305);
         let chosen = AeadAlgo::negotiate(AeadAlgo::preferred(), peer_pref);
 
@@ -532,8 +532,8 @@ impl Handshake {
         let x_pub = XPub::from(&eph_x);
         let peer_x = XPub::from(init.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
-        // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
-        // Gemitigeerd door de hybride ML-KEM-leg, maar we falen hier expliciet.
+        // L-9: reject an all-zero (low-order/non-contributory) X25519 result.
+        // Mitigated by the hybrid ML-KEM leg, but we fail explicitly here.
         if x_ss.as_bytes().iter().all(|&b| b == 0) {
             return Err(ChameleonError::Handshake {
                 state: "respond".into(),
@@ -551,18 +551,18 @@ impl Handshake {
         transcript.absorb(&resp.transcript_bytes());
 
         let th = transcript.hash();
-        // Rol-gebonden handtekening (L-5): responder tekent SIG_LABEL_RESPONDER‖th.
+        // Role-bound signature (L-5): responder signs SIG_LABEL_RESPONDER‖th.
         resp.sig = auth.sign(&role_bound_hash(SIG_LABEL_RESPONDER, &th))?;
         let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &mac_key_from(&shared));
         let tag = hmac::sign(&mac_key, &th);
         resp.mac.copy_from_slice(tag.as_ref());
 
         let wire = resp.encode()?;
-        // I-13: het session_id komt uit het gedeelde geheim; beide kanten leiden
-        // hetzelfde af, dus geen proces-globale teller die kan desyncen.
+        // I-13: the session_id comes from the shared secret; both sides derive
+        // the same, so no process-global counter that can desync.
         let session_id = derive_session_id(&shared);
         let session = Session::from_handshake_with_algo(session_id, shared, false, chosen)?;
-        // Bewaar de transcript-hash zodat we straks de Confirm kunnen verifiëren.
+        // Store the transcript hash so we can verify the Confirm later.
         Ok((
             Handshake::SentResponse {
                 session,
@@ -572,10 +572,10 @@ impl Handshake {
         ))
     }
 
-    /// INITIATOR stap 2: verwerk Response, verifieer responder, bouw Confirm.
-    /// De initiator wordt Established (heeft de responder geauthenticeerd) EN
-    /// produceert het Confirm-bericht dat hij terugstuurt zodat de responder
-    /// óók de initiator kan authenticeren.
+    /// INITIATOR step 2: process Response, verify responder, build Confirm.
+    /// The initiator becomes Established (has authenticated the responder) AND
+    /// produces the Confirm message it sends back so the responder can
+    /// authenticate the initiator too.
     pub fn finalize(self, raw: Bytes, auth: &dyn Authenticator) -> Result<(Self, Bytes)> {
         let (eph_x, eph_mlkem_sk, mut transcript) = match self {
             Handshake::SentInit {
@@ -606,7 +606,7 @@ impl Handshake {
         let mlkem_ss = mlkem768::decapsulate(&ct, &eph_mlkem_sk);
         let peer_x = XPub::from(resp.x25519_pub);
         let x_ss = eph_x.diffie_hellman(&peer_x);
-        // L-9: weiger een all-zero (low-order/non-contributory) X25519-uitkomst.
+        // L-9: reject an all-zero (low-order/non-contributory) X25519 result.
         if x_ss.as_bytes().iter().all(|&b| b == 0) {
             return Err(ChameleonError::Handshake {
                 state: "finalize".into(),
@@ -618,7 +618,7 @@ impl Handshake {
         transcript.absorb(&resp.transcript_bytes());
         let th = transcript.hash();
 
-        // Authenticeer de RESPONDER via zijn rol-gebonden handtekening (L-5).
+        // Authenticate the RESPONDER via its role-bound signature (L-5).
         auth.verify(&role_bound_hash(SIG_LABEL_RESPONDER, &th), &resp.sig)?;
         let mac_key = hmac::Key::new(hmac::HMAC_SHA256, &mac_key_from(&shared));
         hmac::verify(&mac_key, &th, &resp.mac).map_err(|_| ChameleonError::Handshake {
@@ -626,27 +626,27 @@ impl Handshake {
             msg: "MAC verification failed".into(),
         })?;
 
-        // Bouw het Confirm-bericht: onze handtekening over hetzelfde transcript.
-        // Hiermee bewijst de initiator zijn identiteit aan de responder.
+        // Build the Confirm message: our signature over the same transcript.
+        // This is how the initiator proves its identity to the responder.
         let mut confirm = HandshakeMessage::new_confirm(auth.signature_len())?;
-        // Rol-gebonden handtekening (L-5): initiator tekent SIG_LABEL_INITIATOR‖th.
+        // Role-bound signature (L-5): initiator signs SIG_LABEL_INITIATOR‖th.
         confirm.sig = auth.sign(&role_bound_hash(SIG_LABEL_INITIATOR, &th))?;
         let tag = hmac::sign(&mac_key, &th);
         confirm.mac.copy_from_slice(tag.as_ref());
         let wire = confirm.encode()?;
 
-        // De responder heeft de definitieve cipher gekozen; lees 'm uit de
-        // Response. Die keuze zit in het transcript, dus als een aanvaller 'm
-        // had veranderd faalt de MAC-verificatie hierboven al.
+        // The responder chose the final cipher; read it from the
+        // Response. That choice is in the transcript, so if an attacker had
+        // changed it the MAC verification above would already fail.
         let chosen = AeadAlgo::from_u8(resp.aead_algo)?;
-        // I-13: hetzelfde afgeleide session_id als de responder (uit `shared`).
+        // I-13: the same derived session_id as the responder (from `shared`).
         let session_id = derive_session_id(&shared);
         let session = Session::from_handshake_with_algo(session_id, shared, true, chosen)?;
         Ok((Handshake::Established { session }, wire))
     }
 
-    /// RESPONDER stap 2: verwerk Confirm, authenticeer de INITIATOR.
-    /// Pas hierna is de sessie wederzijds geauthenticeerd en vertrouwd.
+    /// RESPONDER step 2: process Confirm, authenticate the INITIATOR.
+    /// Only after this is the session mutually authenticated and trusted.
     pub fn confirm(self, raw: Bytes, auth: &dyn Authenticator) -> Result<Self> {
         let (session, transcript_hash) = match self {
             Handshake::SentResponse {
@@ -668,11 +668,11 @@ impl Handshake {
             });
         }
 
-        // Authenticeer de INITIATOR via zijn rol-gebonden handtekening (L-5) over
-        // het transcript. Dit is wat de handshake wederzijds maakt: zonder geldige
-        // initiator-handtekening wordt de sessie NOOIT vertrouwd. De rol-binding
-        // zorgt dat de responder-handtekening (over SIG_LABEL_RESPONDER‖th) hier
-        // niet als initiator-bewijs kan worden gereflecteerd.
+        // Authenticate the INITIATOR via its role-bound signature (L-5) over
+        // the transcript. This is what makes the handshake mutual: without a
+        // valid initiator signature the session is NEVER trusted. The role
+        // binding ensures the responder signature (over SIG_LABEL_RESPONDER‖th)
+        // cannot be reflected here as initiator proof.
         auth.verify(
             &role_bound_hash(SIG_LABEL_INITIATOR, &transcript_hash),
             &conf.sig,

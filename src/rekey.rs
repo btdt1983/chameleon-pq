@@ -1,16 +1,16 @@
-//! Rekey-driver die het gedeelde-socket-probleem oplost.
+//! Rekey driver that solves the shared-socket problem.
 //!
-//! HET PROBLEEM
-//!   run_handshake_initiator leest zelf van de socket (recv_from). Tijdens een
-//!   live tunnel leest de inbound-loop óók van diezelfde socket. Twee lezers op
-//!   één socket = race: de rekey-response wordt door de data-loop opgegeten en
-//!   als data-frame gedropt. De rekey hangt dan voor altijd.
+//! THE PROBLEM
+//!   run_handshake_initiator reads from the socket itself (recv_from). During a
+//!   live tunnel the inbound loop reads from that same socket too. Two readers
+//!   on one socket = race: the rekey response is swallowed by the data loop and
+//!   dropped as a data frame. The rekey then hangs forever.
 //!
-//! DE OPLOSSING
-//!   De inbound-loop blijft de ENIGE lezer. Wanneer hij een Handshake-frame ziet
-//!   midden in een sessie, stuurt hij dat via een kanaal naar deze driver. De
-//!   driver verstuurt zelf (send_to mag wél vanuit meerdere taken) maar ONTVANGT
-//!   uitsluitend via het kanaal. Zo is er precies één socket-lezer.
+//! THE SOLUTION
+//!   The inbound loop stays the ONLY reader. When it sees a Handshake frame
+//!   mid-session, it forwards it via a channel to this driver. The driver sends
+//!   itself (send_to is allowed from multiple tasks) but RECEIVES exclusively
+//!   via the channel. This way there is exactly one socket reader.
 
 use crate::crypto::Authenticator;
 use crate::error::Result;
@@ -25,20 +25,20 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info};
 
-/// Een binnengekomen handshake-fragment, doorgegeven door de inbound-loop.
+/// An incoming handshake fragment, forwarded by the inbound loop.
 pub type HandshakeFrameRx = mpsc::Receiver<Bytes>;
 pub type HandshakeFrameTx = mpsc::Sender<Bytes>;
 
-/// Per-poging wachttijd op de response; bij verlies sturen we het init
-/// opnieuw. Totale tijd = MAX_REKEY_RETRIES * PER_ATTEMPT_TIMEOUT.
+/// Per-attempt wait for the response; on loss we resend the init.
+/// Total time = MAX_REKEY_RETRIES * PER_ATTEMPT_TIMEOUT.
 const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_REKEY_RETRIES: usize = 4;
 
-/// Voer als INITIATOR een rekey uit zonder zelf de socket te lezen.
-/// Response-fragmenten komen binnen via `hs_rx` (gevoed door de inbound-loop).
-/// Bij verlies van het init- of response-pakket wordt het init opnieuw
-/// verstuurd (bounded retry). De ephemeral sleutels blijven over retries
-/// heen constant — alleen de verzending wordt herhaald.
+/// As INITIATOR, run a rekey without reading the socket itself.
+/// Response fragments arrive via `hs_rx` (fed by the inbound loop).
+/// On loss of the init or response packet the init is resent (bounded
+/// retry). The ephemeral keys stay constant across retries — only the
+/// transmission is repeated.
 pub async fn rekey_as_initiator(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -49,21 +49,21 @@ pub async fn rekey_as_initiator(
     hs_obf: Option<&[u8; 32]>,
 ) -> Result<()> {
     let (hs, init_wire) = Handshake::start(auth)?;
-    // Bouw de init-datagrammen één keer (obf of cleartext) en herverzend
-    // dezelfde bytes per retry, zodat een verloren fragment door een latere
-    // poging alsnog compleet kan worden.
+    // Build the init datagrams once (obf or cleartext) and resend the same
+    // bytes per retry, so that a lost fragment can still be completed by a
+    // later attempt.
     let init_datagrams = build_handshake_datagrams(new_session_id, &init_wire, hs_obf)?;
 
-    // Retry-lus: stuur init, wacht op response; bij timeout opnieuw sturen.
-    // De Reassembler wordt per poging vers opgezet zodat een halve oude
-    // response geen latere poging vervuilt.
+    // Retry loop: send init, wait for response; on timeout send again.
+    // The Reassembler is set up fresh per attempt so that a half-received old
+    // response does not pollute a later attempt.
     let mut last_err = crate::error::ChameleonError::Handshake {
         state: "rekey".into(),
         msg: "no attempts made".into(),
     };
 
     for attempt in 1..=MAX_REKEY_RETRIES {
-        // (Her)verstuur het init-bericht.
+        // (Re)send the init message.
         for datagram in &init_datagrams {
             socket.send_to(datagram, peer).await?;
         }
@@ -81,12 +81,12 @@ pub async fn rekey_as_initiator(
 
         match attempt_result {
             Ok(Ok(Some(resp_wire))) => {
-                // finalize verifieert de responder en geeft het Confirm-bericht.
+                // finalize verifies the responder and returns the Confirm message.
                 return match hs.finalize(resp_wire, auth)? {
                     (Handshake::Established { session }, confirm_wire) => {
-                        // Verstuur Confirm zodat de responder ons authenticeert.
+                        // Send Confirm so the responder authenticates us.
                         send_handshake(socket, peer, new_session_id, &confirm_wire, hs_obf).await?;
-                        let sid = session.session_id; // afgeleid session_id (I-13)
+                        let sid = session.session_id; // derived session_id (I-13)
                         sessions.install_new_session(session);
                         info!(
                             "rekey complete after {attempt} attempt(s), mutual — \
@@ -104,9 +104,9 @@ pub async fn rekey_as_initiator(
             Ok(Err(e)) => {
                 last_err = e;
                 break;
-            } // kanaal dicht: stoppen
+            } // channel closed: stop
             Err(_) => {
-                // Timeout op deze poging: log en probeer opnieuw.
+                // Timeout on this attempt: log and retry.
                 debug!("rekey attempt {attempt} timed out, retrying");
                 last_err = crate::error::ChameleonError::Handshake {
                     state: "rekey".into(),
@@ -119,8 +119,8 @@ pub async fn rekey_as_initiator(
     Err(last_err)
 }
 
-/// Plan het opruimen van de vorige sessie na een grace-periode.
-/// Aangeroepen vanuit de tunnel-loop die een Arc<SessionManager> heeft.
+/// Schedule cleanup of the previous session after a grace period.
+/// Called from the tunnel loop that holds an Arc<SessionManager>.
 pub fn schedule_retire(sessions: Arc<SessionManager>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -129,14 +129,14 @@ pub fn schedule_retire(sessions: Arc<SessionManager>) {
     });
 }
 
-/// RESPONDER-kant van een mid-sessie rekey, fase 1: verwerk de binnengekomen
-/// init en stuur de response terug. Installeert de sessie nog NIET — die wordt
-/// pas vertrouwd na een geldige Confirm (fase 2). Geeft de pending handshake
-/// terug zodat de inbound-loop 'm vasthoudt tot de Confirm binnenkomt.
+/// RESPONDER side of a mid-session rekey, phase 1: process the incoming init
+/// and send the response back. Does NOT install the session yet — it is only
+/// trusted after a valid Confirm (phase 2). Returns the pending handshake so
+/// the inbound loop holds onto it until the Confirm arrives.
 ///
-/// Dit tweetraps-model past bij het feit dat de inbound-loop de enige lezer
-/// van de socket is: hij voert eerst de init hierheen, en later de Confirm
-/// naar `rekey_responder_confirm`.
+/// This two-stage model fits the fact that the inbound loop is the only reader
+/// of the socket: it first feeds the init here, and later the Confirm to
+/// `rekey_responder_confirm`.
 pub async fn rekey_as_responder(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -160,9 +160,9 @@ pub async fn rekey_as_responder(
     }
 }
 
-/// RESPONDER-kant van een mid-sessie rekey, fase 2: verwerk de Confirm,
-/// authenticeer de initiator, en installeer dan pas de nieuwe sessie.
-/// Zonder geldige Confirm wordt de rekey-sessie nooit vertrouwd.
+/// RESPONDER side of a mid-session rekey, phase 2: process the Confirm,
+/// authenticate the initiator, and only then install the new session.
+/// Without a valid Confirm the rekey session is never trusted.
 pub fn rekey_responder_confirm(
     hs: Handshake,
     auth: &dyn Authenticator,
@@ -172,7 +172,7 @@ pub fn rekey_responder_confirm(
 ) -> Result<()> {
     match hs.confirm(confirm_wire, auth)? {
         Handshake::Established { session } => {
-            let sid = session.session_id; // afgeleid session_id (I-13)
+            let sid = session.session_id; // derived session_id (I-13)
             sessions.install_new_session(session);
             info!(
                 "rekey (responder) complete, mutual — now on session {sid} (req {new_session_id})"
@@ -186,8 +186,8 @@ pub fn rekey_responder_confirm(
     }
 }
 
-/// Hulpconstructie: maak het kanaal waarmee de inbound-loop handshake-frames
-/// naar een lopende rekey-driver doorgeeft.
+/// Helper: create the channel over which the inbound loop forwards handshake
+/// frames to a running rekey driver.
 pub fn handshake_channel() -> (HandshakeFrameTx, HandshakeFrameRx) {
     mpsc::channel(16)
 }

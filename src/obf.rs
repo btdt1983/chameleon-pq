@@ -1,32 +1,32 @@
-//! Obfuscatie-laag voor het DATApad: QUIC-stijl header-protection + padding.
+//! Obfuscation layer for the DATA path: QUIC-style header-protection + padding.
 //!
-//! ACHTERGROND: het oude datapad-frame (frame.rs) toonde op de wire nog steeds
-//! een constant type-byte (0x01), een constant session_id voor de hele sessie
-//! en een monotoon oplopende counter. Dat is — ook zónder statische magic — een
-//! triviaal matchbare stroom-vingerafdruk, en de pakketlengte lekte exact de
-//! plaintext-lengte. Deze laag maakt elk datapad-datagram op de wire tot een
-//! uniform-ogende willekeurige bytereeks: geen vast byte, geen zichtbaar
-//! session_id, geen zichtbare counter, geen zichtbaar frame-type, en (via
-//! padding) geen exacte lengte.
+//! BACKGROUND: the old data-path frame (frame.rs) still showed on the wire a
+//! constant type-byte (0x01), a constant session_id for the whole session and
+//! a monotonically increasing counter. That is — even without a static magic —
+//! a trivially matchable stream fingerprint, and the packet length leaked the
+//! plaintext length exactly. This layer turns every data-path datagram on the
+//! wire into a uniform-looking random byte sequence: no fixed byte, no visible
+//! session_id, no visible counter, no visible frame-type, and (via padding) no
+//! exact length.
 //!
-//! HOE (naar RFC 9001 §5.4, QUIC header-protection):
-//!   1. De inner AEAD/nonce/replay-kern in session.rs blijft ONGEWIJZIGD. We
-//!      versleutelen de plaintext precies als voorheen (aad = de logische
-//!      header H = [0x01, session_id, counter]).
-//!   2. Uit de resulterende ciphertext+tag nemen we een `sample` (de laatste 16
-//!      bytes, altijd bínnen de AEAD-tag) en leiden daaruit een 13-byte masker
-//!      af: mask = HMAC-SHA256(obf_key, sample)[..13].
-//!   3. De zichtbare header wordt masked_H = H XOR mask. Wire = masked_H ‖ ct.
+//! HOW (following RFC 9001 §5.4, QUIC header-protection):
+//!   1. The inner AEAD/nonce/replay core in session.rs stays UNCHANGED. We
+//!      encrypt the plaintext exactly as before (aad = the logical header
+//!      H = [0x01, session_id, counter]).
+//!   2. From the resulting ciphertext+tag we take a `sample` (the last 16
+//!      bytes, always within the AEAD-tag) and derive a 13-byte mask from it:
+//!      mask = HMAC-SHA256(obf_key, sample)[..13].
+//!   3. The visible header becomes masked_H = H XOR mask. Wire = masked_H ‖ ct.
 //!
-//! De integriteit van de header komt NIET van het (malleable) XOR-masker maar
-//! van het feit dat de ontvanger de teruggewonnen H als AEAD-aad meegeeft:
-//! knoeien met masked_H óf met ct levert een verkeerde counter/sessie of een
-//! kapotte tag op — in beide gevallen faalt de AEAD-verificatie. Exact zoals
-//! QUIC: het masker is puur vertrouwelijkheid, de tag is de authenticatie.
+//! The header integrity comes NOT from the (malleable) XOR mask but from the
+//! fact that the receiver passes the recovered H as AEAD-aad: tampering with
+//! masked_H or with ct yields a wrong counter/session or a broken tag — in both
+//! cases the AEAD verification fails. Exactly like QUIC: the mask is pure
+//! confidentiality, the tag is the authentication.
 //!
-//! Het échte frame-type (Data/KeepAlive/Close) zit in de INNER framing
-//! (pack_inner), versleuteld binnen de AEAD-plaintext, zodat op de wire elk
-//! datagram structureel identiek is en het type nooit lekt.
+//! The real frame-type (Data/KeepAlive/Close) sits in the INNER framing
+//! (pack_inner), encrypted within the AEAD-plaintext, so that on the wire every
+//! datagram is structurally identical and the type never leaks.
 
 use crate::error::{ChameleonError, Result};
 use crate::frame::HEADER_LEN;
@@ -34,39 +34,39 @@ use bytes::Bytes;
 use rand::RngCore;
 use ring::hmac;
 
-/// Aantal bytes dat we uit de ciphertext-staart bemonsteren voor het masker.
-/// 16 past altijd binnen de AEAD-tag (ChaCha20 tag = 16, AEGIS = 32), óók bij
-/// lege plaintext (keepalive), dus het is uniform over beide ciphers.
+/// Number of bytes we sample from the ciphertext tail for the mask. 16 always
+/// fits within the AEAD-tag (ChaCha20 tag = 16, AEGIS = 32), even with empty
+/// plaintext (keepalive), so it is uniform across both ciphers.
 pub const SAMPLE_LEN: usize = 16;
 
-/// Lengte van de gemaskeerde header op de wire — gelijk aan de oude cleartext
-/// frame-header (type ‖ session_id ‖ counter), zodat de wire-overhead +0 is.
+/// Length of the masked header on the wire — equal to the old cleartext
+/// frame-header (type ‖ session_id ‖ counter), so the wire-overhead is +0.
 pub const HP_HEADER_LEN: usize = HEADER_LEN; // 13
 
-/// MTU-veilige wire-grootte voor het datapad (frame::MAX_PAYLOAD + HEADER_LEN).
+/// MTU-safe wire-size for the data path (frame::MAX_PAYLOAD + HEADER_LEN).
 pub const MTU_WIRE: usize = 1280;
 
-/// Op de wire draagt elk geobfusceerd datagram ALTIJD het Data-domein (0x01).
-/// Het echte type zit versleuteld in de inner framing. Dit is óók de aad-type-
-/// byte die session.rs::data_aad hardcodeert, dus de gemaskeerde header maskeert
-/// exact de bytes die als aad worden meegeauthenticeerd.
+/// On the wire every obfuscated datagram ALWAYS carries the Data domain (0x01).
+/// The real type is encrypted in the inner framing. This is also the aad-type-
+/// byte that session.rs::data_aad hardcodes, so the masked header masks exactly
+/// the bytes that are authenticated as aad.
 const WIRE_TYPE_DATA: u8 = 0x01;
 
-/// Minimale grootte van de inner framing: inner_type(1) + real_len(2).
+/// Minimum size of the inner framing: inner_type(1) + real_len(2).
 const INNER_HEADER_LEN: usize = 3;
 
-/// Padding-beleid voor het datapad. Instelbaar via config; verbergt de
-/// pakketgrootte (die anders exact de plaintext-lengte lekt) ten koste van
-/// bandbreedte.
+/// Padding policy for the data path. Configurable via config; hides the packet
+/// size (which otherwise leaks the plaintext length exactly) at the cost of
+/// bandwidth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PadPolicy {
-    /// Geen padding — laagste overhead, maar de grootte verraadt de lengte.
+    /// No padding — lowest overhead, but the size reveals the length.
     Off,
-    /// Pad naar grootteklassen (zie `BUCKETS`): verbergt de exacte lengte,
-    /// matige overhead. De standaard.
+    /// Pad to size classes (see `BUCKETS`): hides the exact length, moderate
+    /// overhead. The default.
     Bucketed,
-    /// Pad elk pakket naar de maximale MTU-veilige grootte: beste grootte-
-    /// obfuscatie, hoogste bandbreedte-kost.
+    /// Pad every packet to the maximum MTU-safe size: best size-obfuscation,
+    /// highest bandwidth cost.
     Full,
 }
 
@@ -80,31 +80,31 @@ impl From<crate::config::PaddingPolicy> for PadPolicy {
     }
 }
 
-/// Grootteklassen (op de INNER framed-lengte) voor Bucketed padding. Bewust
-/// klein gehouden: allemaal ruim onder de MTU-veilige limiet, zodat padding de
-/// datagrammen nooit over de MTU duwt (extra IP-fragmentatie is zelf een
-/// vingerafdruk). Pakketten groter dan de bovenste klasse worden niet gepad.
+/// Size classes (on the INNER framed-length) for Bucketed padding. Deliberately
+/// kept small: all well below the MTU-safe limit, so padding never pushes the
+/// datagrams over the MTU (extra IP-fragmentation is itself a fingerprint).
+/// Packets larger than the top class are not padded.
 const BUCKETS: [usize; 5] = [64, 128, 256, 512, 1024];
 
-/// Maximale inner framed-lengte die nog in een MTU-veilig wire-datagram past,
-/// gegeven de tag-lengte van de gekozen cipher.
+/// Maximum inner framed-length that still fits in an MTU-safe wire-datagram,
+/// given the tag-length of the chosen cipher.
 pub fn max_framed(tag_len: usize) -> usize {
     MTU_WIRE
         .saturating_sub(HP_HEADER_LEN)
         .saturating_sub(tag_len)
 }
 
-/// Wat de ontvanger uit de gemaskeerde header terugwint. Bevat GEEN plaintext:
-/// de AEAD-open (in session.rs) gebeurt daarna met de teruggewonnen counter.
+/// What the receiver recovers from the masked header. Contains NO plaintext:
+/// the AEAD-open (in session.rs) happens afterwards with the recovered counter.
 pub struct Recovered {
-    /// Wire-type-domein (hoort 0x01 = Data te zijn). Puur ter sanity-check;
-    /// de echte authenticatie is de AEAD-tag.
+    /// Wire-type domain (should be 0x01 = Data). Purely for a sanity-check;
+    /// the real authentication is the AEAD-tag.
     pub wire_type: u8,
     pub session_id: u32,
     pub counter: u64,
 }
 
-/// Leid het 13-byte header-masker af uit de ciphertext-sample.
+/// Derive the 13-byte header-mask from the ciphertext-sample.
 fn header_mask(obf_key: &[u8; 32], sample: &[u8]) -> [u8; HP_HEADER_LEN] {
     let key = hmac::Key::new(hmac::HMAC_SHA256, obf_key);
     let tag = hmac::sign(&key, sample);
@@ -113,17 +113,17 @@ fn header_mask(obf_key: &[u8; 32], sample: &[u8]) -> [u8; HP_HEADER_LEN] {
     mask
 }
 
-/// De ciphertext-staart die als sample dient. Aanname: `ct.len() >= SAMPLE_LEN`
-/// (altijd waar — de AEAD-tag alleen al is ≥16 bytes).
+/// The ciphertext tail that serves as the sample. Assumption: `ct.len() >=
+/// SAMPLE_LEN` (always true — the AEAD-tag alone is ≥16 bytes).
 fn sample_of(ct: &[u8]) -> &[u8] {
     &ct[ct.len() - SAMPLE_LEN..]
 }
 
-/// UITGAAND: gegeven de reeds-verzegelde ciphertext+tag, bouw het wire-datagram
-/// `masked_H ‖ ct`. `counter`/`session_id` horen bij de nonce/aad waarmee `ct`
-/// is verzegeld.
+/// OUTGOING: given the already-sealed ciphertext+tag, build the wire-datagram
+/// `masked_H ‖ ct`. `counter`/`session_id` belong to the nonce/aad with which
+/// `ct` was sealed.
 pub fn seal_wire(obf_key: &[u8; 32], session_id: u32, counter: u64, ct: &[u8]) -> Bytes {
-    debug_assert!(ct.len() >= SAMPLE_LEN, "ct minstens één AEAD-tag lang");
+    debug_assert!(ct.len() >= SAMPLE_LEN, "ct at least one AEAD tag long");
     let mut h = [0u8; HP_HEADER_LEN];
     h[0] = WIRE_TYPE_DATA;
     h[1..5].copy_from_slice(&session_id.to_le_bytes());
@@ -140,9 +140,10 @@ pub fn seal_wire(obf_key: &[u8; 32], session_id: u32, counter: u64, ct: &[u8]) -
     Bytes::from(out)
 }
 
-/// INKOMEND: win uit één kandidaat-obf_key de header terug. Doet GEEN AEAD-open
-/// (dat doet session.rs met de teruggewonnen counter). Geeft `None` bij een te
-/// kort datagram — een goedkope, panic-vrije poort tegen ruis/korte pakketten.
+/// INCOMING: recover the header from a single candidate-obf_key. Does NO
+/// AEAD-open (session.rs does that with the recovered counter). Returns `None`
+/// for a too-short datagram — a cheap, panic-free gate against noise/short
+/// packets.
 pub fn unmask(obf_key: &[u8; 32], datagram: &[u8]) -> Option<Recovered> {
     if datagram.len() < HP_HEADER_LEN + SAMPLE_LEN {
         return None;
@@ -159,23 +160,23 @@ pub fn unmask(obf_key: &[u8; 32], datagram: &[u8]) -> Option<Recovered> {
     })
 }
 
-/// De ciphertext (na de 13-byte header) van een inkomend datagram.
-/// Aanroeper moet zelf de minimumlengte al via `unmask` hebben afgevangen.
+/// The ciphertext (after the 13-byte header) of an incoming datagram.
+/// The caller must already have gated the minimum length via `unmask`.
 pub fn ct_slice(datagram: &[u8]) -> &[u8] {
     &datagram[HP_HEADER_LEN..]
 }
 
-/// Verpak de plaintext in de inner framing (die daarna wordt verzegeld):
-/// `inner_type(1) ‖ real_len(2 LE) ‖ plaintext ‖ random_pad`. Het echte type
-/// zit hier ingebakken, dus het lekt niet op de wire. `max_framed` begrenst de
-/// padding zodat het wire-datagram MTU-veilig blijft.
+/// Pack the plaintext into the inner framing (which is sealed afterwards):
+/// `inner_type(1) ‖ real_len(2 LE) ‖ plaintext ‖ random_pad`. The real type is
+/// baked in here, so it does not leak on the wire. `max_framed` bounds the
+/// padding so the wire-datagram stays MTU-safe.
 pub fn pack_inner(
     inner_type: u8,
     plaintext: &[u8],
     policy: PadPolicy,
     max_framed: usize,
 ) -> Vec<u8> {
-    // Datapad-payloads zijn MTU-begrensd; real_len past ruim in een u16.
+    // Data-path payloads are MTU-bounded; real_len fits easily in a u16.
     debug_assert!(plaintext.len() <= u16::MAX as usize);
     let real_len = plaintext.len();
     let base = INNER_HEADER_LEN + real_len;
@@ -193,7 +194,8 @@ pub fn pack_inner(
     buf
 }
 
-/// Kies de doel-lengte voor de inner framing volgens het padding-beleid.
+/// Choose the target length for the inner framing according to the padding
+/// policy.
 fn pad_target(base: usize, policy: PadPolicy, max_framed: usize) -> usize {
     match policy {
         PadPolicy::Off => base,
@@ -201,7 +203,7 @@ fn pad_target(base: usize, policy: PadPolicy, max_framed: usize) -> usize {
             if base <= max_framed {
                 max_framed
             } else {
-                base // al groter dan MTU-veilig: niet verder opblazen
+                base // already larger than MTU-safe: don't inflate further
             }
         }
         PadPolicy::Bucketed => {
@@ -210,13 +212,13 @@ fn pad_target(base: usize, policy: PadPolicy, max_framed: usize) -> usize {
                     return b;
                 }
             }
-            base // groter dan de bovenste klasse (of dan MTU): niet padden
+            base // larger than the top class (or than MTU): don't pad
         }
     }
 }
 
-/// Pak de inner framing weer uit na een geslaagde AEAD-open: geef
-/// (inner_type, plaintext) terug, met de padding gestript.
+/// Unpack the inner framing again after a successful AEAD-open: return
+/// (inner_type, plaintext), with the padding stripped.
 pub fn unpack_inner(framed: &[u8]) -> Result<(u8, Bytes)> {
     if framed.len() < INNER_HEADER_LEN {
         return Err(ChameleonError::PacketTooShort {
@@ -228,7 +230,7 @@ pub fn unpack_inner(framed: &[u8]) -> Result<(u8, Bytes)> {
     let real_len = u16::from_le_bytes([framed[1], framed[2]]) as usize;
     let end = INNER_HEADER_LEN + real_len;
     if end > framed.len() {
-        // real_len wijst voorbij de buffer — corrupt/kwaadwillig.
+        // real_len points beyond the buffer — corrupt/malicious.
         return Err(ChameleonError::DecryptionFailed);
     }
     Ok((
@@ -241,9 +243,9 @@ pub fn unpack_inner(framed: &[u8]) -> Result<(u8, Bytes)> {
 mod tests {
     use super::*;
 
-    // Een nep-ciphertext van >= SAMPLE_LEN bytes voor de masking-tests
-    // (de masking-laag is onafhankelijk van de AEAD; de end-to-end AEAD-tests
-    // staan in tests/integration.rs).
+    // A fake ciphertext of >= SAMPLE_LEN bytes for the masking tests
+    // (the masking layer is independent of the AEAD; the end-to-end AEAD-tests
+    // live in tests/integration.rs).
     fn fake_ct(len: usize, fill: u8) -> Vec<u8> {
         vec![fill; len]
     }
@@ -257,7 +259,7 @@ mod tests {
         assert_eq!(wire.len(), HP_HEADER_LEN + ct.len());
         assert_eq!(ct_slice(&wire), &ct[..]);
 
-        let rec = unmask(&key, &wire).expect("lang genoeg");
+        let rec = unmask(&key, &wire).expect("long enough");
         assert_eq!(rec.wire_type, WIRE_TYPE_DATA);
         assert_eq!(rec.session_id, 0xDEADBEEF);
         assert_eq!(rec.counter, 0x0102030405060708);
@@ -265,9 +267,9 @@ mod tests {
 
     #[test]
     fn wire_header_is_not_plaintext_0x01() {
-        // Het eerste byte op de wire mag NIET het constante 0x01 zijn: het is
-        // gemaskeerd. (Kans dat het toevallig 0x01 is, is ~1/256 — we kiezen een
-        // ct waarbij dat niet zo is en checken vooral dat het van H[0] verschilt.)
+        // The first byte on the wire must NOT be the constant 0x01: it is
+        // masked. (The chance it is coincidentally 0x01 is ~1/256 — we pick a
+        // ct where that is not the case and mainly check it differs from H[0].)
         let key = [0x22u8; 32];
         let ct = fake_ct(32, 0x5C);
         let wire = seal_wire(&key, 7, 1, &ct);
@@ -280,11 +282,11 @@ mod tests {
         let key = [0x33u8; 32];
         let ct = fake_ct(48, 0x77);
         let mut wire = seal_wire(&key, 100, 200, &ct).to_vec();
-        // Knoei met het session_id-veld in de gemaskeerde header.
+        // Tamper with the session_id field in the masked header.
         wire[2] ^= 0xFF;
         let rec = unmask(&key, &wire).unwrap();
-        // De teruggewonnen sessie verschilt -> in de praktijk valt hij buiten de
-        // kandidaat en/of faalt de AEAD-open. Hier: recovery != origineel.
+        // The recovered session differs -> in practice it falls outside the
+        // candidate and/or the AEAD-open fails. Here: recovery != original.
         assert_ne!(rec.session_id, 100);
     }
 
@@ -299,27 +301,27 @@ mod tests {
     #[test]
     fn pack_unpack_roundtrip_no_pad() {
         let framed = pack_inner(0x03, b"", PadPolicy::Off, max_framed(16));
-        // Off: alleen inner header (3) + 0 plaintext.
+        // Off: only inner header (3) + 0 plaintext.
         assert_eq!(framed.len(), INNER_HEADER_LEN);
         let (t, pt) = unpack_inner(&framed).unwrap();
         assert_eq!(t, 0x03);
         assert!(pt.is_empty());
 
-        let framed = pack_inner(0x01, b"hallo", PadPolicy::Off, max_framed(16));
+        let framed = pack_inner(0x01, b"hello", PadPolicy::Off, max_framed(16));
         let (t, pt) = unpack_inner(&framed).unwrap();
         assert_eq!(t, 0x01);
-        assert_eq!(&pt[..], b"hallo");
+        assert_eq!(&pt[..], b"hello");
     }
 
     #[test]
     fn bucketed_padding_rounds_up_and_strips() {
         let mf = max_framed(16);
-        let framed = pack_inner(0x01, b"kort", PadPolicy::Bucketed, mf);
-        // base = 3 + 4 = 7 -> eerste bucket 64.
+        let framed = pack_inner(0x01, b"short", PadPolicy::Bucketed, mf);
+        // base = 3 + 5 = 8 -> first bucket 64.
         assert_eq!(framed.len(), 64);
         let (t, pt) = unpack_inner(&framed).unwrap();
         assert_eq!(t, 0x01);
-        assert_eq!(&pt[..], b"kort");
+        assert_eq!(&pt[..], b"short");
     }
 
     #[test]
@@ -327,21 +329,21 @@ mod tests {
         let mf = max_framed(16);
         let a = pack_inner(0x01, b"x", PadPolicy::Full, mf);
         let b = pack_inner(0x01, &vec![0u8; 500], PadPolicy::Full, mf);
-        // Beide gepad tot dezelfde max_framed -> gelijke lengte (grootte verborgen).
+        // Both padded to the same max_framed -> equal length (size hidden).
         assert_eq!(a.len(), b.len());
         assert_eq!(a.len(), mf);
-        // En de payloads komen exact terug.
+        // And the payloads come back exactly.
         assert_eq!(&unpack_inner(&a).unwrap().1[..], b"x");
         assert_eq!(unpack_inner(&b).unwrap().1.len(), 500);
     }
 
     #[test]
     fn unpack_rejects_bad_length() {
-        // real_len wijst voorbij de buffer.
-        let mut framed = vec![0x01u8, 0xFF, 0xFF]; // len=65535 maar buffer is 3
+        // real_len points beyond the buffer.
+        let mut framed = vec![0x01u8, 0xFF, 0xFF]; // len=65535 but buffer is 3
         framed.extend_from_slice(b"tiny");
         assert!(unpack_inner(&framed).is_err());
-        // Te kort voor zelfs de inner header.
+        // Too short for even the inner header.
         assert!(unpack_inner(&[0x01u8, 0x00]).is_err());
     }
 }

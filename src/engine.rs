@@ -1,15 +1,15 @@
-//! De crypto-engine: het ENE punt waar uitgaand verkeer wordt versleuteld.
+//! The crypto engine: the ONE point where outbound traffic is encrypted.
 //!
-//! Het datapad draait volledig op de CPU (ring / AEGIS), die per pakket
-//! constant-time en low-latency is. Er is BEWUST geen GPU-tak: per-pakket
-//! GPU-encryptie verliest het van de CPU omdat de upload/dispatch/read-back-
-//! latency de paar honderd nanoseconden AEAD-werk ruim overstijgt, en de
-//! zware once-per-connection wiskunde (ML-KEM, handtekeningen) heeft geen
-//! volume om over te parallelliseren. Zie DESIGN.md §11–§12.
+//! The data path runs entirely on the CPU (ring / AEGIS), which is constant-
+//! time and low-latency per packet. There is DELIBERATELY no GPU branch:
+//! per-packet GPU encryption loses to the CPU because the upload/dispatch/
+//! read-back latency far exceeds the few hundred nanoseconds of AEAD work, and
+//! the heavy once-per-connection math (ML-KEM, signatures) has no volume to
+//! parallelise over. See DESIGN.md §11–§12.
 //!
-//! De engine levert WIRE-KLARE datagrammen. Met obfuscatie aan (standaard) is
-//! dat het geobfusceerde datapad-frame (obf.rs: QUIC-stijl header-protection +
-//! padding); met obfuscatie uit het klassieke Frame::new_data-frame.
+//! The engine yields WIRE-READY datagrams. With obfuscation on (the default)
+//! that is the obfuscated data-path frame (obf.rs: QUIC-style header-protection
+//! + padding); with obfuscation off the classic Frame::new_data frame.
 
 use crate::error::Result;
 use crate::frame::{Frame, FrameType};
@@ -24,16 +24,16 @@ pub struct OutboundPacket {
     pub plaintext: Bytes,
 }
 
-/// Resultaat van één parallel-ontsleuteld inkomend datagram: (bron-adres, ruwe
-/// datagram-bytes, en het open-resultaat — `Ok((type, plaintext))` voor het
-/// datapad, `Err` voor een handshake-fragment of ruis).
+/// Result of one incoming datagram decrypted in parallel: (source address, raw
+/// datagram bytes, and the open result — `Ok((type, plaintext))` for the data
+/// path, `Err` for a handshake fragment or noise).
 pub type DecryptResult = (SocketAddr, Bytes, Result<(FrameType, Bytes)>);
 
 pub struct CryptoEngine {
     sessions: Arc<SessionManager>,
-    /// Of het datapad geobfusceerd wordt (config `[obfuscation].enabled`).
+    /// Whether the data path is obfuscated (config `[obfuscation].enabled`).
     obf_enabled: bool,
-    /// Padding-beleid voor de obfuscatie-laag.
+    /// Padding policy for the obfuscation layer.
     pad_policy: PadPolicy,
 }
 
@@ -50,23 +50,23 @@ impl CryptoEngine {
         &self.sessions
     }
 
-    /// Bouw een wire-klaar COVER/dummy-datagram (constante grootte via `Full`),
-    /// voor de constant-rate pacer (Fase 3).
+    /// Build a wire-ready COVER/dummy datagram (constant size via `Full`),
+    /// for the constant-rate pacer (Phase 3).
     pub fn cover_datagram(&self) -> Result<Bytes> {
         self.sessions.seal_cover(PadPolicy::Full)
     }
 
-    /// Verzegel één ECHT datapad-pakket met constante grootte (`Full`), voor het
-    /// gepacede pad — daar moeten echt én cover dezelfde vaste grootte hebben,
-    /// anders lekt de grootte-histogram wat de constante rate juist verbergt.
+    /// Seal one REAL data-path packet at constant size (`Full`), for the paced
+    /// path — there real and cover must share the same fixed size, otherwise the
+    /// size histogram leaks exactly what the constant rate is meant to hide.
     pub fn seal_data_full(&self, plaintext: &[u8]) -> Result<Bytes> {
         self.sessions
             .seal_obf(FrameType::Data as u8, plaintext, PadPolicy::Full)
     }
 
-    /// Verzegel één uitgaand pakket tot een wire-klaar datagram. De obf-seal
-    /// gebeurt in `SessionManager::seal_obf`; de counter is atomisch, dus dit is
-    /// veilig vanuit meerdere threads tegelijk (zie `encrypt_batch_par`).
+    /// Seal one outbound packet into a wire-ready datagram. The obf seal
+    /// happens in `SessionManager::seal_obf`; the counter is atomic, so this is
+    /// safe from multiple threads at once (see `encrypt_batch_par`).
     fn seal_one(&self, plaintext: &[u8]) -> Result<Bytes> {
         if self.obf_enabled {
             self.sessions
@@ -77,8 +77,8 @@ impl CryptoEngine {
         }
     }
 
-    /// Versleutel een batch uitgaande pakketten tot WIRE-KLARE datagrammen
-    /// (sequentieel — voor kleine batches).
+    /// Encrypt a batch of outbound packets into WIRE-READY datagrams
+    /// (sequential — for small batches).
     pub fn encrypt_batch(&self, batch: Vec<OutboundPacket>) -> Result<Vec<Bytes>> {
         batch
             .iter()
@@ -86,10 +86,10 @@ impl CryptoEngine {
             .collect()
     }
 
-    /// Zoals `encrypt_batch`, maar verzegelt de batch PARALLEL over alle
-    /// CPU-cores (Fase C). Order-behoudend; `collect` short-circuit op de eerste
-    /// fout (bv. RekeyRequired) net als de sequentiële variant. Roep dit aan
-    /// binnen een `spawn_blocking` (rayon blokkeert).
+    /// Like `encrypt_batch`, but seals the batch in PARALLEL across all
+    /// CPU cores (Phase C). Order-preserving; `collect` short-circuits on the
+    /// first error (e.g. RekeyRequired) just like the sequential variant. Call
+    /// this inside a `spawn_blocking` (rayon blocks).
     pub fn encrypt_batch_par(&self, batch: Vec<OutboundPacket>) -> Result<Vec<Bytes>> {
         batch
             .par_iter()
@@ -97,11 +97,11 @@ impl CryptoEngine {
             .collect()
     }
 
-    /// Ontsleutel een batch inkomende datagrammen PARALLEL over alle CPU-cores.
-    /// Geeft per datagram (src, ruwe bytes, resultaat) terug in INVOER-volgorde,
-    /// zodat de aanroeper kan partitioneren: `Ok` = data/keepalive/close/padding
-    /// (datapad), `Err` = handshake-fragment of ruis (terug naar de seriële
-    /// coördinator). De AEAD-open is lock-vrij, dus dit schaalt over cores.
+    /// Decrypt a batch of incoming datagrams in PARALLEL across all CPU cores.
+    /// Returns per datagram (src, raw bytes, result) in INPUT order, so the
+    /// caller can partition: `Ok` = data/keepalive/close/padding (data path),
+    /// `Err` = handshake fragment or noise (back to the serial coordinator).
+    /// The AEAD open is lock-free, so this scales across cores.
     pub fn decrypt_batch_par(&self, datagrams: &[(SocketAddr, Bytes)]) -> Vec<DecryptResult> {
         datagrams
             .par_iter()

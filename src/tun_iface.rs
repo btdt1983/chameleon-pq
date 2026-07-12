@@ -1,26 +1,26 @@
-//! TUN-interface laag: cross-platform, asynchroon.
+//! TUN-interface layer: cross-platform, asynchronous.
 //!
-//! Exposeer twee mpsc-kanalen zodat de rest van de applicatie
-//! platform-agnostisch blijft:
+//! Exposes two mpsc channels so the rest of the application stays
+//! platform-agnostic:
 //!
-//!   plaintext_from_tun: Receiver<Bytes>  — IP-pakketten die van de
-//!                                          kernel/TUN binnenkomen en
-//!                                          versleuteld naar de peer moeten.
-//!   plaintext_to_tun:   Sender<Bytes>    — Ontsleutelde IP-pakketten
-//!                                          die naar de kernel/TUN moeten.
+//!   plaintext_from_tun: Receiver<Bytes>  — IP packets coming in from the
+//!                                          kernel/TUN that must be encrypted
+//!                                          and sent to the peer.
+//!   plaintext_to_tun:   Sender<Bytes>    — Decrypted IP packets that must
+//!                                          go to the kernel/TUN.
 //!
-//! PLATFORM-VEREISTEN
-//!   Linux:   CAP_NET_ADMIN (of sudo) om de TUN-interface aan te maken.
-//!   Windows: wintun.dll naast de binary (https://www.wintun.net).
+//! PLATFORM REQUIREMENTS
+//!   Linux:   CAP_NET_ADMIN (or sudo) to create the TUN interface.
+//!   Windows: wintun.dll next to the binary (https://www.wintun.net).
 //!
-//! We drijven de I/O via `tun` 0.8's `AsyncDevice` (`recv`/`send`). Op Windows
-//! draait dat op `wintun-bindings`: een `try_receive`-ringfast-path die tijdens
-//! verkeer nooit blokkeert, en bij idle één pool-thread op het OS-read-event
-//! parkeert — GEEN thread-per-pakket zoals `tun` 0.6, wat de per-pakket-muur en
-//! de burst-instabiliteit veroorzaakte.
+//! We drive the I/O via `tun` 0.8's `AsyncDevice` (`recv`/`send`). On Windows
+//! that runs on `wintun-bindings`: a `try_receive` ring fast-path that never
+//! blocks during traffic, and parks one pool thread on the OS read-event when
+//! idle — NOT thread-per-packet like `tun` 0.6, which caused the per-packet
+//! wall and the burst instability.
 //!
-//! In tests (zonder CAP_NET_ADMIN) kun je `TunPair::new_mock()` gebruiken;
-//! dat geeft twee in-memory kanalen die dezelfde API bieden.
+//! In tests (without CAP_NET_ADMIN) you can use `TunPair::new_mock()`;
+//! that gives two in-memory channels offering the same API.
 
 use crate::config::TunConfig;
 use crate::error::{ChameleonError, Result};
@@ -33,11 +33,11 @@ use tracing::{debug, error, info};
 const TUN_READ_BUF: usize = 65_536;
 const CHANNEL_DEPTH: usize = 512;
 
-/// Het publieke API-oppervlak van de TUN-laag.
+/// The public API surface of the TUN layer.
 pub struct TunPair {
-    /// Lees hieruit: plaintext IP-pakketten richting encrypt → UDP.
+    /// Read from here: plaintext IP packets heading for encrypt → UDP.
     pub from_tun: mpsc::Receiver<Bytes>,
-    /// Schrijf hierheen: decrypted IP-pakketten richting kernel.
+    /// Write here: decrypted IP packets heading for the kernel.
     pub to_tun: mpsc::Sender<Bytes>,
     /// Handles to the TUN read/write tasks (None for the mock). The caller
     /// aborts + awaits these on teardown so the device is fully released before
@@ -48,16 +48,16 @@ pub struct TunPair {
 }
 
 impl TunPair {
-    /// Maak een echte TUN-interface aan en start de I/O-taken.
-    /// Faalt als de rechten ontbreken of het platform niet ondersteund wordt.
+    /// Create a real TUN interface and start the I/O tasks.
+    /// Fails if the permissions are missing or the platform is unsupported.
     pub fn create(cfg: &TunConfig) -> Result<Self> {
         let device = build_async_device(cfg)?;
         Ok(Self::spawn_io(device))
     }
 
-    /// In-memory mock (geen kernel-interface nodig). Bedoeld voor tests en voor
-    /// clients die de tunnel-loops willen aandrijven zonder een echte TUN. Van
-    /// buiten stuur je bytes in via `inject_tx`; lees uitvoer via `drain_rx`.
+    /// In-memory mock (no kernel interface needed). Meant for tests and for
+    /// clients that want to drive the tunnel loops without a real TUN. From
+    /// outside you push bytes in via `inject_tx`; read output via `drain_rx`.
     pub fn new_mock() -> (Self, MockHandles) {
         let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
         let (drain_tx, drain_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
@@ -87,8 +87,8 @@ impl TunPair {
         let device = Arc::new(device);
         let dev_read = device.clone();
 
-        // Lees-taak: TUN → engine (encrypt-kant). `recv` gebruikt de ring-fast-
-        // path tijdens verkeer en parkeert alleen bij idle op het OS-read-event.
+        // Read task: TUN → engine (encrypt side). `recv` uses the ring fast-
+        // path during traffic and parks only when idle on the OS read-event.
         let read_task = tokio::spawn(async move {
             let mut buf = vec![0u8; TUN_READ_BUF];
             loop {
@@ -112,7 +112,7 @@ impl TunPair {
             }
         });
 
-        // Schrijf-taak: engine (decrypt-kant) → TUN.
+        // Write task: engine (decrypt side) → TUN.
         let write_task = tokio::spawn(async move {
             while let Some(pkt) = to_tun_rx.recv().await {
                 debug!("TUN write {} bytes", pkt.len());
@@ -132,20 +132,20 @@ impl TunPair {
     }
 }
 
-/// Uiteinden van een mock-TUN: `inject_tx` speelt "kernel → TUN", `drain_rx`
-/// leest "TUN → kernel".
+/// Ends of a mock TUN: `inject_tx` plays "kernel → TUN", `drain_rx`
+/// reads "TUN → kernel".
 pub struct MockHandles {
-    /// Stuur bytes in alsof ze van de TUN komen.
+    /// Push bytes in as if they came from the TUN.
     pub inject_tx: mpsc::Sender<Bytes>,
-    /// Lees bytes die naar de TUN gestuurd zouden worden.
+    /// Read bytes that would be sent to the TUN.
     pub drain_rx: mpsc::Receiver<Bytes>,
 }
 
-// ── TUN-aanmaak (cross-platform via tun 0.8 `create_as_async`) ───────────────
+// ── TUN creation (cross-platform via tun 0.8 `create_as_async`) ──────────────
 
-/// Maak een asynchrone TUN-interface aan. tun 0.8 levert op elk platform dezelfde
-/// `AsyncDevice` met `recv`/`send`; op Windows draait dat op `wintun-bindings`
-/// (ring fast-path + OS-event, geen thread-per-pakket).
+/// Create an asynchronous TUN interface. tun 0.8 yields the same `AsyncDevice`
+/// with `recv`/`send` on every platform; on Windows that runs on
+/// `wintun-bindings` (ring fast-path + OS-event, no thread-per-packet).
 fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
     let addr: Ipv4Addr = cfg.address.parse().map_err(|e| ChameleonError::Handshake {
         state: "tun".into(),
@@ -194,7 +194,7 @@ fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
 mod tests {
     use super::*;
 
-    /// Verifieer dat de mock-variant werkt zonder kernel-rechten.
+    /// Verify that the mock variant works without kernel permissions.
     #[tokio::test]
     async fn mock_roundtrip() {
         let (pair, handles) = TunPair::new_mock();
@@ -208,7 +208,7 @@ mod tests {
             mut drain_rx,
         } = handles;
 
-        // Simuleer: kernel stuurt pakket naar TUN.
+        // Simulate: kernel sends packet to TUN.
         inject_tx
             .send(Bytes::from_static(b"fake IP packet"))
             .await
@@ -216,7 +216,7 @@ mod tests {
         let received = from_tun.recv().await.unwrap();
         assert_eq!(&received[..], b"fake IP packet");
 
-        // Simuleer: engine schrijft terug naar TUN.
+        // Simulate: engine writes back to TUN.
         to_tun
             .send(Bytes::from_static(b"decrypted IP"))
             .await

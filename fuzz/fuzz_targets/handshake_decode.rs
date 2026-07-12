@@ -1,6 +1,6 @@
 #![no_main]
-//! Fuzz de handshake-berichtparser (tunnel.rs HandshakeMessage::decode).
-//! Attacker-input: een (mogelijk ge-de-obfusceerde) handshake-blob.
+//! Fuzz the handshake message parser (tunnel.rs HandshakeMessage::decode).
+//! Attacker input: a (possibly de-obfuscated) handshake blob.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

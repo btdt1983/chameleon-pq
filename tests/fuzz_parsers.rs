@@ -1,11 +1,11 @@
-//! Stabiele fuzz-/robuustheids-harness voor de parsers van ATTACKER-
-//! gecontroleerde input. Gooit veel seeded-random + adversariële bytes naar elke
-//! parser en faalt zodra er één panic't (out-of-bounds, overflow, unwrap, …).
+//! Stable fuzz/robustness harness for the parsers of ATTACKER-controlled
+//! input. Throws lots of seeded-random + adversarial bytes at each parser and
+//! fails the moment one panics (out-of-bounds, overflow, unwrap, …).
 //!
-//! Dit is de op-stable draaiende regressiewacht (ook in CI). De coverage-guided
-//! variant staat in `fuzz/` (cargo-fuzz, nightly) en dekt hetzelfde oppervlak
-//! dieper. De invariant is voor beide gelijk: geen enkele bytereeks mag een
-//! parser laten panieken — hij hoort netjes `Err`/`None`/`Ok` te geven.
+//! This is the regression guard that runs on stable (also in CI). The
+//! coverage-guided variant lives in `fuzz/` (cargo-fuzz, nightly) and covers
+//! the same surface more deeply. The invariant is the same for both: no byte
+//! sequence may make a parser panic — it should cleanly return `Err`/`None`/`Ok`.
 
 use bytes::Bytes;
 use chameleon::frame::Frame;
@@ -19,14 +19,14 @@ use zeroize::Zeroizing;
 
 const ITERS: usize = 10_000;
 
-/// Vaste edge-cases (rond bekende grenswaarden) + veel seeded-random buffers van
-/// wisselende lengte. De seed maakt het reproduceerbaar; een crash is dus altijd
-/// exact opnieuw af te spelen.
+/// Fixed edge cases (around known boundary values) + many seeded-random buffers
+/// of varying length. The seed makes it reproducible; a crash is therefore
+/// always exactly replayable.
 fn corpus(seed: u64) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
 
-    // Grenswaarden: net onder/op/boven de header- en berichtgroottes die de
-    // parsers hanteren (HEADER_LEN=13, HP_HEADER_LEN+SAMPLE_LEN=29,
+    // Boundary values: just under/at/over the header and message sizes the
+    // parsers handle (HEADER_LEN=13, HP_HEADER_LEN+SAMPLE_LEN=29,
     // HS_FRAG_HEADER_LEN=8, HS_NONCE+TAG=28, HANDSHAKE_MSG_LEN=8192, …).
     let boundaries = [
         0usize, 1, 2, 3, 7, 8, 9, 12, 13, 14, 16, 27, 28, 29, 30, 63, 64, 65, 127, 128, 1023, 1024,
@@ -34,15 +34,15 @@ fn corpus(seed: u64) -> Vec<Vec<u8>> {
     ];
     for &n in &boundaries {
         out.push(vec![0u8; n]); // all-zero
-        out.push(vec![0xFFu8; n]); // all-ones (max u16-lengtevelden etc.)
+        out.push(vec![0xFFu8; n]); // all-ones (max u16 length fields etc.)
         let mut alt = vec![0u8; n];
         for (i, b) in alt.iter_mut().enumerate() {
             *b = (i & 0xFF) as u8;
         }
-        out.push(alt); // oplopend patroon
+        out.push(alt); // ascending pattern
     }
 
-    // Seeded-random buffers tot ~MTU-grootte, plus af en toe een groot bericht.
+    // Seeded-random buffers up to ~MTU size, plus an occasional large message.
     let mut rng = StdRng::seed_from_u64(seed);
     for i in 0..ITERS {
         let cap = if i % 97 == 0 { 9000 } else { 1400 };
@@ -72,7 +72,7 @@ fn fuzz_handshake_decode() {
 fn fuzz_obf_parsers() {
     let key = [0x42u8; 32];
     for buf in corpus(3) {
-        // unmask is de veilige poort; ct_slice mag pas ná een geslaagde unmask.
+        // unmask is the safe gate; ct_slice is only valid after a successful unmask.
         if obf::unmask(&key, &buf).is_some() {
             let _ = obf::ct_slice(&buf);
         }
@@ -91,8 +91,8 @@ fn fuzz_hsobf_parsers() {
 
 #[test]
 fn fuzz_reassembler() {
-    // Voed willekeurige fragmenten in één reassembler; de DoS-cap + prune moeten
-    // het geheugen begrensd houden zonder ooit te panieken.
+    // Feed random fragments into a single reassembler; the DoS cap + prune must
+    // keep memory bounded without ever panicking.
     let mut reasm = Reassembler::default();
     for (i, buf) in corpus(5).into_iter().enumerate() {
         let _ = reasm.push(&buf);
@@ -104,13 +104,13 @@ fn fuzz_reassembler() {
 
 #[test]
 fn fuzz_session_decrypt() {
-    // Een echte sessie; gooi random datagrammen naar beide inbound-paden.
+    // A real session; throw random datagrams at both inbound paths.
     let sess = Session::from_handshake(1, Zeroizing::new([7u8; 32]), true).unwrap();
     let mgr = SessionManager::new(sess);
     for buf in corpus(6) {
-        // Geobfusceerd datapad (obf.rs → AEAD).
+        // Obfuscated data path (obf.rs → AEAD).
         let _ = mgr.decrypt_obf(&buf);
-        // Klassiek datapad: random session_id/counter + willekeurige ciphertext.
+        // Classic data path: random session_id/counter + random ciphertext.
         if buf.len() >= 12 {
             let sid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
             let ctr = u64::from_le_bytes([

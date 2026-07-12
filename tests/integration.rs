@@ -7,7 +7,7 @@ use chameleon::obf::PadPolicy;
 use chameleon::session::{Session, SessionManager};
 use chameleon::tunnel::{fragment, Handshake, HandshakeMessage, Reassembler};
 
-/// Fragmenteer en herassembleer een wire-bericht (de realistische wire-weg).
+/// Fragment and reassemble a wire message (the realistic wire path).
 fn roundtrip(sid: u32, wire: &Bytes) -> Bytes {
     let mut reasm = Reassembler::default();
     let mut out = None;
@@ -16,14 +16,14 @@ fn roundtrip(sid: u32, wire: &Bytes) -> Bytes {
             out = Some(full);
         }
     }
-    out.expect("reassembly compleet")
+    out.expect("reassembly complete")
 }
 
 #[test]
 fn full_handshake_derives_matching_keys_and_tunnels_data() {
     let init_seed = [1u8; 32];
     let resp_seed = [9u8; 32];
-    // Beide kanten kennen elkaars publieke sleutel (wederzijdse auth).
+    // Both sides know each other's public key (mutual auth).
     let init_pub = Ed25519Auth::derive_public(&init_seed);
     let resp_pub = Ed25519Auth::derive_public(&resp_seed);
 
@@ -42,22 +42,22 @@ fn full_handshake_derives_matching_keys_and_tunnels_data() {
             reassembled = Some(full);
         }
     }
-    let init_wire2 = reassembled.expect("reassembly compleet");
+    let init_wire2 = reassembled.expect("reassembly complete");
     assert_eq!(init_wire2, init_wire);
 
     let (hs_resp, resp_wire) = Handshake::respond(init_wire2, &resp_auth).unwrap();
-    // Initiator verifieert responder en produceert het Confirm-bericht.
+    // Initiator verifies responder and produces the Confirm message.
     let (hs_init_done, confirm_wire) = hs_init.finalize(resp_wire, &init_auth).unwrap();
-    // Responder verifieert de initiator via de Confirm -> wederzijds vertrouwd.
+    // Responder verifies the initiator via the Confirm -> mutually trusted.
     let hs_resp_done = hs_resp.confirm(confirm_wire, &resp_auth).unwrap();
 
     let init_session = match hs_init_done {
         Handshake::Established { session } => session,
-        _ => panic!("initiator niet Established"),
+        _ => panic!("initiator not Established"),
     };
     let resp_session = match hs_resp_done {
         Handshake::Established { session } => session,
-        _ => panic!("responder niet Established na confirm"),
+        _ => panic!("responder not Established after confirm"),
     };
 
     let plaintext = b"hello through the post-quantum tunnel";
@@ -99,8 +99,8 @@ fn replay_window_rejects_old_and_duplicate() {
 
 #[test]
 fn wrong_peer_identity_fails_auth() {
-    // Scenario 1: de RESPONDER is niet wie de initiator verwacht.
-    // De initiator heeft een verkeerde peer-pubkey -> finalize moet falen.
+    // Scenario 1: the RESPONDER is not who the initiator expects.
+    // The initiator has a wrong peer pubkey -> finalize must fail.
     let resp_seed = [9u8; 32];
     let init_auth = Ed25519Auth::new(&[1u8; 32], [0xABu8; 32]).unwrap();
     let resp_auth = Ed25519Auth::new(&resp_seed, [0u8; 32]).unwrap();
@@ -110,21 +110,21 @@ fn wrong_peer_identity_fails_auth() {
     let result = hs_init.finalize(resp_wire, &init_auth);
     assert!(
         result.is_err(),
-        "MITM responder had moeten falen bij finalize"
+        "MITM responder should have failed at finalize"
     );
 
-    // Scenario 2: de INITIATOR is niet wie de responder verwacht. Sinds L-6
-    // absorbeert het transcript de identiteiten van BEIDE kanten, dus de
-    // responder mengt zijn (verkeerde) verwachting van de initiator erin: de
-    // transcripts divergeren en de initiator faalt al bij finalize (nog vóór de
-    // Confirm). Een identiteits-mismatch aan ELKE kant laat de handshake dus
-    // schoon falen. (De Confirm-laag zelf — dat een ongeldig initiator-bewijs
-    // wordt afgewezen — wordt door de reflectie-test gedekt.)
+    // Scenario 2: the INITIATOR is not who the responder expects. Since L-6 the
+    // transcript absorbs the identities of BOTH sides, so the responder mixes in
+    // its (wrong) expectation of the initiator: the transcripts diverge and the
+    // initiator already fails at finalize (even before the Confirm). An identity
+    // mismatch on EITHER side therefore makes the handshake fail cleanly. (The
+    // Confirm layer itself — that an invalid initiator proof is rejected — is
+    // covered by the reflection test.)
     let init_real_seed = [3u8; 32];
     let resp_real_seed = [4u8; 32];
     let resp_real_pub = Ed25519Auth::derive_public(&resp_real_seed);
 
-    // init verwacht resp_real (correct); resp verwacht een VERKEERDE init-pubkey.
+    // init expects resp_real (correct); resp expects a WRONG init pubkey.
     let init_ok = Ed25519Auth::new(&init_real_seed, resp_real_pub).unwrap();
     let resp_wrong_expect = Ed25519Auth::new(&resp_real_seed, [0x77u8; 32]).unwrap();
 
@@ -132,7 +132,7 @@ fn wrong_peer_identity_fails_auth() {
     let (_hs_resp2, resp_wire2) = Handshake::respond(init_wire2, &resp_wrong_expect).unwrap();
     assert!(
         hs_init2.finalize(resp_wire2, &init_ok).is_err(),
-        "verkeerde initiator-verwachting poison't het transcript -> finalize faalt (L-6)"
+        "wrong initiator expectation poisons the transcript -> finalize fails (L-6)"
     );
 }
 
@@ -141,68 +141,68 @@ fn reassembler_prune_evicts_stale_incomplete() {
     use chameleon::tunnel::{fragment, Reassembler};
     use std::time::Duration;
 
-    // Bouw een bericht dat in 3 fragmenten splitst.
+    // Build a message that splits into 3 fragments.
     let big = vec![0xABu8; 2500];
     let frags = fragment(100, &big);
     assert!(frags.len() >= 2);
 
     let mut reasm = Reassembler::default();
-    // Push alleen het EERSTE fragment -> incomplete entry blijft hangen.
+    // Push only the FIRST fragment -> incomplete entry stays around.
     let r = reasm.push(&frags[0]).unwrap();
     assert!(r.is_none());
-    assert_eq!(reasm.pending_count(), 1, "incomplete entry aanwezig");
+    assert_eq!(reasm.pending_count(), 1, "incomplete entry present");
 
-    // Prune met een ruime max_age verwijdert niets (entry is vers).
+    // Prune with a generous max_age removes nothing (entry is fresh).
     reasm.prune_old(Duration::from_secs(3600));
-    assert_eq!(reasm.pending_count(), 1, "verse entry blijft");
+    assert_eq!(reasm.pending_count(), 1, "fresh entry stays");
 
-    // Prune met max_age 0 verwijdert de incomplete entry (DoS-fix).
+    // Prune with max_age 0 removes the incomplete entry (DoS fix).
     std::thread::sleep(Duration::from_millis(2));
     reasm.prune_old(Duration::from_millis(1));
-    assert_eq!(reasm.pending_count(), 0, "stale entry verwijderd");
+    assert_eq!(reasm.pending_count(), 0, "stale entry removed");
 }
 
 #[test]
 fn session_manager_rekey_swap_keeps_old_alive() {
     use chameleon::session::{Session, SessionManager};
 
-    // Realistische topologie: 'mgr' is de LOKALE node (responder-rol),
-    // 'peer_*' is de andere kant (initiator-rol). De peer ENCRYPT,
-    // mgr DECRYPT — tx/rx-sleutels matchen alleen tussen tegengestelde rollen.
+    // Realistic topology: 'mgr' is the LOCAL node (responder role),
+    // 'peer_*' is the other side (initiator role). The peer ENCRYPTs,
+    // mgr DECRYPTs — tx/rx keys only match between opposite roles.
     let shared_old = zeroize::Zeroizing::new([1u8; 32]);
     let mgr_old = Session::from_handshake(1, shared_old.clone(), false).unwrap();
     let peer_old = Session::from_handshake(1, shared_old, true).unwrap();
     let mgr = SessionManager::new(mgr_old);
 
-    // Peer stuurt een in-flight pakket op de OUDE sessie.
+    // Peer sends an in-flight packet on the OLD session.
     let (c_old, ct_old) = peer_old.encrypt(b"old-path packet").unwrap();
 
-    // Rekey: nieuwe sessie (id 2) wordt actief; oude -> previous.
+    // Rekey: new session (id 2) becomes active; old -> previous.
     let shared_new = zeroize::Zeroizing::new([2u8; 32]);
     let mgr_new = Session::from_handshake(2, shared_new.clone(), false).unwrap();
     let peer_new = Session::from_handshake(2, shared_new, true).unwrap();
     mgr.install_new_session(mgr_new);
 
-    // In-flight pakket op de oude sessie moet NOG ontsleutelen via 'previous'.
+    // In-flight packet on the old session must STILL decrypt via 'previous'.
     let dec_old = mgr.decrypt(1, c_old, &ct_old);
     assert!(
         dec_old.is_ok(),
-        "previous session ontsleutelt in-flight verkeer"
+        "previous session decrypts in-flight traffic"
     );
     assert_eq!(&dec_old.unwrap()[..], b"old-path packet");
 
-    // Nieuw verkeer op de nieuwe sessie ontsleutelt via 'current'.
+    // New traffic on the new session decrypts via 'current'.
     let (c_new, ct_new) = peer_new.encrypt(b"new-path packet").unwrap();
     let dec_new = mgr.decrypt(2, c_new, &ct_new);
-    assert!(dec_new.is_ok(), "current session ontsleutelt nieuw verkeer");
+    assert!(dec_new.is_ok(), "current session decrypts new traffic");
     assert_eq!(&dec_new.unwrap()[..], b"new-path packet");
 
-    // Na retire is de oude sessie weg; een nieuw in-flight oud pakket faalt.
+    // After retire the old session is gone; a new in-flight old packet fails.
     let (c_old2, ct_old2) = peer_old.encrypt(b"too late").unwrap();
     mgr.retire_previous();
     assert!(
         mgr.decrypt(1, c_old2, &ct_old2).is_err(),
-        "na retire: oude sessie weg"
+        "after retire: old session gone"
     );
 }
 
@@ -210,19 +210,19 @@ fn session_manager_rekey_swap_keeps_old_alive() {
 fn rekey_antistorm_gate_blocks_rapid_retrigger() {
     use chameleon::session::{Session, SessionManager};
 
-    // Maak een sessie met een LAGE drempel door de counter ver op te voeren.
-    // We kunnen de drempel niet direct zetten, dus we testen de tijd-gate:
-    // na een geclaimde rekey mag needs_rekey niet meteen weer true geven.
+    // Make a session with a LOW threshold by advancing the counter far.
+    // We can't set the threshold directly, so we test the time gate:
+    // after a claimed rekey, needs_rekey must not immediately return true again.
     let shared = zeroize::Zeroizing::new([3u8; 32]);
     let s = Session::from_handshake(1, shared, true).unwrap();
     let mgr = SessionManager::new(s);
 
-    // Zonder de counter boven de drempel te brengen geeft needs_rekey false.
-    assert!(!mgr.needs_rekey(), "onder drempel: geen rekey");
+    // Without pushing the counter above the threshold, needs_rekey returns false.
+    assert!(!mgr.needs_rekey(), "below threshold: no rekey");
 
-    // abort_rekey is veilig aanroepbaar zonder lopende rekey.
+    // abort_rekey is safe to call without a rekey in progress.
     mgr.abort_rekey();
-    assert!(!mgr.needs_rekey(), "blijft false");
+    assert!(!mgr.needs_rekey(), "stays false");
 }
 
 #[test]
@@ -233,48 +233,48 @@ fn replay_window_handles_wide_reordering() {
     let rx = Session::from_handshake(1, shared.clone(), false).unwrap();
     let tx = Session::from_handshake(1, shared, true).unwrap();
 
-    // Genereer ruim meer dan 2048 pakketten zodat we ook buiten het venster
-    // kunnen testen.
+    // Generate well over 2048 packets so we can also test outside the
+    // window.
     let mut packets = Vec::new();
     for _ in 0..2600 {
         packets.push(tx.encrypt(b"x").unwrap());
     }
 
-    // Ontvang eerst een hoog pakket (counter 2500). Dat zet 'highest' hoog.
+    // First receive a high packet (counter 2500). That sets 'highest' high.
     let (c_last, ct_last) = &packets[2500];
     assert!(rx.decrypt(*c_last, ct_last).is_ok());
 
-    // Een pakket ~1000 posities ouder (counter 1500) moet NOG geaccepteerd
-    // worden — binnen het 2048-venster. Dit zou met het oude 64-venster falen.
+    // A packet ~1000 positions older (counter 1500) must STILL be accepted —
+    // within the 2048 window. This would fail with the old 64 window.
     let (c_mid, ct_mid) = &packets[1500];
     assert!(
         rx.decrypt(*c_mid, ct_mid).is_ok(),
-        "ver-out-of-order pakket binnen 2048-venster geaccepteerd"
+        "far-out-of-order packet within 2048 window accepted"
     );
 
-    // Datzelfde pakket nogmaals = replay, moet falen.
-    assert!(rx.decrypt(*c_mid, ct_mid).is_err(), "replay verworpen");
+    // The same packet again = replay, must fail.
+    assert!(rx.decrypt(*c_mid, ct_mid).is_err(), "replay rejected");
 
-    // Een pakket dat ECHT buiten het venster valt: counter 100 met highest
-    // op 2500 = delta 2400 > 2048. Moet verworpen worden.
+    // A packet that REALLY falls outside the window: counter 100 with highest
+    // at 2500 = delta 2400 > 2048. Must be rejected.
     let (c_ancient, ct_ancient) = &packets[100];
     assert!(
         rx.decrypt(*c_ancient, ct_ancient).is_err(),
-        "buiten 2048-venster verworpen"
+        "outside 2048 window rejected"
     );
 
-    // En een pakket NET binnen de rand: counter ~500 (delta 2000 < 2048) ok.
+    // And a packet JUST inside the edge: counter ~500 (delta 2000 < 2048) ok.
     let (c_edge, ct_edge) = &packets[500];
     assert!(
         rx.decrypt(*c_edge, ct_edge).is_ok(),
-        "net binnen venster-rand geaccepteerd"
+        "just inside the window edge accepted"
     );
 }
 
 #[test]
 fn mutual_handshake_three_messages_with_fragmentation() {
-    // Volledige 3-berichten wederzijdse handshake over de realistische
-    // wire-weg: elk bericht gefragmenteerd en herassembleerd.
+    // Full 3-message mutual handshake over the realistic wire path: each
+    // message fragmented and reassembled.
     let init_seed = [11u8; 32];
     let resp_seed = [22u8; 32];
     let init_pub = Ed25519Auth::derive_public(&init_seed);
@@ -282,7 +282,7 @@ fn mutual_handshake_three_messages_with_fragmentation() {
     let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
     let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
 
-    // Helper: fragmenteer en herassembleer een wire-bericht.
+    // Helper: fragment and reassemble a wire message.
     fn roundtrip(sid: u32, wire: &Bytes) -> Bytes {
         let mut reasm = Reassembler::default();
         let mut out = None;
@@ -291,7 +291,7 @@ fn mutual_handshake_three_messages_with_fragmentation() {
                 out = Some(full);
             }
         }
-        out.expect("reassembly compleet")
+        out.expect("reassembly complete")
     }
 
     // 1. Init
@@ -307,30 +307,30 @@ fn mutual_handshake_three_messages_with_fragmentation() {
     let confirm_rx = roundtrip(1, &confirm_wire);
     let hs_resp_done = hs_resp.confirm(confirm_rx, &resp_auth).unwrap();
 
-    // Beide kanten Established en sleutels kloppen in beide richtingen.
+    // Both sides Established and keys match in both directions.
     let init_session = match hs_init_done {
         Handshake::Established { session } => session,
-        _ => panic!("initiator niet Established"),
+        _ => panic!("initiator not Established"),
     };
     let resp_session = match hs_resp_done {
         Handshake::Established { session } => session,
-        _ => panic!("responder niet Established"),
+        _ => panic!("responder not Established"),
     };
 
-    let (c, ct) = init_session.encrypt(b"mutual auth werkt").unwrap();
+    let (c, ct) = init_session.encrypt(b"mutual auth works").unwrap();
     assert_eq!(
         &resp_session.decrypt(c, &ct).unwrap()[..],
-        b"mutual auth werkt"
+        b"mutual auth works"
     );
-    let (c2, ct2) = resp_session.encrypt(b"en terug").unwrap();
-    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"en terug");
+    let (c2, ct2) = resp_session.encrypt(b"and back").unwrap();
+    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"and back");
 }
 
 #[test]
 fn aead_negotiation_picks_aegis_when_supported() {
-    // Op hardware met AES-NI moeten beide kanten AEGIS-256X2 kiezen en moet
-    // data over die cipher heen en weer kunnen. Op hardware zonder AES valt
-    // het terug op ChaCha20 — dan test deze assert de fallback.
+    // On hardware with AES-NI both sides must pick AEGIS-256X2 and data must be
+    // able to travel over that cipher back and forth. On hardware without AES it
+    // falls back to ChaCha20 — then this assert tests the fallback.
     use chameleon::aead::AeadAlgo;
 
     let init_seed = [55u8; 32];
@@ -347,44 +347,44 @@ fn aead_negotiation_picks_aegis_when_supported() {
 
     let init_session = match hs_init_done {
         Handshake::Established { session } => session,
-        _ => panic!("initiator niet Established"),
+        _ => panic!("initiator not Established"),
     };
     let resp_session = match hs_resp_done {
         Handshake::Established { session } => session,
-        _ => panic!("responder niet Established"),
+        _ => panic!("responder not Established"),
     };
 
-    // Beide kanten MOETEN dezelfde cipher hebben gekozen.
+    // Both sides MUST have picked the same cipher.
     assert_eq!(
         init_session.algo(),
         resp_session.algo(),
-        "beide kanten gebruiken hetzelfde onderhandelde algoritme"
+        "both sides use the same negotiated algorithm"
     );
-    // En het is de voorkeur van deze machine (AEGIS mét AES-NI, anders ChaCha20).
+    // And it's this machine's preference (AEGIS with AES-NI, else ChaCha20).
     assert_eq!(init_session.algo(), AeadAlgo::preferred());
 
-    // Data moet over de onderhandelde cipher heen en weer kunnen.
-    let (c, ct) = init_session.encrypt(b"via onderhandelde cipher").unwrap();
+    // Data must be able to travel over the negotiated cipher back and forth.
+    let (c, ct) = init_session.encrypt(b"via negotiated cipher").unwrap();
     assert_eq!(
         &resp_session.decrypt(c, &ct).unwrap()[..],
-        b"via onderhandelde cipher"
+        b"via negotiated cipher"
     );
-    let (c2, ct2) = resp_session.encrypt(b"retour").unwrap();
-    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"retour");
+    let (c2, ct2) = resp_session.encrypt(b"return").unwrap();
+    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"return");
 }
 
 #[test]
 fn hybrid_pq_handshake_tunnels_data_both_ways() {
-    // Volledige 3-berichten wederzijdse handshake met HYBRIDE auth
-    // (Ed25519 + ML-DSA-65), over de gefragmenteerde wire-weg. Bewijst dat de
-    // post-quantum handtekening-leg end-to-end door de echte state machine loopt.
+    // Full 3-message mutual handshake with HYBRID auth
+    // (Ed25519 + ML-DSA-65), over the fragmented wire path. Proves that the
+    // post-quantum signature leg runs end-to-end through the real state machine.
     let init_seed = [11u8; 32];
     let resp_seed = [22u8; 32];
     let init_ed_pub = Ed25519Auth::derive_public(&init_seed);
     let resp_ed_pub = Ed25519Auth::derive_public(&resp_seed);
 
-    // Elke kant een eigen ML-DSA-keypair; publieke sleutels worden gekruist
-    // voorgedeeld (out-of-band), net als de Ed25519-identiteiten.
+    // Each side its own ML-DSA keypair; public keys are cross pre-shared
+    // (out-of-band), just like the Ed25519 identities.
     let (init_pq_pub, init_pq_sk) = MlDsaAuth::generate();
     let (resp_pq_pub, resp_pq_sk) = MlDsaAuth::generate();
 
@@ -397,13 +397,13 @@ fn hybrid_pq_handshake_tunnels_data_both_ways() {
         Box::new(MlDsaAuth::from_keys(&resp_pq_sk, &init_pq_pub).unwrap()),
     ]);
 
-    // De hybride handtekening is fors groter; de handshake moet alsnog passen
-    // én in meerdere fragmenten splitsen.
+    // The hybrid signature is considerably larger; the handshake must still fit
+    // and split into multiple fragments.
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
     assert_eq!(init_wire.len(), chameleon::tunnel::HANDSHAKE_MSG_LEN);
     assert!(
         fragment(1, &init_wire).len() >= 2,
-        "PQ-handshake fragmenteert"
+        "PQ handshake fragments"
     );
 
     let init_rx = roundtrip(1, &init_wire);
@@ -415,27 +415,27 @@ fn hybrid_pq_handshake_tunnels_data_both_ways() {
 
     let init_session = match hs_init_done {
         Handshake::Established { session } => session,
-        _ => panic!("initiator niet Established"),
+        _ => panic!("initiator not Established"),
     };
     let resp_session = match hs_resp_done {
         Handshake::Established { session } => session,
-        _ => panic!("responder niet Established"),
+        _ => panic!("responder not Established"),
     };
 
-    let (c, ct) = init_session.encrypt(b"hybride PQ auth werkt").unwrap();
+    let (c, ct) = init_session.encrypt(b"hybrid PQ auth works").unwrap();
     assert_eq!(
         &resp_session.decrypt(c, &ct).unwrap()[..],
-        b"hybride PQ auth werkt"
+        b"hybrid PQ auth works"
     );
-    let (c2, ct2) = resp_session.encrypt(b"en terug").unwrap();
-    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"en terug");
+    let (c2, ct2) = resp_session.encrypt(b"and back").unwrap();
+    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"and back");
 }
 
 #[test]
 fn hybrid_pq_wrong_mldsa_key_fails_even_when_ed25519_matches() {
-    // Cruciale eigenschap van de hybride leg: als ALLEEN de ML-DSA-sleutel van
-    // de peer verkeerd is — maar de Ed25519-leg klopt — moet de handshake nog
-    // steeds falen. Anders zou de PQ-leg loos zijn.
+    // Crucial property of the hybrid leg: if ONLY the peer's ML-DSA key is
+    // wrong — but the Ed25519 leg matches — the handshake must still fail.
+    // Otherwise the PQ leg would be pointless.
     let init_seed = [33u8; 32];
     let resp_seed = [44u8; 32];
     let init_ed_pub = Ed25519Auth::derive_public(&init_seed);
@@ -443,34 +443,34 @@ fn hybrid_pq_wrong_mldsa_key_fails_even_when_ed25519_matches() {
 
     let (_init_pq_pub, init_pq_sk) = MlDsaAuth::generate();
     let (resp_pq_pub, resp_pq_sk) = MlDsaAuth::generate();
-    // Een DERDE, niet-bijbehorend ML-DSA keypair: de initiator denkt dat dít
-    // de publieke sleutel van de responder is. Ed25519 klopt wél.
+    // A THIRD, non-matching ML-DSA keypair: the initiator thinks THIS is the
+    // responder's public key. Ed25519 does match.
     let (wrong_pq_pub, _wrong_pq_sk) = MlDsaAuth::generate();
 
     let init_auth = HybridAuth::new(vec![
         Box::new(Ed25519Auth::new(&init_seed, resp_ed_pub).unwrap()),
-        Box::new(MlDsaAuth::from_keys(&init_pq_sk, &wrong_pq_pub).unwrap()), // FOUT
+        Box::new(MlDsaAuth::from_keys(&init_pq_sk, &wrong_pq_pub).unwrap()), // WRONG
     ]);
     let resp_auth = HybridAuth::new(vec![
         Box::new(Ed25519Auth::new(&resp_seed, init_ed_pub).unwrap()),
-        Box::new(MlDsaAuth::from_keys(&resp_pq_sk, &resp_pq_pub /*irrelevant hier*/).unwrap()),
+        Box::new(MlDsaAuth::from_keys(&resp_pq_sk, &resp_pq_pub /*irrelevant here*/).unwrap()),
     ]);
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
     let (_hs_resp, resp_wire) = Handshake::respond(init_wire, &resp_auth).unwrap();
-    // De responder ondertekende met zijn ECHTE ML-DSA-sleutel; de initiator
-    // verifieert tegen de VERKEERDE -> finalize moet falen, ook al matcht Ed25519.
+    // The responder signed with its REAL ML-DSA key; the initiator verifies
+    // against the WRONG one -> finalize must fail, even though Ed25519 matches.
     let result = hs_init.finalize(resp_wire, &init_auth);
     assert!(
         result.is_err(),
-        "verkeerde ML-DSA-peer-sleutel moet de hybride handshake laten falen"
+        "wrong ML-DSA peer key must make the hybrid handshake fail"
     );
 }
 
 #[test]
 fn aegis_session_roundtrips_many_packets() {
-    // Forceer een AEGIS-sessie direct (los van detectie) en stuur veel
-    // pakketten om de nonce-opbouw en replay-window met AEGIS te dekken.
+    // Force an AEGIS session directly (independent of detection) and send many
+    // packets to cover the nonce construction and replay window with AEGIS.
     use chameleon::aead::AeadAlgo;
     let shared = zeroize::Zeroizing::new([0x9au8; 32]);
     let tx =
@@ -478,23 +478,23 @@ fn aegis_session_roundtrips_many_packets() {
     let rx = Session::from_handshake_with_algo(1, shared, false, AeadAlgo::Aegis256X2).unwrap();
 
     for i in 0..500u32 {
-        let msg = format!("pakket {i}");
+        let msg = format!("packet {i}");
         let (c, ct) = tx.encrypt(msg.as_bytes()).unwrap();
         let pt = rx.decrypt(c, &ct).unwrap();
         assert_eq!(&pt[..], msg.as_bytes());
     }
-    // Replay van een oud pakket moet ook met AEGIS falen.
-    let (c0, ct0) = tx.encrypt(b"vers").unwrap();
+    // Replay of an old packet must also fail with AEGIS.
+    let (c0, ct0) = tx.encrypt(b"fresh").unwrap();
     assert!(rx.decrypt(c0, &ct0).is_ok());
     assert!(
         rx.decrypt(c0, &ct0).is_err(),
-        "replay verworpen onder AEGIS"
+        "replay rejected under AEGIS"
     );
 }
 
-// ── Geobfusceerd datapad (obf.rs, QUIC-stijl header-protection + padding) ─────
+// ── Obfuscated data path (obf.rs, QUIC-style header protection + padding) ────
 
-/// Bouw een sessie met een expliciet AEAD-algoritme voor de obf-tests.
+/// Build a session with an explicit AEAD algorithm for the obf tests.
 fn obf_session(id: u32, shared: [u8; 32], is_initiator: bool, algo: AeadAlgo) -> Session {
     Session::from_handshake_with_algo(id, zeroize::Zeroizing::new(shared), is_initiator, algo)
         .unwrap()
@@ -510,14 +510,14 @@ fn obf_roundtrip_both_ciphers() {
         let rx = SessionManager::new(obf_session(1, shared, false, algo));
 
         let wire = tx
-            .seal_obf(FrameType::Data as u8, b"hallo via obf", PadPolicy::Bucketed)
+            .seal_obf(FrameType::Data as u8, b"hello via obf", PadPolicy::Bucketed)
             .unwrap();
-        // Op de wire geen zichtbaar 0x01-type-byte: de header is gemaskeerd.
-        // (De kans op toevallig 0x01 is ~1/256; dat is geen bug, dus we checken
-        //  de recovery, niet byte-0 hard.)
+        // No visible 0x01 type byte on the wire: the header is masked.
+        // (The chance of an accidental 0x01 is ~1/256; that is not a bug, so we
+        //  check the recovery, not byte 0 strictly.)
         let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
         assert_eq!(ft, FrameType::Data);
-        assert_eq!(&pt[..], b"hallo via obf");
+        assert_eq!(&pt[..], b"hello via obf");
     }
 }
 
@@ -528,7 +528,7 @@ fn obf_tamper_rejected() {
         let tx = obf_session(1, shared, true, algo);
         let rx = SessionManager::new(obf_session(1, shared, false, algo));
 
-        // (a) Knoei met de gemaskeerde header (session_id-veld).
+        // (a) Tamper with the masked header (session_id field).
         let mut w = tx
             .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
             .unwrap()
@@ -536,34 +536,34 @@ fn obf_tamper_rejected() {
         w[2] ^= 0xFF;
         assert!(
             rx.decrypt_obf(&w).is_err(),
-            "gemaskeerde header-tamper faalt"
+            "masked header tamper fails"
         );
 
-        // (b) Knoei met de ciphertext buiten de sample (eerste ct-byte). De
-        //     header komt correct terug, maar de AEAD-tag faalt.
+        // (b) Tamper with the ciphertext outside the sample (first ct byte). The
+        //     header comes back correct, but the AEAD tag fails.
         let mut w = tx
             .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
             .unwrap()
             .to_vec();
-        w[13] ^= 0xFF; // eerste byte ná de 13-byte header
-        assert!(rx.decrypt_obf(&w).is_err(), "ciphertext-tamper faalt");
+        w[13] ^= 0xFF; // first byte after the 13-byte header
+        assert!(rx.decrypt_obf(&w).is_err(), "ciphertext tamper fails");
 
-        // (c) Knoei met de sample-staart (laatste byte).
+        // (c) Tamper with the sample tail (last byte).
         let mut w = tx
             .seal_obf(FrameType::Data as u8, b"payload", PadPolicy::Bucketed)
             .unwrap()
             .to_vec();
         let last = w.len() - 1;
         w[last] ^= 0xFF;
-        assert!(rx.decrypt_obf(&w).is_err(), "sample-tamper faalt");
+        assert!(rx.decrypt_obf(&w).is_err(), "sample tamper fails");
     }
 }
 
 #[test]
 fn obf_trial_demux_current_and_previous() {
-    // Spiegelt session_manager_rekey_swap: een in-flight pakket op de OUDE sessie
-    // moet via 'previous' door de trial-demux worden geopend, nieuw verkeer via
-    // 'current', en na retire faalt de oude.
+    // Mirrors session_manager_rekey_swap: an in-flight packet on the OLD session
+    // must be opened via 'previous' by the trial demux, new traffic via
+    // 'current', and after retire the old one fails.
     let algo = AeadAlgo::ChaCha20Poly1305;
     let shared_old = [1u8; 32];
     let shared_new = [2u8; 32];
@@ -580,21 +580,21 @@ fn obf_trial_demux_current_and_previous() {
         .seal_obf(FrameType::Data as u8, b"new-path", PadPolicy::Bucketed)
         .unwrap();
 
-    // Oud pakket via 'previous'.
+    // Old packet via 'previous'.
     let (ft, pt) = mgr.decrypt_obf(&wire_old).unwrap();
     assert_eq!(ft, FrameType::Data);
     assert_eq!(&pt[..], b"old-path");
-    // Nieuw pakket via 'current'.
+    // New packet via 'current'.
     assert_eq!(&mgr.decrypt_obf(&wire_new).unwrap().1[..], b"new-path");
 
-    // Na retire is de oude sessie weg.
+    // After retire the old session is gone.
     mgr.retire_previous();
     let wire_old2 = peer_old
         .seal_obf(FrameType::Data as u8, b"too-late", PadPolicy::Bucketed)
         .unwrap();
     assert!(
         mgr.decrypt_obf(&wire_old2).is_err(),
-        "na retire faalt de oude sessie"
+        "after retire the old session fails"
     );
 }
 
@@ -603,19 +603,19 @@ fn obf_wrong_key_and_noise_dropped() {
     let algo = AeadAlgo::ChaCha20Poly1305;
     let rx = SessionManager::new(obf_session(1, [7u8; 32], false, algo));
 
-    // Pakket verzegeld met een ANDER shared secret -> niet voor ons.
+    // Packet sealed with a DIFFERENT shared secret -> not for us.
     let alien = obf_session(1, [8u8; 32], true, algo);
     let wire = alien
-        .seal_obf(FrameType::Data as u8, b"niet voor jou", PadPolicy::Off)
+        .seal_obf(FrameType::Data as u8, b"not for you", PadPolicy::Off)
         .unwrap();
-    assert!(rx.decrypt_obf(&wire).is_err(), "vreemde sleutel gedropt");
+    assert!(rx.decrypt_obf(&wire).is_err(), "foreign key dropped");
 
-    // 100 ruis-datagrammen (>= 29 bytes) -> geen enkele mag openen.
+    // 100 noise datagrams (>= 29 bytes) -> none may open.
     for i in 0..100u32 {
         let noise: Vec<u8> = (0..40u32)
             .map(|j| (i.wrapping_mul(7) ^ j.wrapping_mul(13)) as u8)
             .collect();
-        assert!(rx.decrypt_obf(&noise).is_err(), "ruis gedropt");
+        assert!(rx.decrypt_obf(&noise).is_err(), "noise dropped");
     }
 }
 
@@ -629,7 +629,7 @@ fn obf_empty_keepalive_roundtrip() {
         let wire = tx
             .seal_obf(FrameType::KeepAlive as u8, b"", PadPolicy::Bucketed)
             .unwrap();
-        // Lege keepalive is nog steeds MTU-veilig en langer dan de minimumgrens.
+        // Empty keepalive is still MTU-safe and longer than the minimum bound.
         assert!(wire.len() >= 13 + 16);
         let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
         assert_eq!(ft, FrameType::KeepAlive);
@@ -650,10 +650,10 @@ fn obf_full_padding_hides_length() {
     let big = tx
         .seal_obf(FrameType::Data as u8, &vec![0u8; 400], PadPolicy::Full)
         .unwrap();
-    // Full padding -> beide datagrammen even lang (grootte verborgen).
-    assert_eq!(small.len(), big.len(), "Full padding verbergt de lengte");
+    // Full padding -> both datagrams equal length (size hidden).
+    assert_eq!(small.len(), big.len(), "Full padding hides the length");
 
-    // En beide payloads komen exact terug (padding correct gestript).
+    // And both payloads come back exactly (padding stripped correctly).
     assert_eq!(&rx.decrypt_obf(&small).unwrap().1[..], b"x");
     assert_eq!(rx.decrypt_obf(&big).unwrap().1.len(), 400);
 }
@@ -661,15 +661,15 @@ fn obf_full_padding_hides_length() {
 #[test]
 fn obf_short_datagram_rejected() {
     let rx = SessionManager::new(obf_session(1, [9u8; 32], false, AeadAlgo::ChaCha20Poly1305));
-    assert!(rx.decrypt_obf(&[0u8; 13]).is_err(), "te kort");
-    assert!(rx.decrypt_obf(&[0u8; 20]).is_err(), "onder 13+16");
+    assert!(rx.decrypt_obf(&[0u8; 13]).is_err(), "too short");
+    assert!(rx.decrypt_obf(&[0u8; 20]).is_err(), "below 13+16");
 }
 
 #[test]
 fn obf_handshake_frame_falls_through() {
-    // Een echt (cleartext) handshake-frame mag NIET door de obf-open worden
-    // opgeslokt: decrypt_obf hoort te falen, zodat main.rs terugvalt op
-    // Frame::decode voor de rekey-demux.
+    // A real (cleartext) handshake frame must NOT be swallowed by the obf open:
+    // decrypt_obf should fail, so that main.rs falls back to Frame::decode for
+    // the rekey demux.
     let rx = SessionManager::new(obf_session(
         1,
         [0x0Au8; 32],
@@ -680,9 +680,9 @@ fn obf_handshake_frame_falls_through() {
     let hs_wire = Frame::new_handshake(frag).encode().unwrap();
     assert!(
         rx.decrypt_obf(&hs_wire).is_err(),
-        "handshake-frame valt door naar de cleartext-weg"
+        "handshake frame falls through to the cleartext path"
     );
-    // En het is wél een geldig handshake-frame langs de klassieke weg.
+    // And it is a valid handshake frame along the classic path.
     assert_eq!(
         Frame::decode(hs_wire).unwrap().frame_type,
         FrameType::Handshake
@@ -691,10 +691,10 @@ fn obf_handshake_frame_falls_through() {
 
 #[test]
 fn obf_wire_header_looks_random() {
-    // De kernclaim: op de wire is er geen constant header-byte, geen zichtbaar
-    // session_id en geen zichtbare oplopende counter. We verzegelen veel
-    // pakketten op DEZELFDE sessie en controleren dat de gemaskeerde headers
-    // variëren i.p.v. een vaste vingerafdruk te vormen.
+    // The core claim: on the wire there is no constant header byte, no visible
+    // session_id and no visible incrementing counter. We seal many packets on
+    // the SAME session and check that the masked headers vary instead of forming
+    // a fixed fingerprint.
     use std::collections::HashSet;
     let tx = obf_session(0xABCD, [0x2Cu8; 32], true, AeadAlgo::ChaCha20Poly1305);
 
@@ -702,22 +702,22 @@ fn obf_wire_header_looks_random() {
     let mut first_bytes = HashSet::new();
     for _ in 0..200 {
         let w = tx
-            .seal_obf(FrameType::Data as u8, b"zelfde payload", PadPolicy::Off)
+            .seal_obf(FrameType::Data as u8, b"same payload", PadPolicy::Off)
             .unwrap();
         headers.insert(w[..13].to_vec());
         first_bytes.insert(w[0]);
     }
-    // Elke gemaskeerde header is uniek (counter + tag-sample verschillen).
+    // Each masked header is unique (counter + tag sample differ).
     assert_eq!(
         headers.len(),
         200,
-        "gemaskeerde headers zijn allemaal uniek"
+        "masked headers are all unique"
     );
-    // Byte 0 is niet het constante 0x01 en varieert breed (≈uniform).
+    // Byte 0 is not the constant 0x01 and varies widely (≈uniform).
     assert!(!first_bytes.contains(&0x01) || first_bytes.len() > 50);
     assert!(
         first_bytes.len() > 50,
-        "byte-0 varieert breed (geen vaste vingerafdruk), kreeg {} distinct",
+        "byte 0 varies widely (no fixed fingerprint), got {} distinct",
         first_bytes.len()
     );
 }
@@ -730,42 +730,42 @@ fn obf_replay_rejected() {
     let rx = SessionManager::new(obf_session(1, shared, false, algo));
 
     let wire = tx
-        .seal_obf(FrameType::Data as u8, b"eenmalig", PadPolicy::Bucketed)
+        .seal_obf(FrameType::Data as u8, b"one-time", PadPolicy::Bucketed)
         .unwrap();
-    assert!(rx.decrypt_obf(&wire).is_ok(), "eerste keer ok");
+    assert!(rx.decrypt_obf(&wire).is_ok(), "first time ok");
     assert!(
         rx.decrypt_obf(&wire).is_err(),
-        "replay van hetzelfde datagram verworpen"
+        "replay of the same datagram rejected"
     );
 }
 
-// ── Geobfusceerde handshake-envelope (hsobf.rs, Fase 2) ──────────────────────
+// ── Obfuscated handshake envelope (hsobf.rs, Phase 2) ────────────────────────
 
-/// Seal een handshake-bericht, fragmenteer het, herassembleer blind via de
-/// Reassembler (zoals de wire-weg) en open het weer — de realistische obf-weg.
+/// Seal a handshake message, fragment it, reassemble blindly via the
+/// Reassembler (like the wire path) and open it again — the realistic obf path.
 fn hs_roundtrip(key: &[u8; 32], wire: &Bytes) -> Bytes {
     let mut reasm = Reassembler::default();
     let mut out = None;
     for datagram in hsobf::seal_and_fragment(key, wire).unwrap() {
         let (mid, idx, tot, chunk) =
-            hsobf::unmask_fragment(key, &datagram).expect("geldig fragment");
+            hsobf::unmask_fragment(key, &datagram).expect("valid fragment");
         if let Some(blob) = reasm.push_parts(mid, idx, tot, chunk).unwrap() {
             out = Some(hsobf::open(key, &blob).unwrap());
         }
     }
-    out.expect("reassembly compleet")
+    out.expect("reassembly complete")
 }
 
 #[test]
 fn hs_obf_both_sides_derive_same_key() {
     let init_pub = Ed25519Auth::derive_public(&[11u8; 32]);
     let resp_pub = Ed25519Auth::derive_public(&[22u8; 32]);
-    // Beide kanten (own/peer omgewisseld) komen op dezelfde sleutel uit.
+    // Both sides (own/peer swapped) arrive at the same key.
     assert_eq!(
         hsobf::derive_hs_obf_key(&init_pub, &resp_pub, None),
         hsobf::derive_hs_obf_key(&resp_pub, &init_pub, None)
     );
-    // Met PSK ook symmetrisch, en verschillend van de pubkey-afgeleide.
+    // With PSK also symmetric, and different from the pubkey-derived one.
     let psk = [0x5Au8; 32];
     let k_psk = hsobf::derive_hs_obf_key(&init_pub, &resp_pub, Some(&psk));
     assert_eq!(
@@ -778,21 +778,21 @@ fn hs_obf_both_sides_derive_same_key() {
 #[test]
 fn hs_obf_roundtrip_and_jitter() {
     let key = [0x31u8; 32];
-    let wire = Bytes::from(vec![0xABu8; 8192]); // volle handshake-grootte
+    let wire = Bytes::from(vec![0xABu8; 8192]); // full handshake size
     assert_eq!(&hs_roundtrip(&key, &wire)[..], &wire[..]);
 
-    // Aantal fragmenten varieert over runs (grootte-jitter tegen de burst-tell).
+    // Fragment count varies across runs (size jitter against the burst count).
     let mut counts = std::collections::HashSet::new();
     for _ in 0..12 {
         counts.insert(hsobf::seal_and_fragment(&key, &wire).unwrap().len());
     }
-    assert!(counts.len() > 1, "fragment-aantal varieert per handshake");
+    assert!(counts.len() > 1, "fragment count varies per handshake");
 }
 
 #[test]
 fn hs_obf_full_mutual_handshake() {
-    // De volledige 3-berichten wederzijdse handshake, elk bericht via de
-    // geobfusceerde wrap-then-fragment weg i.p.v. het cleartext frame.
+    // The full 3-message mutual handshake, each message via the obfuscated
+    // wrap-then-fragment path instead of the cleartext frame.
     let init_seed = [11u8; 32];
     let resp_seed = [22u8; 32];
     let init_pub = Ed25519Auth::derive_public(&init_seed);
@@ -800,7 +800,7 @@ fn hs_obf_full_mutual_handshake() {
     let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
     let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
 
-    // Beide kanten leiden dezelfde statische obf-sleutel af.
+    // Both sides derive the same static obf key.
     let key = hsobf::derive_hs_obf_key(&init_pub, &resp_pub, None);
 
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
@@ -813,27 +813,27 @@ fn hs_obf_full_mutual_handshake() {
 
     let init_session = match hs_init_done {
         Handshake::Established { session } => session,
-        _ => panic!("initiator niet Established"),
+        _ => panic!("initiator not Established"),
     };
     let resp_session = match hs_resp_done {
         Handshake::Established { session } => session,
-        _ => panic!("responder niet Established"),
+        _ => panic!("responder not Established"),
     };
-    // Sleutels kloppen: data tunnelt beide kanten op.
-    let (c, ct) = init_session.encrypt(b"handshake obf werkt").unwrap();
+    // Keys match: data tunnels both ways.
+    let (c, ct) = init_session.encrypt(b"handshake obf works").unwrap();
     assert_eq!(
         &resp_session.decrypt(c, &ct).unwrap()[..],
-        b"handshake obf werkt"
+        b"handshake obf works"
     );
-    let (c2, ct2) = resp_session.encrypt(b"en terug").unwrap();
-    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"en terug");
+    let (c2, ct2) = resp_session.encrypt(b"and back").unwrap();
+    assert_eq!(&init_session.decrypt(c2, &ct2).unwrap()[..], b"and back");
 }
 
 #[test]
 fn hs_obf_wrong_key_and_noise_rejected() {
     let key = [0x41u8; 32];
     let wire = Bytes::from(vec![0x5Au8; 4096]);
-    // Verzegel onder key, herassembleer, maar open met een ANDERE sleutel.
+    // Seal under key, reassemble, but open with a DIFFERENT key.
     let mut reasm = Reassembler::default();
     let mut blob = None;
     for d in hsobf::seal_and_fragment(&key, &wire).unwrap() {
@@ -844,10 +844,10 @@ fn hs_obf_wrong_key_and_noise_rejected() {
     }
     assert!(
         hsobf::open(&[0x42u8; 32], &blob.unwrap()).is_err(),
-        "verkeerde sleutel"
+        "wrong key"
     );
 
-    // Ruis: 200 willekeurige >= 8-byte datagrammen mogen nooit compleet-en-openen.
+    // Noise: 200 random >= 8-byte datagrams may never complete-and-open.
     let mut r = Reassembler::default();
     for i in 0..200u32 {
         let noise: Vec<u8> = (0..40u32)
@@ -855,7 +855,7 @@ fn hs_obf_wrong_key_and_noise_rejected() {
             .collect();
         if let Some((mid, idx, tot, chunk)) = hsobf::unmask_fragment(&key, &noise) {
             if let Ok(Some(b)) = r.push_parts(mid, idx, tot, chunk) {
-                assert!(hsobf::open(&key, &b).is_err(), "ruis opent niet");
+                assert!(hsobf::open(&key, &b).is_err(), "noise does not open");
             }
         }
     }
@@ -863,9 +863,9 @@ fn hs_obf_wrong_key_and_noise_rejected() {
 
 #[test]
 fn hs_obf_cleartext_frame_not_accepted() {
-    // Een 0.1.2-peer stuurt cleartext Frame::new_handshake-fragmenten. Die mogen
-    // niet als geobfusceerde handshake worden geopend (schone breuk, geen
-    // cross-versie-verwarring).
+    // A 0.1.2 peer sends cleartext Frame::new_handshake fragments. Those may not
+    // be opened as an obfuscated handshake (clean break, no cross-version
+    // confusion).
     let key = [0x51u8; 32];
     let big = vec![0xABu8; 6000];
     let mut reasm = Reassembler::default();
@@ -880,39 +880,39 @@ fn hs_obf_cleartext_frame_not_accepted() {
     }
     assert!(
         !opened,
-        "cleartext 0.1.2-frame wordt niet als obf-handshake geaccepteerd"
+        "cleartext 0.1.2 frame is not accepted as an obf handshake"
     );
 }
 
 #[test]
 fn hs_obf_reassembler_cap_and_prune() {
     use std::time::Duration;
-    // Cap: veel distinct msg_id-partials mogen het geheugen niet onbegrensd
-    // laten groeien (elk niet-data-datagram is nu een kandidaat-fragment).
+    // Cap: many distinct msg_id partials must not let memory grow unbounded
+    // (every non-data datagram is now a candidate fragment).
     let mut reasm = Reassembler::default();
     for mid in 0..200u32 {
-        // Eén fragment van een (beweerd) 2-fragment-bericht -> blijft partial.
+        // One fragment of a (claimed) 2-fragment message -> stays partial.
         let _ = reasm.push_parts(mid, 0, 2, Bytes::from_static(b"x"));
     }
     assert!(
         reasm.pending_count() <= 64,
-        "pending gecapt op 64, kreeg {}",
+        "pending capped at 64, got {}",
         reasm.pending_count()
     );
 
-    // Prune: een verse partial wordt door prune_old(0) verwijderd (DoS-fix).
+    // Prune: a fresh partial is removed by prune_old(0) (DoS fix).
     let mut r2 = Reassembler::default();
     let _ = r2.push_parts(1, 0, 2, Bytes::from_static(b"y"));
     assert_eq!(r2.pending_count(), 1);
     std::thread::sleep(Duration::from_millis(2));
     r2.prune_old(Duration::from_millis(1));
-    assert_eq!(r2.pending_count(), 0, "stale partial verwijderd");
+    assert_eq!(r2.pending_count(), 0, "stale partial removed");
 }
 
 #[test]
 fn hs_obf_wire_looks_random() {
-    // Geen constant type-byte op de wire: byte 0 is de willekeurige msg_id en
-    // varieert breed over handshakes.
+    // No constant type byte on the wire: byte 0 is the random msg_id and
+    // varies widely across handshakes.
     let key = [0x61u8; 32];
     let wire = Bytes::from(vec![0u8; 8192]);
     let mut first_bytes = std::collections::HashSet::new();
@@ -922,12 +922,12 @@ fn hs_obf_wire_looks_random() {
     }
     assert!(
         first_bytes.len() > 20,
-        "byte-0 varieert (geen vaste vingerafdruk), kreeg {} distinct",
+        "byte 0 varies (no fixed fingerprint), got {} distinct",
         first_bytes.len()
     );
 }
 
-// ── Cover-traffic / Padding inner-type (pacer, Fase 3) ───────────────────────
+// ── Cover traffic / Padding inner-type (pacer, Phase 3) ──────────────────────
 
 #[test]
 fn cover_packet_roundtrips_as_padding() {
@@ -938,8 +938,8 @@ fn cover_packet_roundtrips_as_padding() {
 
     let wire = tx.seal_cover(PadPolicy::Full).unwrap();
     let (ft, pt) = rx.decrypt_obf(&wire).unwrap();
-    assert_eq!(ft, FrameType::Padding, "cover pakket = inner-type Padding");
-    assert!(pt.is_empty(), "cover heeft lege payload");
+    assert_eq!(ft, FrameType::Padding, "cover packet = inner-type Padding");
+    assert!(pt.is_empty(), "cover has empty payload");
 }
 
 #[test]
@@ -948,35 +948,35 @@ fn cover_indistinguishable_from_data_under_full() {
     let shared = [0x71u8; 32];
     let tx = SessionManager::new(obf_session(1, shared, true, algo));
 
-    // Een echt Data-pakket en een cover-pakket, beide Full-gepad (zoals de pacer).
+    // A real Data packet and a cover packet, both Full-padded (like the pacer).
     let data = tx
-        .seal_obf(FrameType::Data as u8, b"echte payload", PadPolicy::Full)
+        .seal_obf(FrameType::Data as u8, b"real payload", PadPolicy::Full)
         .unwrap();
     let cover = tx.seal_cover(PadPolicy::Full).unwrap();
 
-    // Zelfde lengte op de wire -> de grootte verraadt echt-vs-cover niet.
+    // Same length on the wire -> the size does not reveal real-vs-cover.
     assert_eq!(
         data.len(),
         cover.len(),
-        "cover en data even lang onder Full"
+        "cover and data equal length under Full"
     );
-    // Maar de gemaskeerde headers verschillen (geen vaste vingerafdruk).
+    // But the masked headers differ (no fixed fingerprint).
     assert_ne!(&data[..13], &cover[..13]);
 }
 
-// ── Micro-benchmarks (voor het snelheidswerk) ────────────────────────────────
-// Draai met:  cargo test --release bench -- --ignored --nocapture
-// #[ignore] zodat ze niet in de gewone suite meelopen.
+// ── Micro-benchmarks (for the speed work) ────────────────────────────────────
+// Run with:  cargo test --release bench -- --ignored --nocapture
+// #[ignore] so they don't run in the normal suite.
 
 #[test]
 #[ignore]
 fn bench_crypto_throughput() {
     use std::time::Instant;
 
-    let pt = vec![0x5Au8; 1200]; // typische MTU-payload
+    let pt = vec![0x5Au8; 1200]; // typical MTU payload
     let n: usize = 1_000_000;
     println!(
-        "\n=== crypto microbench ({n} pakketten x {} B, release, 1 core) ===",
+        "\n=== crypto microbench ({n} packets x {} B, release, 1 core) ===",
         pt.len()
     );
 
@@ -988,7 +988,7 @@ fn bench_crypto_throughput() {
         )
     };
 
-    // Rauwe AEAD (per cipher), zonder obf-laag.
+    // Raw AEAD (per cipher), without the obf layer.
     for (name, algo) in [
         ("ChaCha20-Poly1305", AeadAlgo::ChaCha20Poly1305),
         ("AEGIS-256X2", AeadAlgo::Aegis256X2),
@@ -1006,7 +1006,7 @@ fn bench_crypto_throughput() {
         );
     }
 
-    // Volledig obf-seal-pad (ChaCha, Full padding zoals de pacer gebruikt).
+    // Full obf-seal-pad (ChaCha, Full padding as the pacer uses).
     let mgr = SessionManager::new(obf_session(
         1,
         [0x43u8; 32],
@@ -1028,7 +1028,7 @@ fn bench_crypto_throughput() {
         rate(n, dt, pt.len())
     );
 
-    // Volledig obf-open-pad: seal M distinct, dan time decrypt_obf.
+    // Full obf-open-pad: seal M distinct, then time decrypt_obf.
     let m: usize = 200_000;
     let shared = [0x44u8; 32];
     let txm = SessionManager::new(obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305));
@@ -1068,7 +1068,7 @@ fn bench_udp_sendto() {
     let t = Instant::now();
     let mut sent = 0usize;
     for _ in 0..n {
-        // Eén syscall per pakket — dit is de rate die GSO/sendmmsg zou verhogen.
+        // One syscall per packet — this is the rate GSO/sendmmsg would raise.
         if tx.send_to(&buf, rx_addr).is_ok() {
             sent += 1;
         }
@@ -1085,11 +1085,11 @@ fn bench_udp_sendto() {
     );
 }
 
-// ── Gebatchte UDP-I/O (quinn-udp GSO/GRO) ────────────────────────────────────
+// ── Batched UDP I/O (quinn-udp GSO/GRO) ──────────────────────────────────────
 
-/// Correctheidsgate voor de syscall-laag: een batch datagrammen die via
-/// `batch_send` (GSO waar mogelijk) de deur uit gaat, moet via `batch_recv`
-/// (GRO of per-pakket) compleet en intact terugkomen.
+/// Correctness gate for the syscall layer: a batch of datagrams that goes out
+/// via `batch_send` (GSO where possible) must come back complete and intact via
+/// `batch_recv` (GRO or per-packet).
 #[tokio::test]
 async fn udp_batch_roundtrip() {
     use tokio::net::UdpSocket;
@@ -1100,7 +1100,7 @@ async fn udp_batch_roundtrip() {
     let tx_state = chameleon::udp::socket_state(&tx).unwrap();
     let rx_state = chameleon::udp::socket_state(&rx).unwrap();
 
-    // 5 gelijk-grote datagrammen (elk uniform gevuld met zijn index).
+    // 5 equal-sized datagrams (each uniformly filled with its index).
     let dg: Vec<Bytes> = (0..5u8).map(|i| Bytes::from(vec![i; 1280])).collect();
     chameleon::udp::batch_send(&tx, &tx_state, rx_addr, &dg, 1280, true)
         .await
@@ -1117,18 +1117,18 @@ async fn udp_batch_roundtrip() {
         .expect("recv timeout")
         .unwrap();
         for (_src, d) in chameleon::udp::iter_datagrams(&storage, &metas, n) {
-            assert_eq!(d.len(), 1280, "datagram intact van lengte");
-            assert!(d.iter().all(|&b| b == d[0]), "datagram uniform gevuld");
+            assert_eq!(d.len(), 1280, "datagram intact in length");
+            assert!(d.iter().all(|&b| b == d[0]), "datagram uniformly filled");
             fills.push(d[0]);
         }
     }
-    // Alle 5 aangekomen (volgorde-onafhankelijk).
+    // All 5 arrived (order-independent).
     fills.sort_unstable();
     assert_eq!(fills, vec![0, 1, 2, 3, 4]);
 }
 
-/// Micro-benchmark: batch_send-doorvoer t.o.v. de per-pakket send_to-baseline.
-/// Draai met:  cargo test --release bench_udp_gso -- --ignored --nocapture
+/// Micro-benchmark: batch_send throughput vs the per-packet send_to baseline.
+/// Run with:  cargo test --release bench_udp_gso -- --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn bench_udp_gso() {
@@ -1141,7 +1141,7 @@ async fn bench_udp_gso() {
     let rx_state = chameleon::udp::socket_state(&rx).unwrap();
     let tx_state = chameleon::udp::socket_state(&tx).unwrap();
 
-    // Drain-taak zodat de rx-buffer niet vol loopt.
+    // Drain task so the rx buffer doesn't fill up.
     let drain = tokio::spawn(async move {
         let (mut st, mut mt) = chameleon::udp::recv_buffers();
         while chameleon::udp::batch_recv(&rx, &rx_state, &mut st, &mut mt)
@@ -1165,14 +1165,14 @@ async fn bench_udp_gso() {
     let dt = t.elapsed().as_secs_f64();
     println!(
         "\n=== GSO batch_send microbench (loopback, 1280 B, batch {batch}) ===\n  \
-         batch_send: {:.2} Mpps  {:.2} Gbit/s  ({sent} pkts) — vs per-pakket ~0.18 Mpps",
+         batch_send: {:.2} Mpps  {:.2} Gbit/s  ({sent} pkts) — vs per-packet ~0.18 Mpps",
         sent as f64 / dt / 1e6,
         sent as f64 * 1280.0 * 8.0 / dt / 1e9
     );
     drain.abort();
 }
 
-// ── Parallelle crypto over cores (Fase C) ────────────────────────────────────
+// ── Parallel crypto across cores (Phase C) ───────────────────────────────────
 
 use chameleon::engine::{CryptoEngine, OutboundPacket};
 use std::sync::Arc;
@@ -1188,10 +1188,10 @@ fn obf_engine(shared: [u8; 32], is_initiator: bool, policy: PadPolicy) -> Crypto
     CryptoEngine::new(mgr, true, policy)
 }
 
-/// Parallel verzegelde pakketten moeten geldig zijn: unieke counters (geen
-/// nonce-botsing) en allemaal correct te ontsleutelen. (Byte-gelijkheid met de
-/// sequentiële variant kan NIET: parallelle counter-toewijzing is niet-
-/// deterministisch, en de padding is willekeurig — maar élk pakket opent.)
+/// Parallel-sealed packets must be valid: unique counters (no nonce collision)
+/// and all correctly decryptable. (Byte equality with the sequential variant is
+/// NOT possible: parallel counter assignment is non-deterministic, and the
+/// padding is random — but every packet opens.)
 #[test]
 fn encrypt_batch_par_produces_decryptable_packets() {
     let shared = [0x80u8; 32];
@@ -1209,19 +1209,19 @@ fn encrypt_batch_par_produces_decryptable_packets() {
 
     let mut recovered = std::collections::HashSet::new();
     for w in &wires {
-        let (ft, plain) = rx.decrypt_obf(w).expect("parallel-verzegeld pakket opent");
+        let (ft, plain) = rx.decrypt_obf(w).expect("parallel-sealed packet opens");
         assert_eq!(ft, FrameType::Data);
         recovered.insert(plain.to_vec());
     }
     assert_eq!(
         recovered.len(),
         n,
-        "alle {n} unieke plaintexts teruggekregen"
+        "all {n} unique plaintexts recovered"
     );
 }
 
-/// `decrypt_batch_par` classificeert: geobfusceerde data → Ok(Data), ruis → Err
-/// (zodat de coördinator die als handshake/ruis serieel afhandelt).
+/// `decrypt_batch_par` classifies: obfuscated data → Ok(Data), noise → Err
+/// (so the coordinator handles those as handshake/noise serially).
 #[test]
 fn decrypt_batch_par_classifies_data_and_noise() {
     let shared = [0x81u8; 32];
@@ -1241,7 +1241,7 @@ fn decrypt_batch_par_classifies_data_and_noise() {
             (addr, w)
         })
         .collect();
-    // Eén ruis-datagram ertussen.
+    // One noise datagram in between.
     datagrams.push((addr, Bytes::from(vec![0xEEu8; 60])));
 
     let results = rx.decrypt_batch_par(&datagrams);
@@ -1257,12 +1257,12 @@ fn decrypt_batch_par_classifies_data_and_noise() {
             Err(_) => err += 1,
         }
     }
-    assert_eq!(ok, 200, "alle data geopend");
-    assert_eq!(err, 1, "ruis als Err geclassificeerd");
+    assert_eq!(ok, 200, "all data opened");
+    assert_eq!(err, 1, "noise classified as Err");
 }
 
-/// Micro-benchmark: parallelle vs sequentiële crypto-doorvoer + schaling.
-/// Draai met:  cargo test --release bench_crypto_parallel -- --ignored --nocapture
+/// Micro-benchmark: parallel vs sequential crypto throughput + scaling.
+/// Run with:  cargo test --release bench_crypto_parallel -- --ignored --nocapture
 #[test]
 #[ignore]
 fn bench_crypto_parallel() {
@@ -1281,7 +1281,7 @@ fn bench_crypto_parallel() {
     let cores = std::thread::available_parallelism()
         .map(|c| c.get())
         .unwrap_or(1);
-    println!("\n=== crypto parallel vs sequentieel ({n} x 1200 B, {cores} cores) ===");
+    println!("\n=== crypto parallel vs sequential ({n} x 1200 B, {cores} cores) ===");
 
     // Seal.
     let eng = obf_engine(shared, true, PadPolicy::Full);
@@ -1299,7 +1299,7 @@ fn bench_crypto_parallel() {
         seq / par
     );
 
-    // Open (decrypt): seal M distinct, dan sequentieel vs parallel openen.
+    // Open (decrypt): seal M distinct, then open sequentially vs in parallel.
     let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
     let txm = SessionManager::new(obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305));
     let dg: Vec<(std::net::SocketAddr, Bytes)> = (0..n)
@@ -1329,21 +1329,21 @@ fn bench_crypto_parallel() {
     );
 }
 
-// ── L-5: rol-gebonden handshake-handtekeningen ───────────────────────────────
+// ── L-5: role-bound handshake signatures ─────────────────────────────────────
 
 #[test]
 fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
-    // Domeinscheiding (L-5): responder tekent SIG_LABEL_RESPONDER‖th, initiator
-    // SIG_LABEL_INITIATOR‖th. Zelfs met IDENTIEKE identiteitssleutels aan beide
-    // kanten (het worst case voor reflectie) mag de responder-handtekening niet
-    // als initiator-bewijs in de Confirm gelden.
+    // Domain separation (L-5): responder signs SIG_LABEL_RESPONDER‖th, initiator
+    // SIG_LABEL_INITIATOR‖th. Even with IDENTICAL identity keys on both sides
+    // (the worst case for reflection) the responder signature must not count as
+    // initiator proof in the Confirm.
     let seed = [7u8; 32];
     let pubk = Ed25519Auth::derive_public(&seed);
     let mk = || Ed25519Auth::new(&seed, pubk).unwrap(); // own == peer == pubk
 
-    // (A) Reflectiepoging: neem de responder-sig uit de Response en plak 'm in
-    //     een Confirm. Zonder rol-binding (beide over th, zelfde sleutel) zou dit
-    //     slagen; mét L-5 moet het falen.
+    // (A) Reflection attempt: take the responder sig from the Response and paste
+    //     it into a Confirm. Without role binding (both over th, same key) this
+    //     would succeed; with L-5 it must fail.
     let (_hs_init_a, init_wire_a) = Handshake::start(&mk()).unwrap();
     let (hs_resp_a, resp_wire_a) = Handshake::respond(init_wire_a, &mk()).unwrap();
     let resp_msg_a = HandshakeMessage::decode(resp_wire_a).unwrap();
@@ -1351,12 +1351,12 @@ fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
     forged.sig = resp_msg_a.sig;
     assert!(
         hs_resp_a.confirm(forged.encode().unwrap(), &mk()).is_err(),
-        "gereflecteerde responder-sig mag niet als initiator-bewijs gelden (L-5)"
+        "reflected responder sig must not count as initiator proof (L-5)"
     );
 
-    // (B) Controle: met dezelfde gedeelde sleutel slaagt een ECHTE handshake nog
-    //     steeds -> de afwijzing in (A) komt door de rol-binding, niet doordat de
-    //     sleutel niet zou matchen.
+    // (B) Control: with the same shared key a REAL handshake still succeeds ->
+    //     the rejection in (A) is due to the role binding, not because the key
+    //     wouldn't match.
     let (hs_init_b, init_wire_b) = Handshake::start(&mk()).unwrap();
     let (hs_resp_b, resp_wire_b) = Handshake::respond(init_wire_b, &mk()).unwrap();
     let (_done, confirm_wire_b) = hs_init_b.finalize(resp_wire_b, &mk()).unwrap();
@@ -1365,11 +1365,11 @@ fn confirm_rejects_reflected_responder_signature_even_with_shared_key() {
             hs_resp_b.confirm(confirm_wire_b, &mk()).unwrap(),
             Handshake::Established { .. }
         ),
-        "echte confirm met gedeelde sleutel wordt wél geaccepteerd"
+        "real confirm with shared key is accepted"
     );
 }
 
-// ── M-2: bounded initiële handshake over echte UDP ───────────────────────────
+// ── M-2: bounded initial handshake over real UDP ─────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_over_udp_completes_mutual() {
@@ -1386,7 +1386,7 @@ async fn handshake_over_udp_completes_mutual() {
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_addr = client.local_addr().unwrap();
 
-    // Responder in een aparte taak (de initiator retryt tot hij luistert).
+    // Responder in a separate task (the initiator retries until it listens).
     let resp_task = tokio::spawn(async move {
         let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
         run_handshake_responder(&server, &resp_auth, None).await
@@ -1398,14 +1398,14 @@ async fn handshake_over_udp_completes_mutual() {
         .expect("initiator handshake ok");
 
     let (resp_session, peer) = resp_task.await.unwrap().expect("responder handshake ok");
-    assert_eq!(peer, client_addr, "responder pint het initiator-bronadres");
+    assert_eq!(peer, client_addr, "responder pins the initiator source address");
 
-    // Sinds I-13 leiden beide kanten hetzelfde session_id uit het gedeelde geheim
-    // af (geen proces-globale teller meer), dus een echte data-roundtrip werkt óók
-    // in één testproces: dit bewijst matchende directionele sleutels + session_id.
+    // Since I-13 both sides derive the same session_id from the shared secret
+    // (no more process-global counter), so a real data roundtrip works even in a
+    // single test process: this proves matching directional keys + session_id.
     assert_eq!(
         init_session.session_id, resp_session.session_id,
-        "beide kanten leiden hetzelfde session_id af (I-13)"
+        "both sides derive the same session_id (I-13)"
     );
     let (ctr, ct) = init_session.encrypt(b"udp ping").unwrap();
     assert_eq!(&resp_session.decrypt(ctr, &ct).unwrap()[..], b"udp ping");
@@ -1419,8 +1419,8 @@ async fn handshake_initiator_times_out_without_responder() {
     let init_auth = Ed25519Auth::new(&[5u8; 32], Ed25519Auth::derive_public(&[6u8; 32])).unwrap();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    // Een echt gebonden maar STILLE peer: die antwoordt nooit (geen ICMP-fout,
-    // dus we testen echt het timeout-pad, niet een socket-fout).
+    // A really bound but SILENT peer: it never answers (no ICMP error, so we
+    // really test the timeout path, not a socket error).
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
 
@@ -1428,16 +1428,16 @@ async fn handshake_initiator_times_out_without_responder() {
     let res = run_handshake_initiator(&client, dead_addr, &init_auth, None).await;
     assert!(
         res.is_err(),
-        "geen response -> handshake faalt schoon (geen hang)"
+        "no response -> handshake fails cleanly (no hang)"
     );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(30),
-        "handshake moet bounded falen, niet oneindig hangen"
+        "handshake must fail bounded, not hang forever"
     );
     drop(dead);
 }
 
-// ── L-6: identiteiten gebonden in het transcript ─────────────────────────────
+// ── L-6: identities bound in the transcript ──────────────────────────────────
 
 #[test]
 fn identity_binding_is_symmetric_and_peer_dependent() {
@@ -1451,23 +1451,23 @@ fn identity_binding_is_symmetric_and_peer_dependent() {
 
     let init = Ed25519Auth::new(&i, r_pub).unwrap(); // own I, peer R
     let resp = Ed25519Auth::new(&r, i_pub).unwrap(); // own R, peer I
-                                                     // Beide kanten leiden dezelfde binding af — noodzakelijk voor een geldige
-                                                     // handshake (anders divergeren de transcripts).
+                                                     // Both sides derive the same binding — necessary for a valid
+                                                     // handshake (otherwise the transcripts diverge).
     assert_eq!(
         init.identity_binding(),
         resp.identity_binding(),
-        "identity_binding moet symmetrisch zijn (own/peer omgewisseld)"
+        "identity_binding must be symmetric (own/peer swapped)"
     );
-    // Een andere peer -> een andere binding (de binding hangt van beide af).
+    // A different peer -> a different binding (the binding depends on both).
     let init_to_x = Ed25519Auth::new(&i, x_pub).unwrap();
     assert_ne!(
         init.identity_binding(),
         init_to_x.identity_binding(),
-        "een andere peer moet een andere binding geven"
+        "a different peer must give a different binding"
     );
 }
 
-// ── L-9: low-order / all-zero X25519 wordt geweigerd ─────────────────────────
+// ── L-9: low-order / all-zero X25519 is rejected ─────────────────────────────
 
 #[test]
 fn respond_rejects_low_order_x25519_point() {
@@ -1476,17 +1476,17 @@ fn respond_rejects_low_order_x25519_point() {
 
     let (_hs, init_wire) = Handshake::start(&init_auth).unwrap();
     let mut init_msg = HandshakeMessage::decode(init_wire).unwrap();
-    // All-zero = de X25519 identity (een low-order punt): de DH-uitkomst is 0.
+    // All-zero = the X25519 identity (a low-order point): the DH result is 0.
     init_msg.x25519_pub = [0u8; 32];
     let tampered = init_msg.encode().unwrap();
 
     assert!(
         Handshake::respond(tampered, &resp_auth).is_err(),
-        "low-order/all-zero X25519-punt moet worden geweigerd (L-9)"
+        "low-order/all-zero X25519 point must be rejected (L-9)"
     );
 }
 
-// ── I-13: session_id afgeleid uit het gedeelde geheim ────────────────────────
+// ── I-13: session_id derived from the shared secret ──────────────────────────
 
 #[test]
 fn derived_session_id_matches_across_sides_and_differs_per_handshake() {
@@ -1504,31 +1504,31 @@ fn derived_session_id_matches_across_sides_and_differs_per_handshake() {
         let done_r = hs_r.confirm(conf_w, &mk_r()).unwrap();
         let sid_i = match done_i {
             Handshake::Established { session } => session.session_id,
-            _ => panic!("initiator niet Established"),
+            _ => panic!("initiator not Established"),
         };
         let sid_r = match done_r {
             Handshake::Established { session } => session.session_id,
-            _ => panic!("responder niet Established"),
+            _ => panic!("responder not Established"),
         };
         (sid_i, sid_r)
     };
 
     let (a_i, a_r) = run();
     let (b_i, b_r) = run();
-    // Beide kanten van één handshake komen op hetzelfde id uit.
+    // Both sides of one handshake arrive at the same id.
     assert_eq!(
         a_i, a_r,
-        "beide kanten leiden hetzelfde session_id af (I-13)"
+        "both sides derive the same session_id (I-13)"
     );
     assert_eq!(
         b_i, b_r,
-        "beide kanten leiden hetzelfde session_id af (I-13)"
+        "both sides derive the same session_id (I-13)"
     );
-    // Twee losse handshakes (verse ephemeral shared) geven verschillende ids,
-    // zodat current/previous tijdens een rekey-overlap uit elkaar te houden zijn.
+    // Two separate handshakes (fresh ephemeral shared) give different ids,
+    // so current/previous can be told apart during a rekey overlap.
     assert_ne!(
         a_i, b_i,
-        "verschillende handshakes -> verschillend session_id"
+        "different handshakes -> different session_id"
     );
 }
 
@@ -1539,14 +1539,14 @@ fn cookie_is_deterministic_and_input_dependent() {
     use chameleon::crypto::compute_cookie;
     let secret = [0x11u8; 32];
     let a: std::net::SocketAddr = "1.2.3.4:5678".parse().unwrap();
-    let b: std::net::SocketAddr = "1.2.3.4:5679".parse().unwrap(); // andere poort
-    let c: std::net::SocketAddr = "1.2.3.5:5678".parse().unwrap(); // ander ip
-                                                                   // Deterministisch: zelfde input -> zelfde cookie.
+    let b: std::net::SocketAddr = "1.2.3.4:5679".parse().unwrap(); // other port
+    let c: std::net::SocketAddr = "1.2.3.5:5678".parse().unwrap(); // other ip
+                                                                   // Deterministic: same input -> same cookie.
     assert_eq!(
         compute_cookie(&secret, &a, 100),
         compute_cookie(&secret, &a, 100)
     );
-    // Afhankelijk van poort, ip, tijdvenster en geheim.
+    // Depends on port, ip, time window and secret.
     assert_ne!(
         compute_cookie(&secret, &a, 100),
         compute_cookie(&secret, &b, 100)
@@ -1580,13 +1580,13 @@ async fn responder_challenges_cookieless_init() {
     let server_addr = server.local_addr().unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-    // Responder-taak (wordt nooit compleet — we echoën de cookie niet terug).
+    // Responder task (never completes — we don't echo the cookie back).
     tokio::spawn(async move {
         let resp_auth = Ed25519Auth::new(&resp_seed, init_pub).unwrap();
         let _ = run_handshake_responder(&server, &resp_auth, None).await;
     });
 
-    // Stuur een cleartext Init met cookie = 0 (obf uit).
+    // Send a cleartext Init with cookie = 0 (obf off).
     let init_auth = Ed25519Auth::new(&init_seed, resp_pub).unwrap();
     let (_hs, init_wire) = Handshake::start(&init_auth).unwrap();
     for frag in chameleon::tunnel::fragment(1, &init_wire) {
@@ -1596,8 +1596,8 @@ async fn responder_challenges_cookieless_init() {
         client.send_to(&f, server_addr).await.unwrap();
     }
 
-    // We moeten een CookieChallenge terugkrijgen — NIET een Response (die zou dure
-    // crypto op een ongeverifieerde bron betekenen).
+    // We must get a CookieChallenge back — NOT a Response (that would mean
+    // expensive crypto on an unverified source).
     let mut reasm = chameleon::tunnel::Reassembler::default();
     let mut buf = vec![0u8; 65536];
     let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1614,11 +1614,11 @@ async fn responder_challenges_cookieless_init() {
         }
     })
     .await
-    .expect("responder stuurde een reply");
+    .expect("responder sent a reply");
 
     assert_eq!(
         reply.msg_type,
         HandshakeType::CookieChallenge,
-        "een cookie-loze Init moet een CookieChallenge opleveren, geen Response (L-4)"
+        "a cookieless Init must yield a CookieChallenge, not a Response (L-4)"
     );
 }

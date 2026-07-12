@@ -1,14 +1,14 @@
 #![no_main]
-//! Fuzz de datapad-obfuscatie-parsers (obf.rs): header-unmasking en de inner
-//! framing. Attacker-input: elk geobfusceerd datapad-datagram / geopende blob.
+//! Fuzz the data-path obfuscation parsers (obf.rs): header unmasking and the
+//! inner framing. Attacker input: any obfuscated data-path datagram / opened blob.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let key = [0x42u8; 32];
-    // unmask is de lengte-gepoorte entry; ct_slice mag pas ná een geslaagde unmask.
+    // unmask is the length-gated entry; ct_slice may only run after a successful unmask.
     if chameleon::obf::unmask(&key, data).is_some() {
         let _ = chameleon::obf::ct_slice(data);
     }
-    // De inner framing wordt op de (elders) ontsleutelde plaintext toegepast.
+    // The inner framing is applied to the (elsewhere) decrypted plaintext.
     let _ = chameleon::obf::unpack_inner(data);
 });

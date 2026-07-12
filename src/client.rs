@@ -1,9 +1,10 @@
-//! Client-core: verbind als initiator en draai de tunnel op de achtergrond, met
-//! live status voor een frontend (UI). Dit is de motor die elke client — CLI,
-//! GUI, service — hergebruikt. Er zit GEEN eigen crypto in: alle beveiliging komt
-//! uit de handshake (`net::run_handshake_initiator`) en de tunnel-loops
-//! (`tunnel_loops::run_tunnel_loops`). Een client kan zo niets verzwakken; het
-//! enige wat het beveiligingsniveau bepaalt is de CONFIG (zie `security_warnings`).
+//! Client core: connect as initiator and run the tunnel in the background, with
+//! live status for a frontend (UI). This is the engine every client — CLI,
+//! GUI, service — reuses. It holds NO crypto of its own: all security comes
+//! from the handshake (`net::run_handshake_initiator`) and the tunnel loops
+//! (`tunnel_loops::run_tunnel_loops`). A client thus cannot weaken anything;
+//! the only thing that sets the security level is the CONFIG (see
+//! `security_warnings`).
 
 use crate::config::{AppConfig, EffectiveTraffic};
 use crate::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
@@ -23,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 
-/// Bouw de peer-authenticator uit de config: Ed25519, of hybride Ed25519 + ML-DSA
-/// (post-quantum) als beide ML-DSA-velden gezet zijn.
+/// Build the peer authenticator from the config: Ed25519, or hybrid Ed25519 +
+/// ML-DSA (post-quantum) if both ML-DSA fields are set.
 pub fn build_auth(cfg: &AppConfig) -> Result<Arc<dyn Authenticator>> {
     let seed = cfg.identity.seed_bytes()?;
     let peer_pub = cfg.identity.peer_pub_bytes()?;
@@ -44,8 +45,8 @@ pub fn build_auth(cfg: &AppConfig) -> Result<Arc<dyn Authenticator>> {
     }
 }
 
-/// Leid de statische handshake-obfuscatiesleutel af, of `None` als handshake-
-/// obfuscatie uit staat. Zelfde afleiding als de server, zodat ze matchen.
+/// Derive the static handshake-obfuscation key, or `None` if handshake
+/// obfuscation is off. Same derivation as the server, so they match.
 pub fn hs_obf_key(cfg: &AppConfig) -> Result<Option<[u8; 32]>> {
     if !cfg.obfuscation.handshake {
         return Ok(None);
@@ -60,9 +61,9 @@ pub fn hs_obf_key(cfg: &AppConfig) -> Result<Option<[u8; 32]>> {
     )))
 }
 
-/// Luide waarschuwingen bij een config die NIET op vol beveiligingsniveau draait
-/// (secure-by-default + loud warning). Een lege lijst = alle beveiliging aan.
-/// Een frontend hoort deze prominent te tonen.
+/// Loud warnings for a config that does NOT run at full security level
+/// (secure-by-default + loud warning). An empty list = all security on.
+/// A frontend should show these prominently.
 pub fn security_warnings(cfg: &AppConfig) -> Vec<String> {
     let mut w = Vec::new();
     if !cfg.identity.has_mldsa() {
@@ -106,7 +107,7 @@ pub fn security_warnings(cfg: &AppConfig) -> Vec<String> {
     w
 }
 
-/// Momentopname van de tunnel-status voor een UI.
+/// Snapshot of the tunnel status for a UI.
 #[derive(Debug, Clone)]
 pub struct Status {
     pub connected: bool,
@@ -114,13 +115,13 @@ pub struct Status {
     pub session_id: u32,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
-    /// Epoch-seconden van het laatst ontvangen pakket (0 = nog niets).
+    /// Epoch seconds of the last received packet (0 = nothing yet).
     pub last_recv_epoch: u64,
     pub uptime_secs: u64,
 }
 
-/// Een verbonden client: de tunnel-loops draaien op de achtergrond; deze handle
-/// geeft status en kan de tunnel sluiten.
+/// A connected client: the tunnel loops run in the background; this handle
+/// gives status and can close the tunnel.
 pub struct Client {
     stats: Arc<TunnelStats>,
     task: tokio::task::JoinHandle<()>,
@@ -155,11 +156,11 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Verbind als initiator naar `server`: doe de handshake en start de
-    /// tunnel-loops op de achtergrond (deze functie keert terug zodra de tunnel
-    /// staat). `tun` levert de frontend: `TunPair::create` voor een echte TUN, of
-    /// `TunPair::new_mock` voor tests. De handshake regelt de L-4-cookie,
-    /// M-2-retries en obfuscatie zelf — de client krijgt alle beveiliging vanzelf.
+    /// Connect as initiator to `server`: do the handshake and start the tunnel
+    /// loops in the background (this function returns as soon as the tunnel is
+    /// up). `tun` supplies the frontend: `TunPair::create` for a real TUN, or
+    /// `TunPair::new_mock` for tests. The handshake handles the L-4 cookie, M-2
+    /// retries and obfuscation itself — the client gets all security for free.
     pub async fn connect(
         cfg: &AppConfig,
         server: SocketAddr,
@@ -167,8 +168,8 @@ impl Client {
         tun: TunPair,
     ) -> Result<Self> {
         let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
-        // Ruime recv/send-buffers: de OS-default overflowt op bursty downloads
-        // (zie enlarge_socket_buffers) — dé oorzaak van de download-drops.
+        // Roomy recv/send buffers: the OS default overflows on bursty downloads
+        // (see enlarge_socket_buffers) — the cause of the download drops.
         crate::udp::enlarge_socket_buffers(&socket);
         let hs_obf = hs_obf_key(cfg)?;
         let session =
@@ -183,9 +184,9 @@ impl Client {
         ));
 
         let stats = Arc::new(TunnelStats::default());
-        // Meteen op verbonden zetten: de handshake IS gelukt. (run_tunnel_loops
-        // zet 'm ook, maar die taak start async — anders is er een korte race
-        // waarin status() nog "niet verbonden" zou melden.)
+        // Set connected at once: the handshake DID succeed. (run_tunnel_loops
+        // sets it too, but that task starts async — otherwise there is a brief
+        // race where status() would still report "not connected".)
         stats.connected.store(true, Ordering::Relaxed);
         // Live pacer control: seeded with the connect-time profile; `set_traffic`
         // pushes updates that the outbound loop applies without a reconnect.
@@ -268,7 +269,7 @@ impl Client {
         })
     }
 
-    /// Live status voor een UI.
+    /// Live status for a UI.
     pub fn status(&self) -> Status {
         Status {
             connected: self.stats.connected.load(Ordering::Relaxed) && !self.task.is_finished(),
