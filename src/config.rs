@@ -329,13 +329,13 @@ pub struct EffectiveTraffic {
 }
 
 /// `[traffic]`-sectie: constant-rate pacing + cover-traffic tegen timing-analyse.
-/// Kies een `profile` (standaard `balanced`); alleen bij `profile = "custom"`
+/// Kies een `profile` (standaard `off`); alleen bij `profile = "custom"`
 /// gelden de losse `mode`/`rate_pps`/`burst`-velden. De effectieve rate
 /// (`rate_pps` × `burst`) is ZOWEL de constante bandbreedte (CBR) ALS het
 /// doorvoerplafond.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrafficConfig {
-    /// Voorgedefinieerd profiel; standaard `balanced`. Wint van de losse velden
+    /// Voorgedefinieerd profiel; standaard `off`. Wint van de losse velden
     /// tenzij op `custom` gezet.
     #[serde(default)]
     pub profile: TrafficProfile,
