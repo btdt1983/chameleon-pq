@@ -1,102 +1,102 @@
-# Chameleon-PQ — configuratiebestand
-# Genereer sleutels met: chameleon-pq keygen
+# Chameleon-PQ — configuration file
+# Generate keys with: chameleon-pq keygen
 
 [identity]
-# Eigen Ed25519 seed (32 bytes hex) — GEHEIM houden.
+# Own Ed25519 seed (32 bytes hex) — keep SECRET.
 ed25519_seed_hex      = "0101010101010101010101010101010101010101010101010101010101010101"
-# Voorgedeelde publieke sleutel van de peer — uit 'keygen' van de andere kant.
+# Peer's pre-shared public key — from 'keygen' on the other side.
 peer_ed25519_pub_hex  = "0909090909090909090909090909090909090909090909090909090909090909"
 
-# ── Hybride post-quantum peer-auth (AANBEVOLEN) ─────────────────────────────
-# Vul deze twee in voor hybride Ed25519 + ML-DSA-65 authenticatie. De sleutels
-# zijn groot; genereer ze met `chameleon-pq keygen` en plak de hex hier.
-# Zet ze aan BEIDE kanten, of laat ze aan beide kanten weg voor Ed25519-only.
-#   mldsa_secret_hex    = "…eigen ML-DSA secret key (geheim)…"
-#   peer_mldsa_pub_hex  = "…ML-DSA publieke sleutel van de peer…"
+# ── Hybrid post-quantum peer auth (RECOMMENDED) ─────────────────────────────
+# Fill in these two for hybrid Ed25519 + ML-DSA-65 authentication. The keys
+# are large; generate them with `chameleon-pq keygen` and paste the hex here.
+# Set them on BOTH sides, or omit them on both sides for Ed25519 only.
+#   mldsa_secret_hex    = "…own ML-DSA secret key (secret)…"
+#   peer_mldsa_pub_hex  = "…peer's ML-DSA public key…"
 
 [network]
-# Server luistert hier op; client verbindt hierheen (overschrijfbaar via --bind / --server).
+# Server listens here; client connects here (overridable via --bind / --server).
 bind_addr   = "0.0.0.0:51820"
-server_addr = "1.2.3.4:51820"   # alleen nodig in client-modus
+server_addr = "1.2.3.4:51820"   # only needed in client mode
 
 [tun]
-name    = "chameleon0"           # interface-naam (Linux/macOS: vrije keuze; Windows: ook)
-address = "10.99.0.1"           # IP-adres van deze kant van de tunnel
+name    = "chameleon0"           # interface name (Linux/macOS: free choice; Windows: too)
+address = "10.99.0.1"           # IP address of this side of the tunnel
 netmask = "255.255.255.0"
-mtu     = 1200                  # MTU-veilig voor het geobf. datapad (max 1232);
-                                # groter fragmenteert IP en verraadt/breekt de obf
-# Full-tunnel routing (CLIENT-kant, WireGuard-stijl). Met route_all = true zet de
-# client bij connect ALLE verkeer door de tunnel (0.0.0.0/0) én pint het server-
-# endpoint aan de fysieke gateway, en ruimt dat bij disconnect weer op — geen
-# handmatige `route add` meer nodig. Vereist admin (Windows) / CAP_NET_ADMIN.
-# peer_address = het TUN-adres van de ANDERE kant (de server), de gateway waar de
-# client doorheen routeert. Laat route_all weg (of false) voor split-tunnel.
+mtu     = 1200                  # MTU-safe for the obfuscated data path (max 1232);
+                                # larger fragments IP and reveals/breaks the obf
+# Full-tunnel routing (CLIENT side, WireGuard style). With route_all = true the
+# client routes ALL traffic through the tunnel on connect (0.0.0.0/0) and pins
+# the server endpoint to the physical gateway, cleaning that up on disconnect —
+# no manual `route add` needed. Requires admin (Windows) / CAP_NET_ADMIN.
+# peer_address = the TUN address of the OTHER side (the server), the gateway the
+# client routes through. Omit route_all (or false) for split-tunnel.
 route_all    = false
-# peer_address = "10.99.0.1"     # zet dit op de client (server-TUN-adres)
+# peer_address = "10.99.0.1"     # set this on the client (server TUN address)
 
 [engine]
-# Maximale wachttijd (µs) voor een batch voordat die geflusht wordt.
-# 200 µs is veilig voor gaming; verhoog voor hogere throughput.
-# Het datapad draait volledig op de CPU (constant-time, low-latency).
+# Maximum wait time (µs) for a batch before it is flushed.
+# 200 µs is safe for gaming; increase for higher throughput.
+# The data path runs entirely on the CPU (constant-time, low-latency).
 batch_linger_us = 200
-# Aantal crypto-worker-threads (parallelle seal/open over cores). 0 = auto = alle
-# cores. Alleen van invloed op het SNELLE pad (traffic.enabled = false); met
-# timing-shaping aan capt de rate de doorvoer, dus dan is dit niet de bottleneck.
+# Number of crypto worker threads (parallel seal/open across cores). 0 = auto =
+# all cores. Only affects the FAST path (traffic.enabled = false); with timing
+# shaping on the rate caps throughput, so then this is not the bottleneck.
 workers = 0
-# UDP-GSO: bundel meerdere datagrammen in één send-syscall. Standaard UIT (false).
-# Aan zetten kan de doorvoer verhogen op een schoon Linux↔Linux-pad, MAAR op
-# sommige paden (Hyper-V vSwitch, bepaalde NIC-offload) wordt de gesegmenteerde
-# super-buffer in z'n geheel gedropt → massaal pakketverlies en een instortende
-# download. Laat op false tenzij je pad bewezen schoon is.
+# UDP GSO: bundle multiple datagrams into one send syscall. Default OFF (false).
+# Enabling it can raise throughput on a clean Linux↔Linux path, BUT on some
+# paths (Hyper-V vSwitch, certain NIC offload) the segmented super-buffer is
+# dropped in its entirety → massive packet loss and a collapsing download.
+# Leave at false unless your path is proven clean.
 gso = false
 
 [obfuscation]
-# Verkeersanalyse-weerstand op het DATApad (QUIC-stijl header-protection):
-# geen zichtbaar type-byte, session_id of counter, en padding tegen grootte-
-# lekkage. Standaard AAN — dit maakt het datapad incompatibel met 0.1.0-peers
-# (beide kanten moeten deze build draaien). Zet op false voor het klassieke,
-# niet-geobfusceerde frame (bv. voor debugging).
+# Traffic-analysis resistance on the DATA path (QUIC-style header protection):
+# no visible type byte, session_id or counter, and padding against size
+# leakage. Default ON — this makes the data path incompatible with 0.1.0 peers
+# (both sides must run this build). Set to false for the classic,
+# non-obfuscated frame (e.g. for debugging).
 enabled = true
-# Padding-beleid: "off" | "bucketed" | "full".
-#   off      — geen padding (grootte lekt de plaintext-lengte)
-#   bucketed — pad naar grootteklassen (verbergt exacte lengte; aanbevolen)
-#   full     — pad elk pakket naar de MTU-veilige max (beste obfuscatie, duurst)
+# Padding policy: "off" | "bucketed" | "full".
+#   off      — no padding (size leaks the plaintext length)
+#   bucketed — pad to size classes (hides exact length; recommended)
+#   full     — pad every packet to the MTU-safe max (best obfuscation, costliest)
 padding = "bucketed"
-# Obfusceer óók de HANDSHAKE-envelope (geen zichtbaar type-byte/fragment-header,
-# wisselend-grote fragmenten). Standaard AAN — beide kanten moeten dit gelijk
-# hebben (incompatibel met 0.1.x-peers). Zet op false voor de klassieke handshake.
+# Also obfuscate the HANDSHAKE envelope (no visible type byte/fragment header,
+# varying-size fragments). Default ON — both sides must have this the same
+# (incompatible with 0.1.x peers). Set to false for the classic handshake.
 handshake = true
-# Optioneel: gedeeld obfuscatie-geheim (hex, >= 16 bytes) voor de handshake.
-# Zonder dit wordt de handshake-obfuscatiesleutel afgeleid uit de voorgedeelde
-# Ed25519-pubkeys (nul config). Mét dit kan een tegenstander die alleen de
-# pubkeys heeft de handshake niet de-obfusceren. Zet op BEIDE kanten hetzelfde.
+# Optional: shared obfuscation secret (hex, >= 16 bytes) for the handshake.
+# Without it the handshake obfuscation key is derived from the pre-shared
+# Ed25519 pubkeys (zero config). With it, an adversary who only has the
+# pubkeys cannot de-obfuscate the handshake. Set the same on BOTH sides.
 #   psk_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 
 [traffic]
-# Timing-/cover-traffic-obfuscatie: verstuur op een VAST tempo en vul lege slots
-# met dummy-pakketten, zodat burst-/idle-patronen verdwijnen (de laatste dimensie
-# van verkeersanalyse). Vereist obfuscation.enabled = true.
+# Timing/cover-traffic obfuscation: send at a FIXED tempo and fill empty slots
+# with dummy packets, so burst/idle patterns disappear (the last dimension of
+# traffic analysis). Requires obfuscation.enabled = true.
 #
-# Kies een PROFILE; dat zet mode/rate_pps/burst in één keer goed. De effectieve
-# rate (rate_pps × burst) is je doorvoerplafond (verkeer daarboven wordt gedropt)
-# én, in CBR, je constante bandbreedte (~1232 B per pakket op de lijn).
+# Choose a PROFILE; that sets mode/rate_pps/burst correctly in one go. The
+# effective rate (rate_pps × burst) is your throughput ceiling (traffic above it
+# is dropped) and, in CBR, your constant bandwidth (~1232 B per packet on the wire).
 #
-#   "stealth"    — CBR, 256×2 ≈ 5 Mbit/s. Max anti-analyse; constante bandbreedte
-#                  24/7 (≈ 1,6 TB/maand/richting). Voor licht, onopvallend verkeer.
-#   "balanced"   — Adaptive, 3000×4 ≈ 115 Mbit/s. Timing verborgen tijdens
-#                  gebruik, STIL in rust. Goede algemene VPN-ervaring.
-#   "throughput" — Adaptive, 6000×8 ≈ 460 Mbit/s. Max snelheid mét pacing.
-#   "off"        — STANDAARD. Pacer UIT: native timing/snelheid, GEEN timing-
-#                  verhulling. WireGuard-vergelijkbaar (packet-vorm-padding blijft
-#                  wél aan). Kies "balanced"/"stealth" voor timing-resistentie.
-#   "custom"     — gebruik de losse mode/rate_pps/burst-velden hieronder.
+#   "stealth"    — CBR, 256×2 ≈ 5 Mbit/s. Max anti-analysis; constant bandwidth
+#                  24/7 (≈ 1.6 TB/month/direction). For light, inconspicuous traffic.
+#   "balanced"   — Adaptive, 3000×4 ≈ 115 Mbit/s. Timing hidden during
+#                  use, SILENT at rest. Good general VPN experience.
+#   "throughput" — Adaptive, 6000×8 ≈ 460 Mbit/s. Max speed with pacing.
+#   "off"        — DEFAULT. Pacer OFF: native timing/speed, NO timing
+#                  concealment. WireGuard-comparable (packet-shape padding stays
+#                  on). Choose "balanced"/"stealth" for timing resistance.
+#   "custom"     — use the individual mode/rate_pps/burst fields below.
 profile = "off"
 
-# De onderstaande velden gelden ALLEEN bij profile = "custom".
+# The fields below apply ONLY with profile = "custom".
 enabled  = true
-# "adaptive" — pace tijdens activiteit + cooldown, stil in rust
-# "cbr"      — constant bit-rate (altijd op tempo, ook idle; sterkst, duurst)
+# "adaptive" — pace during activity + cooldown, silent at rest
+# "cbr"      — constant bit-rate (always at tempo, even idle; strongest, costliest)
 mode     = "adaptive"
-rate_pps = 256      # emissie-slots per seconde
-burst    = 2        # pakketten per slot (rate = rate_pps × burst)
-cooldown_ms = 500   # adaptive: cover blijft zo lang na het laatste echte pakket
+rate_pps = 256      # emission slots per second
+burst    = 2        # packets per slot (rate = rate_pps × burst)
+cooldown_ms = 500   # adaptive: cover lasts this long after the last real packet
