@@ -14,9 +14,11 @@
 Thumbs.db
 
 # === SECURITY: never commit secrets ===
-# Echte configs met private keys/seeds (alleen example mag in git)
+# Real configs with private keys/seeds (only the example may be tracked)
 config.toml
 config*.toml
+# Catch any config with private keys regardless of prefix (e.g. client-config-pq.toml)
+*config*.toml
 !config.example.toml
 
 # Sleutel-bestanden in elke vorm
