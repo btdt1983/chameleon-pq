@@ -153,6 +153,36 @@ jobs:
             chameleon-gui.exe
           generate_release_notes: true
 
+  # Publish the crate to crates.io on a `vX.Y.Z` tag (after tests pass). Needs a
+  # crates.io API token in the `CARGO_REGISTRY_TOKEN` repo secret. Idempotent:
+  # skips if that version is already published, so a re-run or a manual
+  # `cargo publish` won't fail the job.
+  publish-crates:
+    name: Publish to crates.io
+    needs: build-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish (skip if version already on crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "::error::tag v$TAG_VER does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+          if curl -fsS -A "chameleon-ci" \
+              "https://crates.io/api/v1/crates/chameleon-pq/$CARGO_VER" >/dev/null 2>&1; then
+            echo "chameleon-pq $CARGO_VER is already on crates.io — skipping publish"
+          else
+            echo "Publishing chameleon-pq $CARGO_VER to crates.io"
+            cargo publish
+          fi
+
   # Coverage-guided fuzzing of the attacker-facing parsers (nightly + cargo-fuzz).
   # Runs weekly / on demand — NOT on every push, since the stable
   # `tests/fuzz_parsers.rs` harness already guards each commit. Each target runs
