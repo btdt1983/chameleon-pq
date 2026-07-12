@@ -20,8 +20,9 @@ Known scope limits:
   most important caveat for any self-built cryptographic protocol
 - The **data path**, the **handshake envelope**, AND now **packet timing** are
   all obfuscated — every datagram looks like uniform random bytes, and optional
-  traffic shaping (`[traffic]`, on by default in **Adaptive** mode; **CBR**
-  available for full constant-rate) sends on a fixed schedule with cover packets
+  traffic shaping (`[traffic]`, **off by default**; opt in via a profile —
+  **Adaptive** paces during use, **CBR** for full constant-rate) sends on a
+  fixed schedule with cover packets
   filling idle slots, so bursts and idle-vs-active dissolve into a steady
   stream. Residual (documented, not claimed as *full* resistance): the tunnel's
   existence and total duration are inherent to a fixed site-to-site link, the
@@ -66,12 +67,12 @@ Known scope limits:
   masked header — the handshake burst no longer shows a constant type byte or a
   fixed fragment structure. The real handshake crypto is unchanged; this is a
   pure outer obfuscation layer (no forward secrecy on the obf layer)
-- Timing / cover-traffic shaping (`pacer.rs`, `[traffic]`, on by default in
-  Adaptive mode): packets go out on a fixed schedule and empty slots are filled
+- Timing / cover-traffic shaping (`pacer.rs`, `[traffic]`, opt-in, **off by
+  default**): packets go out on a fixed schedule and empty slots are filled
   with cover (dummy) packets the receiver silently discards, so burst and
   idle-vs-active patterns are hidden. Cover packets are ordinary obf datagrams
   with an encrypted `Padding` inner type, constant-size under `Full` padding, so
-  they are wire-indistinguishable from real data. Adaptive (default) paces during
+  they are wire-indistinguishable from real data. Adaptive paces during
   activity + cooldown and goes quiet when idle (no bandwidth at rest); **CBR**
   streams constantly for the strongest hiding at a constant cost. No wire/proto
   change — a peer that predates this safely drops cover packets
@@ -83,13 +84,15 @@ Known scope limits:
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
 - Performance (no wire change): the data-path AEAD is auto-selected at startup
   by a quick benchmark (AEGIS-256X2 where it's fastest, ChaCha20 where AEGIS
-  would fall back to slow software AES); UDP I/O is batched with GSO on send /
-  GRO on receive (via `quinn-udp`, per-packet fallback on old kernels /
-  non-Linux) — a microbench lifts the send path from ~0.18 to ~9.6 Mpps; and the
-  seal/open runs in parallel across all cores (rayon, `[engine].workers`),
-  measured at ~4.5× (seal) / ~13× (open) on a 12-thread box. Note: the parallel
-  path helps the **fast mode** (`traffic.enabled = false`); with timing-shaping
-  on (default) the configured rate caps throughput, so speed vs.
+  would fall back to slow software AES); UDP I/O uses GRO on receive and
+  optional GSO on send (`[engine].gso`, **off by default** — it collapsed
+  downloads on some paths, e.g. a Hyper-V vSwitch; via `quinn-udp`, per-packet
+  fallback on old kernels / non-Linux) — a microbench lifts the send path from
+  ~0.18 to ~9.6 Mpps; and the seal/open runs in parallel across all cores
+  (rayon, `[engine].workers`), measured at ~4.5× (seal) / ~13× (open) on a
+  12-thread box. Note: the parallel path helps the **fast mode** (the default
+  `profile = "off"`); with timing-shaping on (opt-in) the configured rate caps
+  throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
 - 84 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
