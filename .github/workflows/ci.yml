@@ -88,12 +88,16 @@ jobs:
   # publish a GitHub Release with the built binaries attached.
   release:
     name: Publish release
-    needs: build-test
+    # Wait for the GUI build too: the Windows bundle ships the GUI client.
+    needs: [build-test, gui]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Needed for config.example.toml and the bundle README template.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: chameleon-pq-linux
@@ -102,16 +106,51 @@ jobs:
         with:
           name: chameleon-pq-windows
           path: ./windows
-      - name: Rename for release
+      - uses: actions/download-artifact@v4
+        with:
+          name: chameleon-gui-windows
+          path: ./gui-win
+
+      # Wintun is not vendored in git. Fetch the official Microsoft-signed DLL
+      # and pin it to the exact bytes we tested (SHA-256 of the amd64 DLL), so a
+      # silently-repackaged upstream can never slip a different binary into the
+      # release.
+      - name: Fetch and verify Wintun (amd64)
         run: |
-          mv linux/chameleon-pq chameleon-pq-linux-x86_64
-          mv windows/chameleon-pq.exe chameleon-pq-windows-x86_64.exe
+          WINTUN_VER=0.14.1
+          WINTUN_DLL_SHA256=e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce
+          curl -fsSL "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip" -o wintun.zip
+          unzip -q wintun.zip
+          echo "${WINTUN_DLL_SHA256}  wintun/bin/amd64/wintun.dll" | sha256sum -c -
+
+      # Self-contained Windows bundle: GUI + CLI + wintun.dll + example config +
+      # usage notes, in one versioned zip that works out of the box.
+      - name: Assemble Windows bundle
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          DIR="chameleon-pq-${VER}-windows-x64"
+          mkdir -p "$DIR"
+          cp gui-win/chameleon-gui.exe             "$DIR/chameleon-gui.exe"
+          cp windows/chameleon-pq.exe              "$DIR/chameleon-pq.exe"
+          cp wintun/bin/amd64/wintun.dll           "$DIR/wintun.dll"
+          cp config.example.toml                   "$DIR/config.example.toml"
+          cp packaging/windows/README-windows.txt  "$DIR/README-windows.txt"
+          zip -r "${DIR}.zip" "$DIR"
+
+      - name: Rename loose binaries for release
+        run: |
+          mv linux/chameleon-pq        chameleon-pq-linux-x86_64
+          mv windows/chameleon-pq.exe  chameleon-pq-windows-x86_64.exe
+          cp gui-win/chameleon-gui.exe chameleon-gui.exe
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            chameleon-pq-*-windows-x64.zip
             chameleon-pq-linux-x86_64
             chameleon-pq-windows-x86_64.exe
+            chameleon-gui.exe
           generate_release_notes: true
 
   # Coverage-guided fuzzing of the attacker-facing parsers (nightly + cargo-fuzz).
