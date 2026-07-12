@@ -28,6 +28,10 @@ config*.toml
 *_secret*
 *_private*
 
+# Native libs kept locally for the Windows bundle (never commit/publish these).
+# wintun.dll is redistributed via the GitHub release, not the crate.
+*.dll
+
 # Local environment overrides
 .env
 .env.local
