@@ -109,7 +109,7 @@ impl Op {
 #[cfg(target_os = "windows")]
 fn route_op(op: Op, cidr: &str, gw: &str, tun: Option<&str>) -> Result<()> {
     let (dst, mask) = cidr_to_dst_mask(cidr)?;
-    let mut cmd = Command::new("route");
+    let mut cmd = command("route");
     match op {
         // metric 1 so our routes win; `IF <idx>` binds to the tun (not a NIC).
         // If the tun has no ifindex yet it is not ready — fail so the caller
@@ -139,7 +139,7 @@ fn route_op(op: Op, cidr: &str, gw: &str, tun: Option<&str>) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn route_op(op: Op, cidr: &str, gw: &str, tun: Option<&str>) -> Result<()> {
-    let mut cmd = Command::new("ip");
+    let mut cmd = command("ip");
     match op {
         Op::Add => {
             cmd.args(["route", "add", cidr, "via", gw]);
@@ -157,7 +157,7 @@ fn route_op(op: Op, cidr: &str, gw: &str, tun: Option<&str>) -> Result<()> {
 /// The current IPv4 default gateway, for the endpoint pin.
 #[cfg(target_os = "windows")]
 fn default_gateway() -> Option<Ipv4Addr> {
-    let out = Command::new("route")
+    let out = command("route")
         .args(["print", "-4", "0.0.0.0"])
         .output()
         .ok()?;
@@ -193,7 +193,7 @@ fn default_gateway() -> Option<Ipv4Addr> {
 /// `netsh interface ipv4 show interfaces` (Idx is the first column).
 #[cfg(target_os = "windows")]
 fn tun_ifindex(name: &str) -> Option<u32> {
-    let out = Command::new("netsh")
+    let out = command("netsh")
         .args(["interface", "ipv4", "show", "interfaces"])
         .output()
         .ok()?;
@@ -238,6 +238,24 @@ fn cidr_to_dst_mask(cidr: &str) -> Result<(String, String)> {
     }
     let mask = if p == 0 { 0u32 } else { u32::MAX << (32 - p) };
     Ok((ip.to_string(), Ipv4Addr::from(mask).to_string()))
+}
+
+/// Build a `Command` that never flashes a console window on Windows.
+///
+/// The GUI runs on the `windows` subsystem (no console of its own), so every
+/// `route`/`netsh` child would otherwise pop up — and briefly flash — its own
+/// console window on connect. `CREATE_NO_WINDOW` (0x0800_0000) suppresses that.
+/// No-op on other platforms.
+fn command(program: &str) -> Command {
+    let cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    let cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd
+    };
+    cmd
 }
 
 fn run(mut cmd: Command, op: Op, what: &str) -> Result<()> {

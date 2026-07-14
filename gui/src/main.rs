@@ -13,7 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use chameleon::client::{build_auth, security_warnings, Client, Status};
-use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
+use chameleon::config::{AppConfig, TrafficProfile};
 use chameleon::tun_iface::TunPair;
 use iced::widget::{button, column, container, pick_list, row, scrollable, svg, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
@@ -517,17 +517,6 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let eff = TrafficConfig {
-            profile: self.profile,
-            ..Default::default()
-        }
-        .effective();
-        let ceiling = if eff.enabled {
-            let pps = eff.rate_pps as u64 * eff.burst as u64;
-            format!("≈ {} Mbit/s ceiling", pps * 1232 * 8 / 1_000_000)
-        } else {
-            "no shaping — WireGuard-comparable".to_string()
-        };
         let profile_row = row![
             label("Profile"),
             pick_list(
@@ -535,7 +524,6 @@ impl App {
                 Some(self.profile),
                 Message::ProfileChanged
             ),
-            text(ceiling).size(12).color(muted),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
