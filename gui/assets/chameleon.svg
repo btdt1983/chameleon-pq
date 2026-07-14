@@ -1,0 +1,32 @@
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Chameleon">
+  <!-- branch the feet grip -->
+  <rect x="18" y="100" width="92" height="6" rx="3" fill="#1f7a45" opacity="0.55"/>
+
+  <!-- hind + front feet (gripping) -->
+  <path d="M50 70 C 49 82, 47 92, 46 101  M58 71 C 61 84, 63 93, 63 101"
+        stroke="#22a35a" stroke-width="7" fill="none" stroke-linecap="round"/>
+  <path d="M82 64 C 82 80, 82 92, 82 101  M90 64 C 93 83, 94 93, 95 101"
+        stroke="#22a35a" stroke-width="7" fill="none" stroke-linecap="round"/>
+
+  <!-- prehensile tail, coiled -->
+  <path d="M90 58 C 110 55, 118 74, 104 83 C 95 88, 88 80, 94 73 C 98 69, 103 72, 101 76"
+        stroke="#2ec16b" stroke-width="8" fill="none" stroke-linecap="round"/>
+
+  <!-- body: snout → casque crest → arched back → belly -->
+  <path fill="#2ec16b" d="
+    M13 48
+    C 17 41, 24 37, 29 35
+    C 29 28, 32 23, 38 21
+    C 41 26, 41 32, 39 37
+    C 54 32, 72 34, 86 45
+    C 92 49, 95 55, 92 61
+    C 85 67, 73 69, 61 68
+    C 51 70, 44 67, 40 61
+    C 37 57, 34 53, 33 49
+    C 27 51, 19 51, 13 48
+    Z"/>
+
+  <!-- eye -->
+  <circle cx="30" cy="44" r="4.6" fill="#0c3f24"/>
+  <circle cx="31.6" cy="42.4" r="1.6" fill="#eafff3"/>
+</svg>
