@@ -15,8 +15,8 @@
 use chameleon::client::{build_auth, security_warnings, Client, Status};
 use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
 use chameleon::tun_iface::TunPair;
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
-use iced::{Color, Element, Length, Subscription, Task};
+use iced::widget::{button, column, container, pick_list, row, scrollable, svg, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ pub fn main() -> iced::Result {
     // (and, if present, also to stderr).
     init_diagnostics();
     iced::application("Chameleon-PQ", App::update, App::view)
+        .theme(App::theme)
         .subscription(App::subscription)
         .run_with(App::new)
 }
@@ -441,22 +442,61 @@ impl App {
         Task::none()
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let config_row = row![
-            text("Config:").width(Length::Fixed(70.0)),
-            text_input("config.toml", &self.config_path).on_input(Message::ConfigPathChanged),
-            button(text("Browse…")).on_press(Message::BrowseConfig),
-            button(text("Load")).on_press(Message::LoadConfig),
-        ]
-        .spacing(8);
+    fn theme(&self) -> Theme {
+        // Custom dark palette with a chameleon-green accent; iced derives the
+        // button/border shades from these.
+        Theme::custom(
+            "Chameleon".to_string(),
+            iced::theme::Palette {
+                background: Color::from_rgb8(0x14, 0x17, 0x1b),
+                text: Color::from_rgb8(0xe6, 0xe8, 0xea),
+                primary: Color::from_rgb8(0x2e, 0xc1, 0x6b),
+                success: Color::from_rgb8(0x2e, 0xc1, 0x6b),
+                danger: Color::from_rgb8(0xe5, 0x48, 0x4d),
+            },
+        )
+    }
 
+    fn view(&self) -> Element<'_, Message> {
+        let muted = Color::from_rgb8(0x8a, 0x93, 0x9c);
+
+        // Header: chameleon logo + wordmark.
+        let logo = svg(svg::Handle::from_memory(
+            include_bytes!("../assets/chameleon.svg").as_slice(),
+        ))
+        .width(Length::Fixed(46.0))
+        .height(Length::Fixed(46.0));
+        let header = row![
+            logo,
+            column![
+                text("Chameleon-PQ").size(24),
+                text("Post-quantum VPN").size(12).color(muted),
+            ]
+            .spacing(1),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        // Connection settings, grouped in a card.
+        let label = |s: &'static str| text(s).size(13).color(muted).width(Length::Fixed(58.0));
+        let config_row = row![
+            label("Config"),
+            text_input("config.toml", &self.config_path).on_input(Message::ConfigPathChanged),
+            button(text("Browse…"))
+                .style(button::secondary)
+                .on_press(Message::BrowseConfig),
+            button(text("Load"))
+                .style(button::secondary)
+                .on_press(Message::LoadConfig),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
         let server_row = row![
-            text("Server:").width(Length::Fixed(70.0)),
+            label("Server"),
             text_input("1.2.3.4:51820", &self.server).on_input(Message::ServerChanged),
         ]
-        .spacing(8);
-
-        // Profile picker with a live ceiling indication (computed via effective()).
+        .spacing(8)
+        .align_y(Alignment::Center);
         let eff = TrafficConfig {
             profile: self.profile,
             ..Default::default()
@@ -469,111 +509,164 @@ impl App {
             "no shaping — WireGuard-comparable".to_string()
         };
         let profile_row = row![
-            text("Profile:").width(Length::Fixed(70.0)),
+            label("Profile"),
             pick_list(
                 &TrafficProfile::ALL[..],
                 Some(self.profile),
                 Message::ProfileChanged
             ),
-            text(ceiling).size(13),
+            text(ceiling).size(12).color(muted),
         ]
-        .spacing(8);
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let settings = container(column![config_row, server_row, profile_row].spacing(10))
+            .padding(16)
+            .width(Length::Fill)
+            .style(card_style);
 
         // Big action button: Connect / Disconnect / (busy).
         let action: Element<Message> = if self.connecting {
-            button(text("Connecting …")).into()
+            button(text("Connecting …")).padding([10, 22]).into()
         } else if self.client.is_some() {
             button(text("Disconnect"))
+                .style(button::danger)
+                .padding([10, 22])
                 .on_press(Message::Disconnect)
                 .into()
         } else {
-            button(text("Connect")).on_press(Message::Connect).into()
+            button(text("Connect"))
+                .style(button::primary)
+                .padding([10, 22])
+                .on_press(Message::Connect)
+                .into()
         };
 
-        // Status panel.
-        let status_panel: Element<Message> = match &self.status {
-            Some(s) if s.connected => container(
-                column![
-                    text("● Connected").color(Color::from_rgb(0.1, 0.7, 0.2)),
-                    text(format!("peer: {}   session: {}", s.peer, s.session_id)),
-                    text(format!(
-                        "↑ {}   ↓ {}",
-                        human_bytes(s.tx_bytes),
-                        human_bytes(s.rx_bytes)
-                    )),
-                    text(format!(
-                        "uptime: {}s   last received: {}",
-                        s.uptime_secs,
-                        if s.last_recv_epoch == 0 {
-                            "—".to_string()
-                        } else {
-                            format!("{}s ago", now_secs().saturating_sub(s.last_recv_epoch))
-                        }
-                    )),
-                ]
-                .spacing(4),
-            )
-            .padding(8)
-            .into(),
-            _ => text("○ Not connected").into(),
-        };
-
-        // Security banner: red if something is weaker, green if everything is on.
+        // Security banner: green when everything is on, red otherwise.
         let banner: Element<Message> = if self.warnings.is_empty() {
-            container(text("Security: fully on").color(Color::WHITE))
-                .padding(8)
-                .style(|_| box_style(Color::from_rgb(0.12, 0.45, 0.18)))
+            container(text("🛡  Security: fully on"))
+                .padding([8, 12])
                 .width(Length::Fill)
+                .style(|_: &Theme| {
+                    banner_style(
+                        Color::from_rgb8(0x14, 0x4d, 0x2b),
+                        Color::from_rgb8(0x8c, 0xf5, 0xbb),
+                    )
+                })
                 .into()
         } else {
-            let mut col = column![text("⚠ Security warnings").color(Color::WHITE)].spacing(4);
+            let mut col = column![text("⚠  Security warnings")].spacing(4);
             for w in &self.warnings {
-                col = col.push(text(format!("• {w}")).color(Color::WHITE));
+                col = col.push(text(format!("•  {w}")).size(13));
             }
             container(col)
-                .padding(8)
-                .style(|_| box_style(Color::from_rgb(0.55, 0.13, 0.13)))
+                .padding([8, 12])
                 .width(Length::Fill)
+                .style(|_: &Theme| {
+                    banner_style(
+                        Color::from_rgb8(0x53, 0x1b, 0x1b),
+                        Color::from_rgb8(0xff, 0xb4, 0xb4),
+                    )
+                })
                 .into()
         };
 
-        let log = scrollable(
-            column(
-                self.log
-                    .iter()
-                    .map(|l| text(l).size(13).into())
-                    .collect::<Vec<_>>(),
+        // Status card.
+        let status_card: Element<Message> = match &self.status {
+            Some(s) if s.connected => container(
+                column![
+                    text("● Connected")
+                        .size(15)
+                        .color(Color::from_rgb8(0x39, 0xd9, 0x7f)),
+                    text(format!("peer {}   ·   session {}", s.peer, s.session_id))
+                        .size(13)
+                        .color(muted),
+                    row![
+                        text(format!("↑ {}", human_bytes(s.tx_bytes))).size(14),
+                        text(format!("↓ {}", human_bytes(s.rx_bytes))).size(14),
+                        text(format!(
+                            "uptime {}s   ·   last recv {}",
+                            s.uptime_secs,
+                            if s.last_recv_epoch == 0 {
+                                "—".to_string()
+                            } else {
+                                format!("{}s ago", now_secs().saturating_sub(s.last_recv_epoch))
+                            }
+                        ))
+                        .size(12)
+                        .color(muted),
+                    ]
+                    .spacing(18),
+                ]
+                .spacing(6),
             )
-            .spacing(2),
-        )
-        .height(Length::Fixed(150.0));
+            .padding(16)
+            .width(Length::Fill)
+            .style(card_style)
+            .into(),
+            _ => container(text("○  Not connected").size(14).color(muted))
+                .padding(16)
+                .width(Length::Fill)
+                .style(card_style)
+                .into(),
+        };
 
-        container(
-            column![
-                text("Chameleon-PQ").size(26),
-                banner,
-                config_row,
-                server_row,
-                profile_row,
-                action,
-                status_panel,
-                text("Log:"),
-                log,
-            ]
-            .spacing(12),
+        // Log card (monospace).
+        let log = container(
+            scrollable(
+                column(
+                    self.log
+                        .iter()
+                        .map(|l| text(l).size(12).font(iced::Font::MONOSPACE).into())
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(2),
+            )
+            .height(Length::Fixed(150.0)),
         )
-        .padding(16)
+        .padding(12)
+        .width(Length::Fill)
+        .style(card_style);
+
+        scrollable(
+            container(
+                column![
+                    header,
+                    banner,
+                    settings,
+                    action,
+                    status_card,
+                    text("Log").size(13).color(muted),
+                    log,
+                ]
+                .spacing(16),
+            )
+            .padding(22)
+            .max_width(560),
+        )
         .into()
     }
 }
 
-/// Background color for a banner (white text on top).
-fn box_style(bg: Color) -> container::Style {
+/// A settings/status "card": a subtly-raised panel with a rounded border.
+fn card_style(_theme: &Theme) -> container::Style {
     container::Style {
-        text_color: Some(Color::WHITE),
-        background: Some(iced::Background::Color(bg)),
-        border: iced::Border {
-            radius: 6.0.into(),
+        background: Some(Background::Color(Color::from_rgb8(0x1e, 0x22, 0x28))),
+        border: Border {
+            radius: 10.0.into(),
+            width: 1.0,
+            color: Color::from_rgb8(0x2b, 0x31, 0x39),
+        },
+        ..Default::default()
+    }
+}
+
+/// A colored status banner (background + foreground text color).
+fn banner_style(bg: Color, fg: Color) -> container::Style {
+    container::Style {
+        text_color: Some(fg),
+        background: Some(Background::Color(bg)),
+        border: Border {
+            radius: 8.0.into(),
             ..Default::default()
         },
         ..Default::default()

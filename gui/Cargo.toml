@@ -10,7 +10,7 @@ description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
 # build it explicitly with: `cargo build --manifest-path gui/Cargo.toml`.
 
 [dependencies]
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio", "svg"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 chameleon-pq = { path = ".." }
 # Diagnostics: the GUI (unlike the CLI) has no console on Windows, so we write
