@@ -308,11 +308,14 @@ impl TrafficProfile {
 impl std::fmt::Display for TrafficProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            TrafficProfile::Stealth => "stealth",
-            TrafficProfile::Balanced => "balanced",
-            TrafficProfile::Throughput => "throughput",
-            TrafficProfile::Off => "off",
-            TrafficProfile::Custom => "custom",
+            // Human-friendly labels for the GUI dropdown. NB the config file keys
+            // stay lowercase (serde rename_all = "lowercase"); this Display is
+            // presentation-only and is not used to (de)serialize the profile.
+            TrafficProfile::Stealth => "Maximum Privacy",
+            TrafficProfile::Balanced => "Balanced",
+            TrafficProfile::Throughput => "High Speed, Still Private",
+            TrafficProfile::Off => "Fastest, No Obfuscation",
+            TrafficProfile::Custom => "Custom",
         })
     }
 }
