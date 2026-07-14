@@ -16,6 +16,26 @@ ML-KEM-768 (KEM) mit X25519 für den Schlüsselaustausch und eine hybride
 Ed25519 + ML-DSA-65 (FIPS 204)-Signatur für die Peer-Authentifizierung,
 über UDP mit einer TUN-Schnittstelle unter Linux/macOS/Windows.
 
+## Warum post-quantum?
+
+Fast die gesamte heute genutzte Verschlüsselung — das Schloss-Symbol bei
+Websites, VPNs, Messenger-Apps — beruht auf Mathematik (RSA, elliptische Kurven),
+die ein ausreichend großer **Quantencomputer** brechen könnte. Solche Maschinen
+gibt es noch nicht, aber sie werden gebaut.
+
+Der Haken ist **„jetzt sammeln, später entschlüsseln"**: Ein Angreifer kann
+deinen verschlüsselten Datenverkehr *heute* aufzeichnen, speichern und einfach
+warten — um ihn Jahre später zu entschlüsseln, sobald ein Quantencomputer
+verfügbar ist. Alles, was lange geheim bleiben muss, ist also schon jetzt
+gefährdet, noch bevor es Quantencomputer überhaupt gibt.
+
+Chameleon-PQ ist für diese Welt gebaut. Es nutzt ein **hybrides** Design, das die
+heute bewährte Verschlüsselung (X25519) mit einem neuen **quantenresistenten**
+Verfahren (ML-KEM-768, von der NIST standardisiert) kombiniert. Dein
+Datenverkehr bleibt geschützt, solange *eines von beiden* hält — so gewinnst du
+Schutz gegen die Quantencomputer von morgen, ohne die heute vertraute Sicherheit
+aufzugeben.
+
 ## ⚠️ Sicherheitsstatus: EXPERIMENTELL
 
 **Dieser Code wurde nicht unabhängig auditiert und sollte nicht zum Schutz
