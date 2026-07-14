@@ -33,13 +33,14 @@ today's proven encryption (X25519) with a new **quantum-resistant** algorithm
 *either one* holds — so you gain defence against tomorrow's quantum computers
 without giving up the security we already trust today.
 
-## ⚠️ Security Status: EXPERIMENTAL
+## ⚠️ Security status: experimental — use at your own risk
 
-**This code has not been independently audited and should not be used to
-protect real traffic.** A self-built cryptographic protocol is a red flag
-until someone qualified has reviewed it. Use this as a learning project,
-an architecture reference, or a starting point for a properly audited
-system — not as a production VPN.
+Chameleon-PQ is **experimental** and has not undergone an **official,
+independent security audit**. Any self-built cryptographic protocol should be
+treated with caution until qualified reviewers have examined it, so **use it at
+your own risk**. It makes a great learning project, architecture reference, or
+starting point for a properly audited system — just not yet a drop-in production
+VPN.
 
 Known scope limits:
 - No external security audit has been performed — this remains the single
