@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="gui/assets/chameleon-icon.png" alt="Chameleon-PQ" width="120">
+</p>
+
 # Chameleon-PQ
 
 [![CI](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml/badge.svg)](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml)
@@ -87,6 +91,10 @@ Known scope limits:
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
+- **Desktop GUI client** (`chameleon-gui`, pure-Rust [iced]): a dark-themed
+  Windows app — pick a config, connect / disconnect, live status, a friendly
+  traffic-profile selector, and an in-app log, with no console window (see
+  [Desktop client](#desktop-client-gui) below)
 - Performance (no wire change): the data-path AEAD is auto-selected at startup
   by a quick benchmark (AEGIS-256X2 where it's fastest, ChaCha20 where AEGIS
   would fall back to slow software AES); UDP I/O uses GRO on receive and
@@ -129,6 +137,37 @@ Known scope limits:
   (`tunnel_loops::run_tunnel_loops`) run on both sides over loopback UDP with a
   mock TUN, and plaintext flows both ways through the full handshake (incl. the
   L-4 cookie round-trip) → seal → GSO-send → GRO-recv → decrypt → TUN path
+
+## Download
+
+Prebuilt binaries are attached to every [release](../../releases/latest):
+
+- **Windows** — `chameleon-pq-<version>-windows-x64.zip`: a self-contained bundle
+  with the desktop GUI (`chameleon-gui.exe`), the CLI (`chameleon-pq.exe`), the
+  Microsoft-signed `wintun.dll`, an example config, and setup notes. Unzip and
+  run — nothing else to install.
+- **Linux** — `chameleon-pq-linux-x86_64` (CLI).
+- **crates.io** — `cargo install chameleon-pq` (CLI).
+
+## Desktop client (GUI)
+
+<p align="center">
+  <img src="docs/screenshot.jpg" alt="chameleon-gui — connected to a peer" width="360">
+</p>
+
+Prefer click-to-connect over the command line? The Windows release ships a native
+desktop client, **chameleon-gui**, built in pure Rust with [iced]:
+
+- a dark theme with the chameleon logo and a matching taskbar icon;
+- pick your `config.toml`, connect / disconnect, and watch live status;
+- a friendly traffic-profile selector (Maximum Privacy · Balanced · High Speed ·
+  Fastest) and an in-app log — with no console window in the background;
+- a link straight to this repository from the header.
+
+It's included in the self-contained Windows bundle above, and also builds from
+source on Linux/macOS with `cargo build --release --manifest-path gui/Cargo.toml`.
+
+[iced]: https://iced.rs
 
 ## Build
 

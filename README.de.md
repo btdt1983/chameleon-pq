@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="gui/assets/chameleon-icon.png" alt="Chameleon-PQ" width="120">
+</p>
+
 # Chameleon-PQ
 
 [![CI](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml/badge.svg)](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml)
@@ -96,6 +100,10 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Teilstücke
 - Keepalive / Erkennung toter Peers
 - Plattformübergreifendes TUN: Linux, macOS, Windows (Wintun)
+- **Desktop-GUI-Client** (`chameleon-gui`, reines Rust mit [iced]): eine
+  Windows-App im Dark-Theme — Konfiguration auswählen, verbinden / trennen,
+  Live-Status, ein übersichtlicher Traffic-Profil-Auswähler und ein integriertes
+  Log, ohne Konsolenfenster (siehe [Desktop-Client](#desktop-client-gui) unten)
 - Performance (keine Wire-Änderung): das Datenpfad-AEAD wird beim Start per
   Kurz-Benchmark automatisch gewählt (AEGIS-256X2 wo am schnellsten, sonst
   ChaCha20 — z. B. wenn AEGIS auf Software-AES zurückfällt); die UDP-I/O ist
@@ -139,6 +147,37 @@ Bekannte Einschränkungen des Geltungsbereichs:
   mit einem Mock-TUN, und Klartext fließt in beide Richtungen durch den
   vollständigen Handshake (inkl. L-4-Cookie-Round-Trip) → Seal → GSO-Send →
   GRO-Recv → Decrypt → TUN-Pfad
+
+## Download
+
+Vorgefertigte Binaries hängen an jedem [Release](../../releases/latest):
+
+- **Windows** — `chameleon-pq-<version>-windows-x64.zip`: ein eigenständiges Bundle
+  mit der Desktop-GUI (`chameleon-gui.exe`), dem CLI (`chameleon-pq.exe`), der
+  Microsoft-signierten `wintun.dll`, einer Beispielkonfiguration und Hinweisen.
+  Entpacken und starten — sonst nichts zu installieren.
+- **Linux** — `chameleon-pq-linux-x86_64` (CLI).
+- **crates.io** — `cargo install chameleon-pq` (CLI).
+
+## Desktop-Client (GUI)
+
+<p align="center">
+  <img src="docs/screenshot.jpg" alt="chameleon-gui — mit einem Peer verbunden" width="360">
+</p>
+
+Lieber per Klick verbinden statt über die Kommandozeile? Das Windows-Release enthält
+einen nativen Desktop-Client, **chameleon-gui**, in reinem Rust mit [iced] gebaut:
+
+- ein Dark-Theme mit dem Chamäleon-Logo und passendem Taskleisten-Symbol;
+- `config.toml` auswählen, verbinden / trennen und den Live-Status verfolgen;
+- ein übersichtlicher Traffic-Profil-Auswähler (Maximum Privacy · Balanced · High
+  Speed · Fastest) und ein integriertes Log — ohne Konsolenfenster im Hintergrund;
+- ein Link direkt zu diesem Repository in der Kopfzeile.
+
+Er ist im eigenständigen Windows-Bundle oben enthalten und baut auch aus dem
+Quellcode unter Linux/macOS mit `cargo build --release --manifest-path gui/Cargo.toml`.
+
+[iced]: https://iced.rs
 
 ## Build
 
