@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "chameleon-pq"
-version = "0.6.1"
+version = "0.7.3"
 dependencies = [
  "aegis",
  "anyhow",

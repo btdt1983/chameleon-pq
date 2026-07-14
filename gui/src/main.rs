@@ -6,6 +6,12 @@
 //! NOTE: a real tunnel needs privileges for the TUN adapter (Linux:
 //! CAP_NET_ADMIN/sudo; Windows: admin + wintun.dll next to the binary).
 
+// Release builds detach from the console subsystem so NO cmd window opens
+// alongside the GUI on Windows. Debug keeps the console for dev output. Nothing
+// is lost: all library/tracing output already goes to chameleon-gui.log and the
+// panic hook. (Harmless / ignored on non-Windows targets.)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use chameleon::client::{build_auth, security_warnings, Client, Status};
 use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
 use chameleon::tun_iface::TunPair;
