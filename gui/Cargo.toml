@@ -11,6 +11,7 @@ description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio", "svg", "image"] }
+open = "5"                                # open the repo URL in the default browser
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 chameleon-pq = { path = ".." }
 # Diagnostics: the GUI (unlike the CLI) has no console on Windows, so we write
