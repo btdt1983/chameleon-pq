@@ -38,6 +38,14 @@ const MAX_QUEUE: usize = 1024;
 /// seal/decrypt sequentially to avoid the spawn_blocking+rayon overhead under
 /// light traffic.
 const PAR_THRESHOLD: usize = 16;
+/// Send-side seal threshold — deliberately HIGH. A per-flush
+/// `spawn_blocking(encrypt_batch_par)` parks the outbound `select!` loop for the
+/// ~100-300us of a rayon fork/join round-trip, so it cannot drain `from_tun`
+/// while a flush is in flight (measured: 22 pkts/flush at a 200us tick = ~770us
+/// stalled per flush). Inline serial sealing is what the RX path uses at ~76k
+/// pps on one core, and send needs far fewer seals/s. Kept separate from
+/// `PAR_THRESHOLD` so the RX parallel-decrypt decision stays unchanged.
+const SEND_PAR_THRESHOLD: usize = 128;
 
 /// The configuration values that `run_tunnel_loops` needs, OWNED (no
 /// `&AppConfig` borrow) so the loop can be spawned as a task — exactly what a
@@ -215,6 +223,9 @@ pub async fn run_tunnel_loops(
         // TEMP TX diagnostics (branch client-datapath-diag).
         let mut tx_diag = interval(Duration::from_secs(2));
         let (mut t_pkts, mut t_flushes, mut t_flush_pkts) = (0u64, 0u64, 0u64);
+        // Peak from_tun backlog over the window: near 512 => flush/consumer-bound
+        // (fix #1/#2 are the levers); near 0 => wintun-read supply-bound (fix #3).
+        let mut t_qmax = 0u64;
 
         loop {
             tokio::select! {
@@ -222,6 +233,7 @@ pub async fn run_tunnel_loops(
                     match maybe {
                         Some(pkt) => {
                             t_pkts += 1;
+                            t_qmax = t_qmax.max(from_tun.len() as u64);
                             stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             if paced {
                                 // Bounded queue with tail-drop (see MAX_QUEUE).
@@ -307,11 +319,11 @@ pub async fn run_tunnel_loops(
                     if t_pkts > 0 {
                         let avg_flush = t_flush_pkts as f64 / t_flushes.max(1) as f64;
                         info!(
-                            "TX-DIAG/2s: {} pkts ({}/s) from TUN | {} flushes, {:.1} pkts/flush (>= {} => parallel encrypt)",
-                            t_pkts, t_pkts / 2, t_flushes, avg_flush, PAR_THRESHOLD,
+                            "TX-DIAG/2s: {} pkts ({}/s) from TUN | {} flushes, {:.1} pkts/flush (par >= {}) | from_tun backlog max {}/512",
+                            t_pkts, t_pkts / 2, t_flushes, avg_flush, SEND_PAR_THRESHOLD, t_qmax,
                         );
                     }
-                    t_pkts = 0; t_flushes = 0; t_flush_pkts = 0;
+                    t_pkts = 0; t_flushes = 0; t_flush_pkts = 0; t_qmax = 0;
                 }
                 // Live traffic-profile switch: recompute pacing on the fly, with
                 // no reconnect. `if traffic_live` disables this arm once every
@@ -662,9 +674,11 @@ async fn flush_outbound(
 ) {
     let batch = std::mem::take(pending);
     let count = batch.len();
-    // Small batch: sequential (avoid the spawn_blocking+rayon overhead).
-    // Large batch: seal in PARALLEL across all cores via one spawn_blocking hop.
-    let sealed = if count < PAR_THRESHOLD {
+    // Common case: seal INLINE on this task — no spawn_blocking hand-off. The
+    // rayon round-trip parks the outbound loop and stalls draining `from_tun`;
+    // inline serial seal is exactly what the RX path does at ~76k pps. Only
+    // genuine large bursts (>= SEND_PAR_THRESHOLD) take the parallel hop.
+    let sealed = if count < SEND_PAR_THRESHOLD {
         engine.encrypt_batch(batch)
     } else {
         let engine = engine.clone();
