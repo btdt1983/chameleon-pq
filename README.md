@@ -1,5 +1,10 @@
 # Chameleon-PQ
 
+[![CI](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml/badge.svg)](https://github.com/btdt1983/chameleon-pq/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/chameleon-pq.svg)](https://crates.io/crates/chameleon-pq)
+[![Release](https://img.shields.io/github/v/release/btdt1983/chameleon-pq)](https://github.com/btdt1983/chameleon-pq/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 *🇬🇧 English | [🇩🇪 Deutsch](README.de.md)*
 
 Experimental hybrid post-quantum VPN written in Rust. Combines ML-KEM-768 (KEM)
