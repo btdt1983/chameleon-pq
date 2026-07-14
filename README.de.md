@@ -24,26 +24,27 @@ die ein ausreichend großer **Quantencomputer** brechen könnte. Solche Maschine
 gibt es noch nicht, aber sie werden gebaut.
 
 Der Haken ist **„jetzt sammeln, später entschlüsseln"**: Ein Angreifer kann
-deinen verschlüsselten Datenverkehr *heute* aufzeichnen, speichern und einfach
+Ihren verschlüsselten Datenverkehr *heute* aufzeichnen, speichern und einfach
 warten — um ihn Jahre später zu entschlüsseln, sobald ein Quantencomputer
 verfügbar ist. Alles, was lange geheim bleiben muss, ist also schon jetzt
 gefährdet, noch bevor es Quantencomputer überhaupt gibt.
 
 Chameleon-PQ ist für diese Welt gebaut. Es nutzt ein **hybrides** Design, das die
 heute bewährte Verschlüsselung (X25519) mit einem neuen **quantenresistenten**
-Verfahren (ML-KEM-768, von der NIST standardisiert) kombiniert. Dein
-Datenverkehr bleibt geschützt, solange *eines von beiden* hält — so gewinnst du
+Verfahren (ML-KEM-768, von der NIST standardisiert) kombiniert. Ihr
+Datenverkehr bleibt geschützt, solange *eines von beiden* hält — so gewinnen Sie
 Schutz gegen die Quantencomputer von morgen, ohne die heute vertraute Sicherheit
 aufzugeben.
 
-## ⚠️ Sicherheitsstatus: EXPERIMENTELL
+## ⚠️ Sicherheitsstatus: experimentell — Nutzung auf eigenes Risiko
 
-**Dieser Code wurde nicht unabhängig auditiert und sollte nicht zum Schutz
-von echtem Datenverkehr eingesetzt werden.** Ein selbst entwickeltes
-kryptografisches Protokoll ist ein Warnsignal, bis jemand mit
-entsprechender Qualifikation es geprüft hat. Nutzen Sie dies als
+Chameleon-PQ ist **experimentell** und wurde **nicht offiziell und unabhängig
+auditiert**. Jedes selbst entwickelte kryptografische Protokoll sollte mit
+Vorsicht behandelt werden, bis qualifizierte Fachleute es geprüft haben — die
+**Nutzung erfolgt daher auf eigenes Risiko**. Es eignet sich hervorragend als
 Lernprojekt, als Architekturreferenz oder als Ausgangspunkt für ein
-ordnungsgemäß auditiertes System – nicht als Produktiv-VPN.
+ordnungsgemäß auditiertes System — nur noch nicht als sofort einsetzbares
+Produktiv-VPN.
 
 Bekannte Einschränkungen des Geltungsbereichs:
 - Es wurde kein externes Sicherheitsaudit durchgeführt – das bleibt der mit
