@@ -1,32 +1,30 @@
-<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Chameleon">
+<svg viewBox="0 0 140 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Chameleon">
   <!-- branch the feet grip -->
-  <rect x="18" y="100" width="92" height="6" rx="3" fill="#1f7a45" opacity="0.55"/>
+  <path d="M14 106 H126" stroke="#1f7a45" stroke-width="7" stroke-linecap="round" opacity="0.5"/>
 
-  <!-- hind + front feet (gripping) -->
-  <path d="M50 70 C 49 82, 47 92, 46 101  M58 71 C 61 84, 63 93, 63 101"
-        stroke="#22a35a" stroke-width="7" fill="none" stroke-linecap="round"/>
-  <path d="M82 64 C 82 80, 82 92, 82 101  M90 64 C 93 83, 94 93, 95 101"
-        stroke="#22a35a" stroke-width="7" fill="none" stroke-linecap="round"/>
-
-  <!-- prehensile tail, coiled -->
-  <path d="M90 58 C 110 55, 118 74, 104 83 C 95 88, 88 80, 94 73 C 98 69, 103 72, 101 76"
-        stroke="#2ec16b" stroke-width="8" fill="none" stroke-linecap="round"/>
-
-  <!-- body: snout → casque crest → arched back → belly -->
+  <!-- BODY first, so legs + tail draw on top: snout, casque crest, arched back, belly -->
   <path fill="#2ec16b" d="
-    M13 48
-    C 17 41, 24 37, 29 35
-    C 29 28, 32 23, 38 21
-    C 41 26, 41 32, 39 37
-    C 54 32, 72 34, 86 45
-    C 92 49, 95 55, 92 61
-    C 85 67, 73 69, 61 68
-    C 51 70, 44 67, 40 61
-    C 37 57, 34 53, 33 49
-    C 27 51, 19 51, 13 48
-    Z"/>
+    M14 54
+    C 20 45 29 41 37 40
+    C 39 32 45 28 53 27
+    C 52 34 49 39 46 43
+    C 62 38 78 42 90 52
+    C 96 57 95 64 88 66
+    C 74 71 52 71 41 67
+    C 33 64 29 59 29 54
+    C 24 55 18 55 14 54 Z"/>
 
-  <!-- eye -->
-  <circle cx="30" cy="44" r="4.6" fill="#0c3f24"/>
-  <circle cx="31.6" cy="42.4" r="1.6" fill="#eafff3"/>
+  <!-- legs, on top -->
+  <g stroke="#1f8f4e" stroke-width="9" stroke-linecap="round" fill="none">
+    <path d="M49 65 C 48 80 47 92 46 103"/>
+    <path d="M79 63 C 81 79 82 92 82 103"/>
+  </g>
+
+  <!-- prehensile TAIL: bold spiral curling down-right from the rear, on top -->
+  <path d="M89 60 C 109 57 119 73 110 85 C 103 94 90 92 88 81 C 87 74 95 70 99 74 C 101 76 100 79 98 79"
+        fill="none" stroke="#2ec16b" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- turret eye -->
+  <circle cx="31" cy="50" r="5.6" fill="#0b3a22"/>
+  <circle cx="32.8" cy="48.2" r="2" fill="#eafff3"/>
 </svg>

@@ -28,8 +28,16 @@ pub fn main() -> iced::Result {
     // error/panic vanishes with the window. We log to a file NEXT to the binary
     // (and, if present, also to stderr).
     init_diagnostics();
+    // Window/taskbar icon (top-left title bar): the chameleon mark.
+    let icon =
+        iced::window::icon::from_file_data(include_bytes!("../assets/chameleon-icon.png"), None)
+            .ok();
     iced::application("Chameleon-PQ", App::update, App::view)
         .theme(App::theme)
+        .window(iced::window::Settings {
+            icon,
+            ..Default::default()
+        })
         .subscription(App::subscription)
         .run_with(App::new)
 }
