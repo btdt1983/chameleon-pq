@@ -212,11 +212,16 @@ pub async fn run_tunnel_loops(
         let mut traffic_rx = traffic_rx;
         let mut traffic_live = true;
 
+        // TEMP TX diagnostics (branch client-datapath-diag).
+        let mut tx_diag = interval(Duration::from_secs(2));
+        let (mut t_pkts, mut t_flushes, mut t_flush_pkts) = (0u64, 0u64, 0u64);
+
         loop {
             tokio::select! {
                 maybe = from_tun.recv() => {
                     match maybe {
                         Some(pkt) => {
+                            t_pkts += 1;
                             stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             if paced {
                                 // Bounded queue with tail-drop (see MAX_QUEUE).
@@ -228,6 +233,8 @@ pub async fn run_tunnel_loops(
                             } else {
                                 pending.push(OutboundPacket { plaintext: pkt });
                                 if pending.len() >= MAX_BATCH {
+                                    t_flushes += 1;
+                                    t_flush_pkts += pending.len() as u64;
                                     flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
                                 }
                             }
@@ -268,6 +275,8 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else if !pending.is_empty() {
+                        t_flushes += 1;
+                        t_flush_pkts += pending.len() as u64;
                         flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
                     }
 
@@ -293,6 +302,16 @@ pub async fn run_tunnel_loops(
                         }
                         rekeying_out.store(false, Ordering::Release);
                     }
+                }
+                _ = tx_diag.tick() => {
+                    if t_pkts > 0 {
+                        let avg_flush = t_flush_pkts as f64 / t_flushes.max(1) as f64;
+                        info!(
+                            "TX-DIAG/2s: {} pkts ({}/s) from TUN | {} flushes, {:.1} pkts/flush (>= {} => parallel encrypt)",
+                            t_pkts, t_pkts / 2, t_flushes, avg_flush, PAR_THRESHOLD,
+                        );
+                    }
+                    t_pkts = 0; t_flushes = 0; t_flush_pkts = 0;
                 }
                 // Live traffic-profile switch: recompute pacing on the fly, with
                 // no reconnect. `if traffic_live` disables this arm once every
