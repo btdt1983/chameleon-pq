@@ -28,7 +28,7 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{error, info, trace};
 
 const TUN_READ_BUF: usize = 65_536;
 const CHANNEL_DEPTH: usize = 512;
@@ -98,7 +98,7 @@ impl TunPair {
                         break;
                     }
                     Ok(n) => {
-                        debug!("TUN read {} bytes", n);
+                        trace!("TUN read {} bytes", n);
                         let pkt = Bytes::copy_from_slice(&buf[..n]);
                         if from_tun_tx.send(pkt).await.is_err() {
                             break;
@@ -115,7 +115,7 @@ impl TunPair {
         // Write task: engine (decrypt side) → TUN.
         let write_task = tokio::spawn(async move {
             while let Some(pkt) = to_tun_rx.recv().await {
-                debug!("TUN write {} bytes", pkt.len());
+                trace!("TUN write {} bytes", pkt.len());
                 if let Err(e) = device.send(&pkt).await {
                     error!("TUN write error: {e}");
                     break;

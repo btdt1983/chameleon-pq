@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const MAX_BATCH: usize = 256;
 /// Upper bound on the outbound queue under pacing. When full, the newest TUN
@@ -38,6 +38,17 @@ const MAX_QUEUE: usize = 1024;
 /// seal/decrypt sequentially to avoid the spawn_blocking+rayon overhead under
 /// light traffic.
 const PAR_THRESHOLD: usize = 16;
+/// Fix #2: depth of the sealed-batch hand-off channel between the outbound drain
+/// loop and the single UDP sender task. Bounded so a slow sender back-pressures
+/// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
+/// item is one drained batch (≤ MAX_BATCH datagrams).
+const SEND_PIPELINE_BATCHES: usize = 16;
+/// Fix #2-v2: a sealed batch this small is sent INLINE on the loop (no send_tx
+/// hand-off / sender wakeup). Bulk sends (the upload) exceed this and go to the
+/// dedicated sender task so the loop keeps draining; but the download's trickle
+/// of TCP ACKs (1-2 per drain) stays inline, avoiding the per-ACK pipeline
+/// overhead that stole client CPU from the RX path (it regressed download).
+const SEND_INLINE_MAX: usize = 8;
 
 /// The configuration values that `run_tunnel_loops` needs, OWNED (no
 /// `&AppConfig` borrow) so the loop can be spawned as a task — exactly what a
@@ -199,8 +210,33 @@ pub async fn run_tunnel_loops(
     // plain select! on JoinHandles detaches the losers, leaking a tunnel that
     // keeps sending — which broke disconnect and the server's session loop.
     let mut tasks = tokio::task::JoinSet::new();
+    // Fix #2: single UDP sender task. The outbound loop SEALS (assigns AEAD
+    // counters in from_tun drain order) then ships wires here; this ONE task pops
+    // FIFO and awaits the sends, so on-wire order == counter order. Spawned INTO
+    // `tasks` so tasks.shutdown()/drop aborts it — a detached tokio::spawn would
+    // leak a live sender.
+    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<Vec<Bytes>>(SEND_PIPELINE_BATCHES);
+    {
+        let socket_snd = socket.clone();
+        let state_snd = sock_state.clone();
+        let peer_snd = peer;
+        let gso_snd = gso;
+        tasks.spawn(async move {
+            while let Some(wires) = send_rx.recv().await {
+                for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                    if let Err(e) =
+                        crate::udp::batch_send(&socket_snd, &state_snd, peer_snd, run, seg, gso_snd)
+                            .await
+                    {
+                        error!("UDP batch send (pipeline): {e}");
+                    }
+                }
+            }
+        });
+    }
     tasks.spawn(async move {
         let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
+        let mut drained: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
         let mut tick = interval(if paced { pace_slot } else { linger });
@@ -214,25 +250,64 @@ pub async fn run_tunnel_loops(
 
         loop {
             tokio::select! {
-                maybe = from_tun.recv() => {
-                    match maybe {
-                        Some(pkt) => {
-                            stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                            if paced {
-                                // Bounded queue with tail-drop (see MAX_QUEUE).
-                                if pending.len() >= MAX_QUEUE {
-                                    debug!("outbound queue full — tail-drop");
-                                } else {
-                                    pending.push(OutboundPacket { plaintext: pkt });
-                                }
+                n = from_tun.recv_many(&mut drained, MAX_BATCH) => {
+                    if n == 0 {
+                        break; // channel closed → teardown
+                    }
+                    for pkt in &drained {
+                        stats_out.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
+                    if paced {
+                        // PACED: stage into `pending` (bounded, tail-drop); the tick
+                        // arm emits at the constant slot rate.
+                        for pkt in drained.drain(..) {
+                            if pending.len() >= MAX_QUEUE {
+                                debug!("outbound queue full — tail-drop");
                             } else {
                                 pending.push(OutboundPacket { plaintext: pkt });
-                                if pending.len() >= MAX_BATCH {
-                                    flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
-                                }
                             }
                         }
-                        None => break,
+                    } else {
+                        // NON-PACED throughput path: seal here (counters monotonic in
+                        // from_tun drain order) and hand the wires to the sender task.
+                        // No inline socket await → the loop returns to draining at once.
+                        let batch: Vec<OutboundPacket> = drained
+                            .drain(..)
+                            .map(|plaintext| OutboundPacket { plaintext })
+                            .collect();
+                        match engine_out.encrypt_batch(batch) {
+                            Ok(wires) if wires.len() > SEND_INLINE_MAX => {
+                                // Bulk: hand off to the sender task so the loop keeps
+                                // draining. Parks ONLY when the sender is saturated
+                                // (back-pressure); parking here, before the next
+                                // recv_many, keeps counters in send order.
+                                if send_tx.send(wires).await.is_err() {
+                                    break; // sender gone
+                                }
+                            }
+                            Ok(wires) if !wires.is_empty() => {
+                                // Small (e.g. TCP ACKs): send inline — cheap (≤ a few
+                                // GSO syscalls), doesn't stall the loop, and avoids the
+                                // send_tx hop + sender wakeup that stole client CPU from
+                                // the RX path during a download.
+                                for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                                    if let Err(e) = crate::udp::batch_send(
+                                        &socket_out,
+                                        &state_out,
+                                        peer_out,
+                                        run,
+                                        seg,
+                                        gso,
+                                    )
+                                    .await
+                                    {
+                                        error!("UDP batch send (inline): {e}");
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("encrypt_batch: {e}"),
+                        }
                     }
                 }
                 _ = tick.tick() => {
@@ -268,7 +343,19 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else if !pending.is_empty() {
-                        flush_outbound(&engine_out, &socket_out, &state_out, &mut pending, peer_out, gso).await;
+                        // Residue staged while paced, then live-switched to off: seal
+                        // & ship once so nothing is stranded. Steady non-paced traffic
+                        // never uses `pending` (recv_many ships directly).
+                        let batch = std::mem::take(&mut pending);
+                        match engine_out.encrypt_batch(batch) {
+                            Ok(wires) if !wires.is_empty() => {
+                                if send_tx.send(wires).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("encrypt_batch: {e}"),
+                        }
                     }
 
                     // Rekey trigger (shared): threshold reached AND no rekey running.
@@ -302,7 +389,30 @@ pub async fn run_tunnel_loops(
                         traffic_live = false; // all senders dropped
                     } else {
                         let eff = *traffic_rx.borrow_and_update();
-                        paced = eff.enabled && obf_on;
+                        let new_paced = eff.enabled && obf_on;
+                        // Fix #2 correctness: the decoupled sender is a 2nd socket
+                        // writer. Across a live off→paced switch it must not race the
+                        // paced arm's direct sends, or already-queued low counters
+                        // could arrive after fresh high-counter paced packets and fall
+                        // outside the peer's 2048 replay window. Drain the sender queue
+                        // before enabling paced (leaves ≤1 in-flight batch, in window).
+                        if !paced && new_paced {
+                            while send_tx.capacity() < send_tx.max_capacity() {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        }
+                        // On paced→off, seal & ship any `pending` residue NOW (in
+                        // order) so the steady recv_many path can't seal newer packets
+                        // ahead of it.
+                        if paced && !new_paced && !pending.is_empty() {
+                            let batch = std::mem::take(&mut pending);
+                            if let Ok(wires) = engine_out.encrypt_batch(batch) {
+                                if !wires.is_empty() && send_tx.send(wires).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        paced = new_paced;
                         let new_mode = match eff.mode {
                             TrafficMode::Cbr => ShapeMode::Cbr,
                             TrafficMode::Adaptive => ShapeMode::Adaptive,
@@ -398,14 +508,14 @@ pub async fn run_tunnel_loops(
                             stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
                             match ft {
                                 FrameType::Data => {
-                                    debug!("inbound {} bytes -> TUN", plain.len());
+                                    trace!("inbound {} bytes -> TUN", plain.len());
                                     stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                     if to_tun.send(plain).await.is_err() { break 'inbound; }
                                 }
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
                                 FrameType::Close => { info!("peer closed session"); break 'inbound; }
                                 FrameType::Handshake => {} // not expected via the obf path
-                                FrameType::Padding => debug!("cover packet discarded"),
+                                FrameType::Padding => trace!("cover packet discarded"),
                             }
                             continue;
                         }
@@ -474,7 +584,7 @@ pub async fn run_tunnel_loops(
                                     frame.session_id, frame.sequence, &frame.payload)
                                 {
                                     Ok(plain) => {
-                                        debug!("inbound {} bytes -> TUN", plain.len());
+                                        trace!("inbound {} bytes -> TUN", plain.len());
                                         stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                         if to_tun.send(plain).await.is_err() { break 'inbound; }
                                     }
@@ -599,45 +709,6 @@ pub async fn run_tunnel_loops(
     }
     stats.connected.store(false, Ordering::Relaxed);
     info!("tunnel closed");
-}
-
-async fn flush_outbound(
-    engine: &Arc<CryptoEngine>,
-    socket: &UdpSocket,
-    state: &quinn_udp::UdpSocketState,
-    pending: &mut Vec<OutboundPacket>,
-    peer: SocketAddr,
-    gso: bool,
-) {
-    let batch = std::mem::take(pending);
-    let count = batch.len();
-    // Small batch: sequential (avoid the spawn_blocking+rayon overhead).
-    // Large batch: seal in PARALLEL across all cores via one spawn_blocking hop.
-    let sealed = if count < PAR_THRESHOLD {
-        engine.encrypt_batch(batch)
-    } else {
-        let engine = engine.clone();
-        match tokio::task::spawn_blocking(move || engine.encrypt_batch_par(batch)).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("seal task join error: {e}");
-                return;
-            }
-        }
-    };
-    match sealed {
-        Ok(wires) => {
-            // Send equal-sized runs in as few syscalls as possible (GSO where
-            // possible). Under Full the whole batch is one run → one GSO call.
-            for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                if let Err(e) = crate::udp::batch_send(socket, state, peer, run, seg, gso).await {
-                    error!("UDP batch send: {e}");
-                }
-            }
-            debug!("flushed {} pkts", count);
-        }
-        Err(e) => error!("encrypt_batch: {e}"),
-    }
 }
 
 fn now_secs() -> u64 {
