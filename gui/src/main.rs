@@ -23,6 +23,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The project's GitHub page (linked from the GUI header).
+const REPO_URL: &str = "https://github.com/btdt1983/chameleon-pq";
+
 pub fn main() -> iced::Result {
     // Diagnostics first: a Windows GUI has no console, so without this every
     // error/panic vanishes with the window. We log to a file NEXT to the binary
@@ -256,6 +259,8 @@ enum Message {
     Connected(Result<Arc<Client>, String>),
     Disconnect,
     Tick,
+    /// Open the project's GitHub page in the default browser.
+    OpenRepo,
 }
 
 impl App {
@@ -296,6 +301,9 @@ impl App {
         match message {
             Message::ConfigPathChanged(v) => self.config_path = v,
             Message::ServerChanged(v) => self.server = v,
+            Message::OpenRepo => {
+                let _ = open::that(REPO_URL);
+            }
             Message::BrowseConfig => {
                 // Open the native dialog async; the result comes back as ConfigPicked.
                 return Task::perform(
@@ -481,6 +489,10 @@ impl App {
                 text("Post-quantum VPN").size(12).color(muted),
             ]
             .spacing(1),
+            iced::widget::horizontal_space(),
+            button(text("GitHub ↗").size(13))
+                .style(button::text)
+                .on_press(Message::OpenRepo),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
