@@ -16,6 +16,23 @@ with X25519 for key agreement and a hybrid Ed25519 + ML-DSA-65 (FIPS 204)
 signature for peer authentication, over UDP with a TUN interface on
 Linux/macOS/Windows.
 
+## Why post-quantum?
+
+Almost all encryption in use today — the padlock on websites, VPNs, messaging
+apps — relies on math (RSA, elliptic curves) that a large enough **quantum
+computer** could break. Those machines don't exist yet, but they are being built.
+
+The catch is **"harvest now, decrypt later"**: an adversary can record your
+encrypted traffic *today*, store it, and simply wait — then decrypt it years
+later once a quantum computer is available. So anything that has to stay secret
+for a long time is already at risk, before quantum computers even arrive.
+
+Chameleon-PQ is built for that world. It uses a **hybrid** design that combines
+today's proven encryption (X25519) with a new **quantum-resistant** algorithm
+(ML-KEM-768, standardised by NIST). Your traffic stays protected as long as
+*either one* holds — so you gain defence against tomorrow's quantum computers
+without giving up the security we already trust today.
+
 ## ⚠️ Security Status: EXPERIMENTAL
 
 **This code has not been independently audited and should not be used to
