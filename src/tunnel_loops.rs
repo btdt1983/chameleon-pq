@@ -43,6 +43,12 @@ const PAR_THRESHOLD: usize = 16;
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
 /// item is one drained batch (≤ MAX_BATCH datagrams).
 const SEND_PIPELINE_BATCHES: usize = 16;
+/// Fix #2-v2: a sealed batch this small is sent INLINE on the loop (no send_tx
+/// hand-off / sender wakeup). Bulk sends (the upload) exceed this and go to the
+/// dedicated sender task so the loop keeps draining; but the download's trickle
+/// of TCP ACKs (1-2 per drain) stays inline, avoiding the per-ACK pipeline
+/// overhead that stole client CPU from the RX path (it regressed download).
+const SEND_INLINE_MAX: usize = 8;
 
 /// The configuration values that `run_tunnel_loops` needs, OWNED (no
 /// `&AppConfig` borrow) so the loop can be spawned as a task — exactly what a
@@ -281,13 +287,33 @@ pub async fn run_tunnel_loops(
                         t_flushes += 1;
                         t_flush_pkts += n as u64;
                         match engine_out.encrypt_batch(batch) {
-                            Ok(wires) if !wires.is_empty() => {
-                                // Bounded hand-off; parks the loop ONLY when the sender
-                                // is saturated (correct back-pressure). Parking here,
-                                // before the next recv_many, means no later packet is
-                                // sealed ahead of these → counters stay in send order.
+                            Ok(wires) if wires.len() > SEND_INLINE_MAX => {
+                                // Bulk: hand off to the sender task so the loop keeps
+                                // draining. Parks ONLY when the sender is saturated
+                                // (back-pressure); parking here, before the next
+                                // recv_many, keeps counters in send order.
                                 if send_tx.send(wires).await.is_err() {
                                     break; // sender gone
+                                }
+                            }
+                            Ok(wires) if !wires.is_empty() => {
+                                // Small (e.g. TCP ACKs): send inline — cheap (≤ a few
+                                // GSO syscalls), doesn't stall the loop, and avoids the
+                                // send_tx hop + sender wakeup that stole client CPU from
+                                // the RX path during a download.
+                                for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                                    if let Err(e) = crate::udp::batch_send(
+                                        &socket_out,
+                                        &state_out,
+                                        peer_out,
+                                        run,
+                                        seg,
+                                        gso,
+                                    )
+                                    .await
+                                    {
+                                        error!("UDP batch send (inline): {e}");
+                                    }
                                 }
                             }
                             Ok(_) => {}
