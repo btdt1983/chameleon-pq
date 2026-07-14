@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const MAX_BATCH: usize = 256;
 /// Upper bound on the outbound queue under pacing. When full, the newest TUN
@@ -343,12 +343,33 @@ pub async fn run_tunnel_loops(
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
 
+        // --- TEMP datapath diagnostics (branch client-datapath-diag) ---
+        let mut diag_tick = interval(Duration::from_secs(2));
+        let (mut d_batches, mut d_msgs, mut d_datagrams) = (0u64, 0u64, 0u64);
+        let (mut d_par, mut d_ser, mut d_data) = (0u64, 0u64, 0u64);
+        let (mut d_cap_sum, mut d_cap_zero, mut d_cap_n) = (0u64, 0u64, 0u64);
+
         'inbound: loop {
             tokio::select! {
                 _ = prune_tick.tick() => {
                     // State-Bloat-DoS fix: clean up half-finished fragments.
                     rekey_reasm.prune_old(Duration::from_secs(10));
                     rekey_confirm_reasm.prune_old(Duration::from_secs(10));
+                }
+                _ = diag_tick.tick() => {
+                    if d_datagrams > 0 {
+                        let dg_per_batch = d_datagrams as f64 / d_batches.max(1) as f64;
+                        let dg_per_msg = d_datagrams as f64 / d_msgs.max(1) as f64;
+                        let cap_avg = d_cap_sum as f64 / d_cap_n.max(1) as f64;
+                        info!(
+                            "RX-DIAG/2s: {} pkts ({}/s) | {} recv-batches, {:.1} dg/batch, {:.2} dg/msg (GRO) | decrypt par/ser={}/{} | to-TUN cap avg {:.0}/{} ({}x FULL) | data->TUN {}",
+                            d_datagrams, d_datagrams / 2, d_batches, dg_per_batch, dg_per_msg,
+                            d_par, d_ser, cap_avg, to_tun.max_capacity(), d_cap_zero, d_data,
+                        );
+                    }
+                    d_batches = 0; d_msgs = 0; d_datagrams = 0;
+                    d_par = 0; d_ser = 0; d_data = 0;
+                    d_cap_sum = 0; d_cap_zero = 0; d_cap_n = 0;
                 }
                 recv = crate::udp::batch_recv(&socket_in, &state_in, &mut recv_storage, &mut recv_metas) => {
                     let count = match recv {
@@ -362,6 +383,11 @@ pub async fn run_tunnel_loops(
                         crate::udp::iter_datagrams(&recv_storage, &recv_metas, count)
                             .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
                             .collect();
+                    // TEMP diagnostics: recv-batch + GRO coalescing.
+                    d_batches += 1;
+                    d_msgs += count as u64;
+                    d_datagrams += datagrams.len() as u64;
+                    if datagrams.len() >= PAR_THRESHOLD { d_par += 1; } else { d_ser += 1; }
 
                     // Decrypt the batch in PARALLEL across all cores at
                     // sufficient volume; for a small batch sequentially (avoid overhead).
@@ -398,14 +424,20 @@ pub async fn run_tunnel_loops(
                             stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
                             match ft {
                                 FrameType::Data => {
-                                    debug!("inbound {} bytes -> TUN", plain.len());
+                                    trace!("inbound {} bytes -> TUN", plain.len());
                                     stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
+                                    // TEMP diagnostics: sample to-TUN backpressure before the (possibly blocking) send.
+                                    let cap = to_tun.capacity();
+                                    d_cap_sum += cap as u64;
+                                    d_cap_n += 1;
+                                    if cap == 0 { d_cap_zero += 1; }
+                                    d_data += 1;
                                     if to_tun.send(plain).await.is_err() { break 'inbound; }
                                 }
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
                                 FrameType::Close => { info!("peer closed session"); break 'inbound; }
                                 FrameType::Handshake => {} // not expected via the obf path
-                                FrameType::Padding => debug!("cover packet discarded"),
+                                FrameType::Padding => trace!("cover packet discarded"),
                             }
                             continue;
                         }
@@ -474,7 +506,7 @@ pub async fn run_tunnel_loops(
                                     frame.session_id, frame.sequence, &frame.payload)
                                 {
                                     Ok(plain) => {
-                                        debug!("inbound {} bytes -> TUN", plain.len());
+                                        trace!("inbound {} bytes -> TUN", plain.len());
                                         stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                         if to_tun.send(plain).await.is_err() { break 'inbound; }
                                     }
@@ -634,7 +666,7 @@ async fn flush_outbound(
                     error!("UDP batch send: {e}");
                 }
             }
-            debug!("flushed {} pkts", count);
+            trace!("flushed {} pkts", count);
         }
         Err(e) => error!("encrypt_batch: {e}"),
     }
