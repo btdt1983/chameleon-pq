@@ -40,6 +40,30 @@ async fn main() -> anyhow::Result<()> {
             run_keygen();
             return Ok(());
         }
+        Command::Init {
+            server_addr,
+            out_dir,
+            bind,
+            tun_net,
+            mtu,
+            split_tunnel,
+            kill_switch,
+            profile,
+            force,
+        } => {
+            run_init(
+                *server_addr,
+                out_dir,
+                *bind,
+                tun_net,
+                *mtu,
+                *split_tunnel,
+                *kill_switch,
+                profile,
+                *force,
+            )?;
+            return Ok(());
+        }
         Command::Check => {
             let cfg = AppConfig::load(&cli.config)?;
             println!(
@@ -304,6 +328,133 @@ fn run_keygen() {
     println!("peer_mldsa_pub_hex   = \"{mldsa_pub_hex}\"");
     println!();
     println!("# Omit the mldsa_* fields on BOTH sides for classic (Ed25519-only) auth.");
+}
+
+// ── Guided setup (init) ──────────────────────────────────────────────────────
+
+/// Generate a matched server + client config pair and write both files.
+#[allow(clippy::too_many_arguments)]
+fn run_init(
+    server_addr: Option<SocketAddr>,
+    out_dir: &std::path::Path,
+    bind: SocketAddr,
+    tun_net: &str,
+    mtu: u16,
+    split_tunnel: bool,
+    kill_switch: bool,
+    profile: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    use chameleon::setup::{init_pair, parse_tun_net, PairParams};
+
+    let full_tunnel = !split_tunnel;
+    if kill_switch && !full_tunnel {
+        anyhow::bail!("--kill-switch requires full-tunnel; drop --split-tunnel");
+    }
+    const PROFILES: [&str; 5] = ["off", "balanced", "stealth", "throughput", "custom"];
+    if !PROFILES.contains(&profile) {
+        anyhow::bail!(
+            "--profile '{profile}' must be one of: {}",
+            PROFILES.join(", ")
+        );
+    }
+    let tun_net = parse_tun_net(tun_net)?;
+
+    // The server address is the one thing we cannot guess — prompt if missing.
+    let server_addr = match server_addr {
+        Some(a) => a,
+        None => prompt_server_addr()?,
+    };
+
+    let params = PairParams {
+        server_addr,
+        bind_addr: bind,
+        tun_net,
+        mtu,
+        full_tunnel,
+        kill_switch,
+        profile: profile.to_string(),
+    };
+    let (server_toml, client_toml) = init_pair(&params);
+
+    // Self-check: a generated config must parse AND pass full validation before
+    // we write it (catches any template mistake up front).
+    AppConfig::from_toml_str(&server_toml)
+        .map_err(|e| anyhow::anyhow!("generated server config failed validation: {e}"))?;
+    AppConfig::from_toml_str(&client_toml)
+        .map_err(|e| anyhow::anyhow!("generated client config failed validation: {e}"))?;
+
+    let server_path = out_dir.join("server-config.toml");
+    let client_path = out_dir.join("client-config.toml");
+    write_secret(&server_path, &server_toml, force)?;
+    write_secret(&client_path, &client_toml, force)?;
+
+    println!("✔ Generated a matched key pair (Ed25519 + ML-DSA-65) and a shared obfuscation PSK.");
+    println!("✔ Both configs validated OK. Wrote (mode 0600 on Unix — keep them SECRET):");
+    println!("    {}   → run on the SERVER", server_path.display());
+    println!("    {}   → run on the CLIENT", client_path.display());
+    println!();
+    println!("Next steps:");
+    println!(
+        "  SERVER:  chameleon-pq --config {} server",
+        server_path.display()
+    );
+    if full_tunnel {
+        println!("           # full-tunnel internet breakout also needs, once (Linux):");
+        println!("           sudo sysctl -w net.ipv4.ip_forward=1");
+        println!("           sudo nft add table ip nat");
+        println!(
+            "           sudo nft 'add chain ip nat post {{ type nat hook postrouting priority 100; }}'"
+        );
+        println!("           sudo nft add rule ip nat post oifname != \"lo\" masquerade");
+    }
+    println!(
+        "  CLIENT:  chameleon-pq --config {} client",
+        client_path.display()
+    );
+    println!(
+        "           # or load {} in the desktop GUI",
+        client_path.display()
+    );
+    Ok(())
+}
+
+/// Prompt for the server address on stdin (`init` without `--server-addr`).
+fn prompt_server_addr() -> anyhow::Result<SocketAddr> {
+    use std::io::Write;
+    print!("Server address the client connects to (e.g. 203.0.113.5:51820): ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    line.trim().parse::<SocketAddr>().map_err(|_| {
+        anyhow::anyhow!(
+            "not a valid host:port — re-run with --server-addr <ip:port> (a numeric IP, not a hostname)"
+        )
+    })
+}
+
+/// Write a secrets file, refusing to clobber an existing one unless `force`.
+/// Created with 0600 permissions on Unix so private keys aren't world-readable.
+fn write_secret(path: &std::path::Path, contents: &str, force: bool) -> anyhow::Result<()> {
+    use std::io::Write;
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists — pass --force to overwrite",
+            path.display()
+        );
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
 }
 
 // ── Logging init ─────────────────────────────────────────────────────────────

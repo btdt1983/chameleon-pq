@@ -61,6 +61,38 @@ pub enum Command {
     },
     /// Generate a new Ed25519 keypair (print to stdout)
     Keygen,
+    /// Guided setup: generate a matched server + client config pair (keys, PSK
+    /// and settings), cross-wired and ready to run — no manual key copying.
+    Init {
+        /// Address the CLIENT connects to (the server's reachable ip:port).
+        /// Prompted for if omitted and running interactively.
+        #[arg(long)]
+        server_addr: Option<SocketAddr>,
+        /// Directory to write `server-config.toml` and `client-config.toml` into.
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// Server bind address.
+        #[arg(long, default_value = "0.0.0.0:51820")]
+        bind: SocketAddr,
+        /// TUN /24 network base (server = .1, client = .2).
+        #[arg(long, default_value = "10.99.0")]
+        tun_net: String,
+        /// TUN MTU (must be ≤ 1232 for the obfuscated data path).
+        #[arg(long, default_value_t = 1200)]
+        mtu: u16,
+        /// Make the client split-tunnel (default is a full-tunnel VPN).
+        #[arg(long)]
+        split_tunnel: bool,
+        /// Enable the client kill switch (requires full-tunnel).
+        #[arg(long)]
+        kill_switch: bool,
+        /// Traffic profile: off | balanced | stealth | throughput.
+        #[arg(long, default_value = "off")]
+        profile: String,
+        /// Overwrite existing config files if present.
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate the configuration file
     Check,
     /// Manually control the VPN kill switch (escape hatch if left engaged after
@@ -495,7 +527,14 @@ impl AppConfig {
             state: "config".into(),
             msg: format!("cannot read {:?}: {e}", path),
         })?;
-        let cfg: AppConfig = toml::from_str(&raw).map_err(|e| ChameleonError::Handshake {
+        Self::from_toml_str(&raw)
+    }
+
+    /// Parse and fully validate a config from a TOML string (same checks as
+    /// `load`, without the file read). Used by `init` to self-check a generated
+    /// config before writing it.
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
+        let cfg: AppConfig = toml::from_str(raw).map_err(|e| ChameleonError::Handshake {
             state: "config".into(),
             msg: format!("TOML parse error: {e}"),
         })?;

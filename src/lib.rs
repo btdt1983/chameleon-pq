@@ -13,6 +13,7 @@ pub mod pacer;
 pub mod rekey;
 pub mod route;
 pub mod session;
+pub mod setup;
 pub mod tun_iface;
 pub mod tunnel;
 pub mod tunnel_loops;
