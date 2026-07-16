@@ -168,6 +168,7 @@ dependencies = [
  "bytes",
  "clap",
  "hkdf",
+ "libc",
  "parking_lot",
  "pqcrypto-mldsa",
  "pqcrypto-mlkem",
