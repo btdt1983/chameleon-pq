@@ -69,6 +69,11 @@ anyhow             = "1"
 # Voor #[tokio::test] loopback-tests van de gebatchte UDP-I/O.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 
+# SO_RCVBUFFORCE/SO_SNDBUFFORCE (bypass net.core.rmem_max when privileged) live
+# behind a raw setsockopt — Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
