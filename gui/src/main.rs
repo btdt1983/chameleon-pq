@@ -384,10 +384,12 @@ impl App {
             Message::LoadConfig => match AppConfig::load(std::path::Path::new(&self.config_path)) {
                 Ok(cfg) => {
                     self.warnings = security_warnings(&cfg);
-                    if self.server.is_empty() {
-                        if let Some(s) = cfg.network.server_addr {
-                            self.server = s.to_string();
-                        }
+                    // Adopt the config's server address on every Load. Previously
+                    // this only filled an EMPTY field, so after you'd set a server
+                    // once, re-loading a config with a CHANGED ip silently kept the
+                    // old one — a confusing "it ignores my config" gotcha.
+                    if let Some(s) = cfg.network.server_addr {
+                        self.server = s.to_string();
                     }
                     // Show the config's profile in the dropdown.
                     self.profile = cfg.traffic.profile;
