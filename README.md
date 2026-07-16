@@ -109,6 +109,13 @@ Known scope limits:
 - Fragment reassembly with DoS-resistant pruning of stale partials
 - Keepalive / dead-peer detection
 - Cross-platform TUN: Linux, macOS, Windows (Wintun)
+- **Kill switch** (client, full-tunnel, opt-in `tun.kill_switch`): a fail-closed
+  firewall installed while connected, so if the tunnel drops nothing leaks to the
+  physical NIC in cleartext — only loopback, the LAN, DHCP and the tunnel's own
+  paths stay open. Unlike the RAII full-tunnel routes it *survives* an unexpected
+  drop (that is the point) and comes down only on a deliberate disconnect or the
+  `chameleon-pq killswitch off` escape hatch. nftables on Linux, Windows Firewall
+  (default-outbound-block + per-path allow) on Windows
 - **Desktop GUI client** (`chameleon-gui`, pure-Rust [iced]): a dark-themed
   Windows app — pick a config, connect / disconnect, live status, a friendly
   traffic-profile selector, and an in-app log, with no console window (see
@@ -125,7 +132,7 @@ Known scope limits:
   `profile = "off"`); with timing-shaping on (opt-in) the configured rate caps
   throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 84 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 88 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -145,7 +152,10 @@ Known scope limits:
   over real sockets + a clean timeout when no responder answers), identity
   binding (symmetric, peer-dependent), low-order/all-zero X25519 rejection, and
   the return-routability cookie (deterministic + input-dependent, and a
-  cookie-less Init is answered with a CookieChallenge, not an expensive Response)
+  cookie-less Init is answered with a CookieChallenge, not an expensive Response),
+  and the kill-switch firewall ruleset (a default-drop policy that permits only
+  loopback, the tunnel transport, the TUN, LAN and DHCP, with the LAN rule
+  omitted when the subnet is unknown, and unsafe interface names rejected)
 - Fuzzing of the attacker-facing parsers (frame + handshake decode, the data-path
   and handshake obfuscation parsers, the reassembler, and the inbound
   decrypt path): a stable random + edge-case harness runs with `cargo test`
