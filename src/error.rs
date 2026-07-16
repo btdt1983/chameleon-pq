@@ -32,6 +32,9 @@ pub enum ChameleonError {
 
     #[error("Route error: {0}")]
     Route(String),
+
+    #[error("Kill switch error: {0}")]
+    KillSwitch(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChameleonError>;

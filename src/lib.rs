@@ -6,6 +6,7 @@ pub mod engine;
 pub mod error;
 pub mod frame;
 pub mod hsobf;
+pub mod killswitch;
 pub mod net;
 pub mod obf;
 pub mod pacer;
