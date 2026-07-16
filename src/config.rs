@@ -63,6 +63,21 @@ pub enum Command {
     Keygen,
     /// Validate the configuration file
     Check,
+    /// Manually control the VPN kill switch (escape hatch if left engaged after
+    /// a crash / app close, so you can restore connectivity from the CLI).
+    #[command(name = "killswitch", visible_alias = "kill-switch")]
+    KillSwitch {
+        #[command(subcommand)]
+        action: KillSwitchAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KillSwitchAction {
+    /// Remove the kill switch and restore normal connectivity.
+    Off,
+    /// Report whether the kill switch is currently engaged.
+    Status,
 }
 
 // ── Config-structs ───────────────────────────────────────────────────────────
@@ -159,6 +174,14 @@ pub struct TunConfig {
     /// the client routes through when `route_all` is set.
     #[serde(default)]
     pub peer_address: Option<String>,
+    /// Kill switch (client, full-tunnel only): while connected, install a
+    /// firewall lock-down so that if the tunnel drops, traffic is BLOCKED rather
+    /// than leaking to the physical NIC in cleartext. Unlike `route_all` it is
+    /// fail-closed — it survives an unexpected drop and is removed only on a
+    /// deliberate disconnect (or `killswitch off`). Only meaningful with
+    /// `route_all = true`. Default off (opt-in).
+    #[serde(default)]
+    pub kill_switch: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

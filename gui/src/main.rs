@@ -14,8 +14,11 @@
 
 use chameleon::client::{build_auth, security_warnings, Client, Status};
 use chameleon::config::{AppConfig, TrafficProfile};
+use chameleon::killswitch::KillSwitch;
 use chameleon::tun_iface::TunPair;
-use iced::widget::{button, column, container, pick_list, row, scrollable, svg, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, svg, text, text_input,
+};
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -242,6 +245,17 @@ struct App {
     warnings: Vec<String>,
     log: Vec<String>,
     connecting: bool,
+    /// Kill switch preference (mirrors config `tun.kill_switch`): engage a
+    /// fail-closed firewall while connected so a tunnel drop blocks traffic
+    /// instead of leaking to the physical NIC.
+    kill_switch: bool,
+    /// The active kill-switch guard. Held HERE (not in `Client`) on purpose: an
+    /// unexpected drop clears `client`, and the switch must survive that. `Some`
+    /// only while engaged.
+    ks: Option<KillSwitch>,
+    /// A kill switch detected at startup that we did NOT create this session —
+    /// left over from a previous crash / app close. Offer to clear it.
+    ks_orphan: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,12 +273,24 @@ enum Message {
     Connected(Result<Arc<Client>, String>),
     Disconnect,
     Tick,
+    /// Toggle the kill-switch preference (checkbox).
+    ToggleKillSwitch(bool),
+    /// Escape hatch: tear the kill switch down and restore connectivity.
+    DisableKillSwitch,
     /// Open the project's GitHub page in the default browser.
     OpenRepo,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
+        // A kill switch still installed at startup means a previous run left it
+        // engaged (crash or window-close while connected) — surface it so the
+        // user can clear it and get back online.
+        let ks_orphan = KillSwitch::is_engaged();
+        let mut log = vec!["Load a config and connect.".into()];
+        if ks_orphan {
+            log.push("⚠ Kill switch is still active from a previous session.".into());
+        }
         (
             App {
                 config_path: "config.toml".into(),
@@ -274,8 +300,11 @@ impl App {
                 client: None,
                 status: None,
                 warnings: Vec::new(),
-                log: vec!["Load a config and connect.".into()],
+                log,
                 connecting: false,
+                kill_switch: false,
+                ks: None,
+                ks_orphan,
             },
             Task::none(),
         )
@@ -362,9 +391,13 @@ impl App {
                     }
                     // Show the config's profile in the dropdown.
                     self.profile = cfg.traffic.profile;
+                    // Mirror the config's kill-switch preference into the toggle.
+                    self.kill_switch = cfg.tun.kill_switch;
                     self.log(format!(
-                        "Config loaded: {} (profile: {})",
-                        self.config_path, cfg.traffic.profile
+                        "Config loaded: {} (profile: {}, kill switch: {})",
+                        self.config_path,
+                        cfg.traffic.profile,
+                        if cfg.tun.kill_switch { "on" } else { "off" }
                     ));
                     self.config = Some(cfg);
                 }
@@ -420,6 +453,33 @@ impl App {
                             "Connected — session {}",
                             client.status().session_id
                         ));
+                        // Engage the kill switch now the tunnel is up. Only with
+                        // full-tunnel routing (otherwise blocking everything but
+                        // the tunnel would strand a split-tunnel user offline).
+                        if self.kill_switch {
+                            let full_tunnel = self.config.as_ref().is_some_and(|c| c.tun.route_all);
+                            let tun = self
+                                .config
+                                .as_ref()
+                                .map(|c| c.tun.name.clone())
+                                .unwrap_or_default();
+                            if full_tunnel {
+                                match KillSwitch::engage(client.status().peer, &tun) {
+                                    Ok(k) => {
+                                        self.ks = Some(k);
+                                        self.ks_orphan = false;
+                                        self.log("Kill switch engaged — traffic is locked to the tunnel.");
+                                    }
+                                    Err(e) => {
+                                        self.log(format!("Kill switch failed to engage: {e}"))
+                                    }
+                                }
+                            } else {
+                                self.log(
+                                    "Kill switch skipped: it needs full-tunnel (tun.route_all = true).",
+                                );
+                            }
+                        }
                         self.status = Some(client.status());
                         self.client = Some(client);
                     }
@@ -432,7 +492,29 @@ impl App {
                 }
                 self.client = None;
                 self.status = None;
+                // Deliberate disconnect → take the kill switch down (fail-open is
+                // correct HERE: the user asked to stop).
+                if let Some(mut k) = self.ks.take() {
+                    k.disengage();
+                    self.log("Kill switch disengaged.");
+                }
                 self.log("Disconnected.");
+            }
+            Message::ToggleKillSwitch(on) => {
+                self.kill_switch = on;
+                if let Some(cfg) = &mut self.config {
+                    cfg.tun.kill_switch = on;
+                }
+                self.log(format!(
+                    "Kill switch preference: {}",
+                    if on { "on" } else { "off" }
+                ));
+            }
+            Message::DisableKillSwitch => {
+                KillSwitch::clear();
+                self.ks = None;
+                self.ks_orphan = false;
+                self.log("Kill switch disabled — connectivity restored.");
             }
             Message::Tick => {
                 if let Some(c) = &self.client {
@@ -449,6 +531,15 @@ impl App {
                         );
                         self.client = None;
                         self.status = None;
+                        // Do NOT disengage the kill switch here: this is exactly
+                        // the unexpected-drop case it exists for. It stays engaged
+                        // (fail-closed); the banner offers a way to disable it.
+                        if self.ks.is_some() {
+                            self.log(
+                                "⚠ Kill switch ACTIVE — traffic is blocked. Reconnect, \
+                                 or disable the kill switch to go online without the VPN.",
+                            );
+                        }
                     } else {
                         self.status = Some(st);
                     }
@@ -527,7 +618,17 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let settings = container(column![config_row, server_row, profile_row].spacing(10))
+        let ks_row = row![
+            label("Safety"),
+            checkbox(
+                "Kill switch — block traffic if the tunnel drops (needs full-tunnel)",
+                self.kill_switch,
+            )
+            .on_toggle(Message::ToggleKillSwitch),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let settings = container(column![config_row, server_row, profile_row, ks_row].spacing(10))
             .padding(16)
             .width(Length::Fill)
             .style(card_style);
@@ -547,6 +648,39 @@ impl App {
                 .padding([10, 22])
                 .on_press(Message::Connect)
                 .into()
+        };
+
+        // Kill-switch recovery banner: shown when the switch is engaged but the
+        // tunnel is NOT connected (an unexpected drop, or a leftover from a
+        // previous session). Offers a one-click way back online.
+        let ks_stranded =
+            self.client.is_none() && !self.connecting && (self.ks_orphan || self.ks.is_some());
+        let ks_banner: Element<Message> = if ks_stranded {
+            container(
+                column![
+                    text("🔒  Kill switch active — traffic is blocked").size(14),
+                    text(
+                        "The tunnel is down. Reconnect to stay protected, or disable the \
+                         kill switch to go online WITHOUT the VPN."
+                    )
+                    .size(12),
+                    button(text("Disable kill switch"))
+                        .style(button::danger)
+                        .on_press(Message::DisableKillSwitch),
+                ]
+                .spacing(8),
+            )
+            .padding([10, 12])
+            .width(Length::Fill)
+            .style(|_: &Theme| {
+                banner_style(
+                    Color::from_rgb8(0x53, 0x1b, 0x1b),
+                    Color::from_rgb8(0xff, 0xb4, 0xb4),
+                )
+            })
+            .into()
+        } else {
+            iced::widget::Space::with_height(Length::Shrink).into()
         };
 
         // Security banner: green when everything is on, red otherwise.
@@ -640,6 +774,7 @@ impl App {
                 column![
                     header,
                     banner,
+                    ks_banner,
                     settings,
                     action,
                     status_card,

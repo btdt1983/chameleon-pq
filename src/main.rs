@@ -16,7 +16,7 @@
 //! the inbound loop first tries decrypt_obf() and only falls back to the
 //! cleartext frame for the (still cleartext) handshake/rekey messages.
 
-use chameleon::config::{AppConfig, Cli, Command};
+use chameleon::config::{AppConfig, Cli, Command, KillSwitchAction};
 use chameleon::crypto::{Authenticator, Ed25519Auth, MlDsaAuth};
 use chameleon::engine::CryptoEngine;
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
@@ -46,6 +46,28 @@ async fn main() -> anyhow::Result<()> {
                 "Config OK — bind={} tun={}",
                 cfg.network.bind_addr, cfg.tun.name
             );
+            return Ok(());
+        }
+        // Escape hatch: control the kill switch without a config, so a user
+        // stranded offline (client crashed while engaged) can always recover.
+        Command::KillSwitch { action } => {
+            match action {
+                KillSwitchAction::Off => {
+                    chameleon::killswitch::KillSwitch::clear();
+                    println!("kill switch removed — connectivity restored");
+                }
+                KillSwitchAction::Status => {
+                    let on = chameleon::killswitch::KillSwitch::is_engaged();
+                    println!(
+                        "kill switch: {}",
+                        if on {
+                            "ENGAGED (traffic blocked)"
+                        } else {
+                            "off"
+                        }
+                    );
+                }
+            }
             return Ok(());
         }
         _ => {}

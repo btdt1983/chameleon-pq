@@ -33,6 +33,13 @@ mtu     = 1200                  # MTU-safe for the obfuscated data path (max 123
 # client routes through. Omit route_all (or false) for split-tunnel.
 route_all    = false
 # peer_address = "10.99.0.1"     # set this on the client (server TUN address)
+# Kill switch (CLIENT side, full-tunnel only). With kill_switch = true the client
+# installs a fail-closed firewall while connected: if the tunnel drops, traffic is
+# BLOCKED rather than leaking to the physical NIC in cleartext. Only loopback, the
+# LAN, DHCP and the tunnel's own paths stay open. Unlike route_all it survives an
+# unexpected drop — remove it with a deliberate disconnect or `chameleon-pq
+# killswitch off`. Needs route_all = true. Default off (opt-in).
+kill_switch  = false
 
 [engine]
 # Maximum wait time (µs) for a batch before it is flushed.
