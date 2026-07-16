@@ -47,26 +47,80 @@ pub fn socket_state(socket: &UdpSocket) -> io::Result<UdpSocketState> {
 /// bursts so TCP settles on the real throughput instead of collapsing.
 const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-/// Enlarge SO_RCVBUF/SO_SNDBUF on the UDP socket (best-effort; the OS clamps to
-/// its maximum — Windows honors large values, Linux caps at net.core.rmem_max
-/// unless raised). Fails non-fatally; logs what we actually got.
+/// Enlarge SO_RCVBUF/SO_SNDBUF on the UDP socket. Best-effort; logs what we got.
+///
+/// Plain SO_RCVBUF is silently clamped by the kernel to `net.core.rmem_max`
+/// (208 KiB on stock Debian) — so on an untuned server the buffer overflows on
+/// bursts, the kernel drops datagrams, and TCP throttles (upload especially:
+/// ~0.1% loss caps a flow at a few Mbit via the Mathis bound). On Linux we
+/// therefore prefer `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which bypass that cap for
+/// a privileged process — and the server always runs as root for the TUN, so it
+/// gets the full buffer with zero sysctl tuning. Falls back to the plain sockopt
+/// when unprivileged or non-Linux, and warns loudly if the OS still clamped us.
 pub fn enlarge_socket_buffers(socket: &UdpSocket) {
     let sref = socket2::SockRef::from(socket);
-    if let Err(e) = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
-        tracing::debug!("set_recv_buffer_size failed: {e}");
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = socket.as_raw_fd();
+        // Try the un-clamped FORCE variant first; fall back to the plain sockopt
+        // (which socket2 sets) if we lack CAP_NET_ADMIN.
+        if !set_buffer_force(fd, libc::SO_RCVBUFFORCE, SOCKET_BUFFER_BYTES) {
+            let _ = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+        }
+        if !set_buffer_force(fd, libc::SO_SNDBUFFORCE, SOCKET_BUFFER_BYTES) {
+            let _ = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+        }
     }
-    if let Err(e) = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES) {
-        tracing::debug!("set_send_buffer_size failed: {e}");
+    #[cfg(not(target_os = "linux"))]
+    {
+        if let Err(e) = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES) {
+            tracing::debug!("set_recv_buffer_size failed: {e}");
+        }
+        if let Err(e) = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES) {
+            tracing::debug!("set_send_buffer_size failed: {e}");
+        }
     }
+
     match (sref.recv_buffer_size(), sref.send_buffer_size()) {
         (Ok(r), Ok(s)) => {
             tracing::info!(
                 "UDP socket buffers: recv {} KiB, send {} KiB",
                 r / 1024,
                 s / 1024
-            )
+            );
+            // The kernel reports ~2× the set value; if we are still far under the
+            // request the OS clamped us — say so, with the fix.
+            if r < SOCKET_BUFFER_BYTES / 2 {
+                tracing::warn!(
+                    "UDP recv buffer is only {} KiB (wanted {} KiB) — the OS clamped it. \
+                     Raise net.core.rmem_max (and run as root so SO_RCVBUFFORCE applies); \
+                     otherwise bursty traffic drops and throughput — upload especially — \
+                     suffers.",
+                    r / 1024,
+                    SOCKET_BUFFER_BYTES / 1024
+                );
+            }
         }
         _ => tracing::debug!("could not read back socket buffer sizes"),
+    }
+}
+
+/// Linux-only: set `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE` (bypasses `net.core.*mem_max`
+/// for a process with CAP_NET_ADMIN). Returns whether it succeeded.
+#[cfg(target_os = "linux")]
+fn set_buffer_force(fd: std::os::fd::RawFd, optname: libc::c_int, bytes: usize) -> bool {
+    let val = bytes as libc::c_int;
+    // SAFETY: a standard setsockopt with an `int` optval of the matching length.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            optname,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
     }
 }
 
