@@ -214,6 +214,31 @@ pub struct TunConfig {
     /// `route_all = true`. Default off (opt-in).
     #[serde(default)]
     pub kill_switch: bool,
+    /// DNS-leak protection (client, full-tunnel): resolvers to force DNS through
+    /// the tunnel (WireGuard-style `DNS =`), e.g. `["1.1.1.1", "1.0.0.1"]`. While
+    /// connected, DNS is pointed at these (public) resolvers so queries travel
+    /// through the tunnel instead of leaking to the ISP/router; restored on
+    /// disconnect. Empty = leave the OS DNS alone. Only applied with
+    /// `route_all = true`. Pair with `kill_switch` for a fail-closed guarantee.
+    #[serde(default)]
+    pub dns: Vec<String>,
+}
+
+impl TunConfig {
+    /// The configured DNS resolvers parsed to IP addresses, dropping (with a
+    /// warning) any entry that is not a valid IP.
+    pub fn dns_servers(&self) -> Vec<std::net::IpAddr> {
+        self.dns
+            .iter()
+            .filter_map(|s| match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    tracing::warn!("ignoring invalid [tun] dns entry '{s}'");
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

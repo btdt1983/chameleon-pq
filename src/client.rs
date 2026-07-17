@@ -8,6 +8,7 @@
 
 use crate::config::{AppConfig, EffectiveTraffic};
 use crate::crypto::{Authenticator, Ed25519Auth, HybridAuth, MlDsaAuth};
+use crate::dns::DnsGuard;
 use crate::engine::CryptoEngine;
 use crate::error::Result;
 use crate::frame::FrameType;
@@ -141,6 +142,9 @@ pub struct Client {
     /// Full-tunnel routes (WireGuard-style), held for RAII: removed when this
     /// Client is dropped (i.e. on disconnect). `None` in split-tunnel mode.
     _routes: Option<FullTunnelRoutes>,
+    /// DNS-leak protection, held for RAII: the OS DNS is restored when this
+    /// Client is dropped. `None` unless `[tun] dns` is set with `route_all`.
+    _dns: Option<DnsGuard>,
 }
 
 // Manual Debug: CryptoEngine/SessionManager aren't Debug, but a frontend's
@@ -254,6 +258,27 @@ impl Client {
             None
         };
 
+        // DNS-leak protection (WireGuard-style): with full-tunnel routing up,
+        // force DNS through the tunnel so queries can't leak to the ISP/router.
+        // Best-effort + RAII (restored on disconnect); pairs with the kill switch
+        // for the fail-closed guarantee. Only meaningful once route_all is active.
+        let dns = if cfg.tun.route_all && !cfg.tun.dns.is_empty() {
+            let servers = cfg.tun.dns_servers();
+            if servers.is_empty() {
+                None
+            } else {
+                match DnsGuard::install(&servers, &cfg.tun.name) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        tracing::warn!("DNS-leak protection failed ({e}) — using the OS DNS");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             stats,
             task,
@@ -266,6 +291,7 @@ impl Client {
             pad,
             obf,
             _routes: routes,
+            _dns: dns,
         })
     }
 

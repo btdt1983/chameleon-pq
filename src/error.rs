@@ -35,6 +35,9 @@ pub enum ChameleonError {
 
     #[error("Kill switch error: {0}")]
     KillSwitch(String),
+
+    #[error("DNS error: {0}")]
+    Dns(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChameleonError>;
