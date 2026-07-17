@@ -41,7 +41,9 @@ impl DnsGuard {
         // Reject a tun name we cannot safely embed in a command string. The name
         // comes from config, so this is belt-and-braces (mirrors killswitch.rs).
         if tun.contains(['"', '\'', '\n', '\r', '\\']) {
-            return Err(ChameleonError::Dns(format!("refusing unsafe tun name '{tun}'")));
+            return Err(ChameleonError::Dns(format!(
+                "refusing unsafe tun name '{tun}'"
+            )));
         }
         let restore = install_backend(servers, tun)?;
         info!(
@@ -136,24 +138,44 @@ fn restore_resolv_conf(path: &std::path::Path, restore: &Restore) {
     };
 }
 
-// ── Windows back-end (netsh + DisableSmartNameResolution) ────────────────────
+// ── Windows back-end (per-interface DNS + DisableSmartNameResolution) ─────────
+//
+// A multi-homed Windows host — e.g. a Hyper-V host with several vEthernet /
+// physical adapters — keeps querying the ISP resolver configured on those
+// adapters, so setting DNS on the tun alone leaves a PARTIAL leak (measured:
+// ~half the queries still reached the ISP). We therefore point EVERY up, non-tun
+// IPv4 adapter at the tunnel resolvers (capturing each original so drop can
+// restore it), also set the tun's own resolver, and disable smart multi-homed
+// name resolution — the combination WireGuard uses.
 
 #[cfg(target_os = "windows")]
 const DNSCLIENT_POLICY_KEY: &str = r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient";
 
-/// Windows has nothing to hold: the tun's DNS config dies with the interface on
-/// disconnect, so restore only has to remove the resolution policy we set.
+/// PowerShell that, for each up non-tun IPv4 adapter, prints `ifIndex|a,b` (its
+/// current resolvers) and then overrides it with ours. `__TUN__` / `__LIST__` are
+/// substituted before running; both are validated/sanitised by the caller.
 #[cfg(target_os = "windows")]
-struct Restore;
+const SET_ALL_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -ne '__TUN__' } | ForEach-Object {
+  $i = $_.ifIndex
+  $o = (Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv4).ServerAddresses -join ','
+  Write-Output ("{0}|{1}" -f $i, $o)
+  Set-DnsClientServerAddress -InterfaceIndex $i -ServerAddresses (__LIST__)
+}"#;
+
+/// Per-interface original IPv4 DNS servers to put back on drop (an empty list =
+/// the interface was on DHCP/none → reset it).
+#[cfg(target_os = "windows")]
+struct Restore {
+    saved: Vec<(u32, Vec<IpAddr>)>,
+}
 
 #[cfg(target_os = "windows")]
 fn install_backend(servers: &[IpAddr], tun: &str) -> Result<Restore> {
+    // 1. The tun's own resolver (ephemeral — dies with the interface, no restore).
     let name_arg = format!("name={tun}");
-
-    // Primary resolver on the tun interface (validate=no: skip the slow/failing
-    // connectivity probe — the tun has no gateway yet at this instant).
     let primary_arg = format!("address={}", servers[0]);
-    run_cmd(
+    let _ = run_cmd(
         "netsh",
         &[
             "interface",
@@ -166,12 +188,11 @@ fn install_backend(servers: &[IpAddr], tun: &str) -> Result<Restore> {
             "register=primary",
             "validate=no",
         ],
-    )?;
-    // Any further resolvers as secondaries.
+    );
     for (i, s) in servers.iter().enumerate().skip(1) {
         let addr_arg = format!("address={s}");
         let idx_arg = format!("index={}", i + 1);
-        run_cmd(
+        let _ = run_cmd(
             "netsh",
             &[
                 "interface",
@@ -183,12 +204,19 @@ fn install_backend(servers: &[IpAddr], tun: &str) -> Result<Restore> {
                 idx_arg.as_str(),
                 "validate=no",
             ],
-        )?;
+        );
     }
 
-    // Turn OFF smart multi-homed name resolution so Windows stops querying every
-    // interface's resolver in parallel (the leak) and uses only the tun's.
-    run_cmd(
+    // 2. Every up non-tun IPv4 adapter: capture its original DNS, then set ours.
+    //    This is the piece that closes the multi-homed leak (the tun alone isn't
+    //    enough — the ISP resolver on the physical/vEthernet adapters still leaks).
+    let script = SET_ALL_SCRIPT
+        .replace("__TUN__", tun)
+        .replace("__LIST__", &ps_server_list(servers));
+    let saved = parse_saved(&run_powershell_capture(&script)?);
+
+    // 3. Defence in depth: stop Windows fanning queries out over every interface.
+    let _ = run_cmd(
         "reg",
         &[
             "add",
@@ -201,14 +229,29 @@ fn install_backend(servers: &[IpAddr], tun: &str) -> Result<Restore> {
             "1",
             "/f",
         ],
-    )?;
-    Ok(Restore)
+    );
+    let _ = run_cmd("ipconfig", &["/flushdns"]);
+    Ok(Restore { saved })
 }
 
 #[cfg(target_os = "windows")]
-fn restore_backend(_restore: &Restore) {
-    // Re-enable smart resolution (delete our policy value). Best-effort; the tun
-    // interface — and its DNS config — is gone by the time we disconnect.
+fn restore_backend(restore: &Restore) {
+    // Put every interface's original IPv4 DNS back (reset to DHCP if it had none),
+    // re-enable smart resolution, and flush. Best-effort.
+    let mut script = String::from("$ErrorActionPreference='SilentlyContinue'\n");
+    for (idx, orig) in &restore.saved {
+        if orig.is_empty() {
+            script.push_str(&format!(
+                "Set-DnsClientServerAddress -InterfaceIndex {idx} -ResetServerAddresses\n"
+            ));
+        } else {
+            script.push_str(&format!(
+                "Set-DnsClientServerAddress -InterfaceIndex {idx} -ServerAddresses ({})\n",
+                ps_server_list(orig)
+            ));
+        }
+    }
+    let _ = run_powershell_capture(&script);
     let _ = run_cmd(
         "reg",
         &[
@@ -219,6 +262,7 @@ fn restore_backend(_restore: &Restore) {
             "/f",
         ],
     );
+    let _ = run_cmd("ipconfig", &["/flushdns"]);
 }
 
 /// Run a command with no console window (the GUI is a windowed subsystem app, so
@@ -239,6 +283,52 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+/// Run PowerShell and return its stdout (no console window). Best-effort content:
+/// only a spawn failure errors; per-command failures inside the script are
+/// swallowed (`$ErrorActionPreference='SilentlyContinue'`).
+#[cfg(target_os = "windows")]
+fn run_powershell_capture(script: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("powershell")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| ChameleonError::Dns(format!("spawning PowerShell failed: {e}")))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// Pure helpers for the Windows back-end. Compiled everywhere (not just Windows)
+// so the parsing/formatting can be unit-tested on the dev box.
+
+/// Format IPs as a PowerShell address list, e.g. `'1.1.1.1','1.0.0.1'`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ps_server_list(servers: &[IpAddr]) -> String {
+    servers
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse the capture script's stdout: one `ifIndex|a.b.c.d,e.f.g.h` line per
+/// adapter (an empty right side = the adapter had no IPv4 DNS). Malformed lines
+/// and non-IP tokens are skipped.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_saved(stdout: &str) -> Vec<(u32, Vec<IpAddr>)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (idx, rest) = line.split_once('|')?;
+            let idx: u32 = idx.trim().parse().ok()?;
+            let servers = rest
+                .split(',')
+                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                .collect();
+            Some((idx, servers))
+        })
+        .collect()
 }
 
 // ── Tests (Linux resolv.conf logic is pure enough to exercise for real) ──────
@@ -274,7 +364,10 @@ mod tests {
         assert!(!now.contains("192.168.0.1"));
         // Restore brings the original bytes back exactly.
         restore_resolv_conf(&p, &restore);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "nameserver 192.168.0.1\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "nameserver 192.168.0.1\n"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -288,13 +381,22 @@ mod tests {
 
         let restore = apply_resolv_conf(&link, &servers()).unwrap();
         // The link is now a regular file with our content (the target untouched).
-        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(std::fs::read_to_string(&link).unwrap().contains("1.1.1.1"));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "nameserver 9.9.9.9\n");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "nameserver 9.9.9.9\n"
+        );
 
         // Restore recreates the symlink pointing back at the original target.
         restore_resolv_conf(&link, &restore);
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         let _ = std::fs::remove_file(&link);
@@ -319,5 +421,31 @@ mod tests {
     #[test]
     fn unsafe_tun_name_rejected() {
         assert!(DnsGuard::install(&servers(), "tun\"; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn ps_list_quotes_each_ip() {
+        assert_eq!(ps_server_list(&servers()), "'1.1.1.1','1.0.0.1'");
+    }
+
+    #[test]
+    fn parse_saved_reads_index_and_servers() {
+        // Windows capture output: "ifIndex|comma,list"; empty right = DHCP/none,
+        // malformed lines are skipped.
+        let out = "13|\n5|217.237.150.101,1.1.1.1\n   \nbad line\n7|8.8.8.8";
+        let got = parse_saved(out);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], (13, vec![]));
+        assert_eq!(
+            got[1],
+            (
+                5,
+                vec![
+                    "217.237.150.101".parse().unwrap(),
+                    "1.1.1.1".parse().unwrap()
+                ]
+            )
+        );
+        assert_eq!(got[2], (7, vec!["8.8.8.8".parse().unwrap()]));
     }
 }
