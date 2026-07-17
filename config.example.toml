@@ -40,6 +40,14 @@ route_all    = false
 # unexpected drop — remove it with a deliberate disconnect or `chameleon-pq
 # killswitch off`. Needs route_all = true. Default off (opt-in).
 kill_switch  = false
+# DNS-leak protection (CLIENT side, full-tunnel), WireGuard-style `DNS =`. Without
+# it the OS keeps using its own resolver — usually the LAN router, which forwards
+# to the ISP — so DNS leaks even with route_all + kill_switch (the kill switch
+# permits the LAN). Listing resolvers here forces DNS through the tunnel while
+# connected (set on the TUN; on Windows it also disables smart multi-homed name
+# resolution so Windows stops querying every interface), restored on disconnect.
+# Use public resolvers reachable through the tunnel. Empty = leave the OS DNS alone.
+# dns = ["1.1.1.1", "1.0.0.1"]
 
 [engine]
 # Maximum wait time (µs) for a batch before it is flushed.

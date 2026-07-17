@@ -2,6 +2,7 @@ pub mod aead;
 pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod dns;
 pub mod engine;
 pub mod error;
 pub mod frame;
