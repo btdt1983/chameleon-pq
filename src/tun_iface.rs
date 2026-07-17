@@ -163,11 +163,12 @@ fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
         .netmask(mask)
         .up();
 
-    // MTU: set it on Linux/macOS, but NOT on Windows. wintun keeps its own
-    // default (1500) and tun 0.6 — the last version that worked on our Windows
-    // client — never pushed the MTU onto the interface either. The 0.8 WinAPI
-    // MTU path is an extra failure surface for no gain (the tunnel already ran
-    // fine with the wintun default), so we leave it alone there.
+    // MTU: set it on Linux/macOS via the tun crate. On Windows the tun 0.8 WinAPI
+    // MTU path rejects our params (an extra failure surface), so we do NOT set it
+    // here — but wintun then keeps its 1500 default, which is wrong for the
+    // obfuscated 1200-byte tunnel and black-holes large upload packets. We push
+    // the MTU on Windows out-of-band via netsh just below, once the interface
+    // exists (netsh is the same mechanism the crate uses for the address there).
     #[cfg(not(windows))]
     tun_cfg.mtu(cfg.mtu);
 
@@ -185,7 +186,65 @@ fn build_async_device(cfg: &TunConfig) -> Result<tun::AsyncDevice> {
         "TUN interface '{}' up — address {} mask {}",
         cfg.name, addr, mask
     );
+
+    // Windows-only: push the MTU onto the wintun interface out-of-band (the tun
+    // crate skips it above). Without this the interface stays at 1500 and a single
+    // TCP upload stream black-holes on oversized packets (download is unaffected
+    // because the server's tun IS the configured MTU). Best-effort: a failure just
+    // leaves the 1500 default (a server-side MSS clamp still bounds forwarded TCP),
+    // so we log and carry on rather than fail the tunnel.
+    #[cfg(windows)]
+    set_windows_mtu(cfg.name.as_str(), cfg.mtu);
+
     Ok(device)
+}
+
+/// Set the wintun interface MTU via `netsh` (Windows only, best-effort). The tun
+/// 0.8 crate does not push the MTU onto the interface on Windows, so wintun keeps
+/// its 1500 default — too large for the obfuscated data path, which black-holes
+/// large upload packets (a single TCP upload stream stalls with retransmits and
+/// pages hang: a PMTU black hole). netsh is the same mechanism the crate uses for
+/// address config on Windows, so the interface is addressable by name right after
+/// creation; we retry a few times in case interface registration lags.
+#[cfg(windows)]
+fn set_windows_mtu(name: &str, mtu: u16) {
+    use std::process::Command;
+    let mtu_arg = format!("mtu={mtu}");
+    for attempt in 1..=3 {
+        match Command::new("netsh")
+            .args([
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                name,
+                mtu_arg.as_str(),
+                "store=active",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                info!("wintun MTU set to {mtu} on '{name}'");
+                return;
+            }
+            Ok(o) if attempt < 3 => {
+                trace!(
+                    "netsh set MTU attempt {attempt} on '{name}' not yet applied: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Ok(o) => tracing::warn!(
+                "netsh could not set MTU {mtu} on '{name}': {} \
+                 (interface stays at 1500; a server-side MSS clamp still bounds TCP)",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => {
+                tracing::warn!("could not run netsh to set MTU on '{name}': {e}");
+                return;
+            }
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
