@@ -599,13 +599,14 @@ dependencies = [
 
 [[package]]
 name = "chameleon-pq"
-version = "0.7.4"
+version = "0.8.1"
 dependencies = [
  "aegis",
  "anyhow",
  "bytes",
  "clap",
  "hkdf",
+ "libc",
  "parking_lot 0.12.5",
  "pqcrypto-mldsa",
  "pqcrypto-mlkem",
