@@ -19,6 +19,7 @@
 use chameleon::config::{AppConfig, Cli, Command, KillSwitchAction};
 use chameleon::crypto::{Authenticator, Ed25519Auth, MlDsaAuth};
 use chameleon::engine::CryptoEngine;
+use chameleon::frame::FrameType;
 use chameleon::net::{run_handshake_initiator, run_handshake_responder};
 use chameleon::obf::PadPolicy;
 use chameleon::session::SessionManager;
@@ -166,6 +167,18 @@ async fn run_server(
             Ok(t) => t,
             Err(e) => {
                 warn!("TUN create failed: {e}; waiting for next client");
+                // Best-effort authenticated teardown: without this the peer
+                // has already completed a real handshake and believes the
+                // session is live, so it would sit out its dead-peer timeout
+                // before retrying. Only meaningful with obfuscation on (a
+                // cleartext Close is unauthenticated and ignored) — mirrors
+                // Client::disconnect()'s Close-before-abort.
+                if cfg.obfuscation.enabled {
+                    let pad: PadPolicy = cfg.obfuscation.padding.into();
+                    if let Ok(wire) = session.seal_obf(FrameType::Close as u8, b"", pad) {
+                        let _ = socket.send_to(&wire, peer).await;
+                    }
+                }
                 continue;
             }
         };

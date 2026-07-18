@@ -20,6 +20,7 @@ use crate::rekey::{
 use crate::tun_iface::TunPair;
 use crate::tunnel::{Handshake, Reassembler};
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -235,7 +236,10 @@ pub async fn run_tunnel_loops(
         });
     }
     tasks.spawn(async move {
-        let mut pending: Vec<OutboundPacket> = Vec::with_capacity(MAX_BATCH);
+        // VecDeque, not Vec: the paced tick arm pops from the front every slot
+        // (Vec::remove(0) would shift every remaining element — O(n) per pop,
+        // O(n^2) to drain a burst).
+        let mut pending: VecDeque<OutboundPacket> = VecDeque::with_capacity(MAX_BATCH);
         let mut drained: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
@@ -264,7 +268,7 @@ pub async fn run_tunnel_loops(
                             if pending.len() >= MAX_QUEUE {
                                 debug!("outbound queue full — tail-drop");
                             } else {
-                                pending.push(OutboundPacket { plaintext: pkt });
+                                pending.push_back(OutboundPacket { plaintext: pkt });
                             }
                         }
                     } else {
@@ -321,7 +325,9 @@ pub async fn run_tunnel_loops(
                         for _ in 0..pace_burst {
                             match pacer.next_emit(!pending.is_empty(), Instant::now()) {
                                 Emit::Real => {
-                                    let pkt = pending.remove(0);
+                                    let pkt = pending
+                                        .pop_front()
+                                        .expect("Emit::Real implies pending is non-empty");
                                     match engine_out.seal_data_full(&pkt.plaintext) {
                                         Ok(wire) => slot.push(wire),
                                         Err(e) => error!("seal data: {e}"),
@@ -346,7 +352,7 @@ pub async fn run_tunnel_loops(
                         // Residue staged while paced, then live-switched to off: seal
                         // & ship once so nothing is stranded. Steady non-paced traffic
                         // never uses `pending` (recv_many ships directly).
-                        let batch = std::mem::take(&mut pending);
+                        let batch = Vec::from(std::mem::take(&mut pending));
                         match engine_out.encrypt_batch(batch) {
                             Ok(wires) if !wires.is_empty() => {
                                 if send_tx.send(wires).await.is_err() {
@@ -405,7 +411,7 @@ pub async fn run_tunnel_loops(
                         // order) so the steady recv_many path can't seal newer packets
                         // ahead of it.
                         if paced && !new_paced && !pending.is_empty() {
-                            let batch = std::mem::take(&mut pending);
+                            let batch = Vec::from(std::mem::take(&mut pending));
                             if let Ok(wires) = engine_out.encrypt_batch(batch) {
                                 if !wires.is_empty() && send_tx.send(wires).await.is_err() {
                                     break;
