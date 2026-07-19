@@ -14,7 +14,7 @@ description = "Desktop GUI client for Chameleon-PQ (iced, pure Rust)"
 # build it explicitly with: `cargo build --manifest-path gui/Cargo.toml`.
 
 [dependencies]
-iced = { version = "0.13", features = ["tokio", "svg", "image"] }
+iced = { version = "0.13", features = ["tokio", "svg", "image", "markdown"] }
 open = "5"                                # open the repo URL in the default browser
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 chameleon-pq = { path = ".." }
@@ -22,6 +22,13 @@ chameleon-pq = { path = ".." }
 # tracing logs and panics to a log file next to the binary.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# "Check for updates" (on-demand only — never called automatically, see the
+# CheckForUpdates handler): fetches the latest GitHub release. rustls-tls, not
+# the default native-tls, so there's no OpenSSL toolchain dependency on any
+# target (matches this project's habit of avoiding brittle C-toolchain deps).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
 
 # Native file dialog to pick the config.toml — TARGET-SPECIFIC:
 # Windows/macOS use their native dialog (no extra system libs); Linux uses the
