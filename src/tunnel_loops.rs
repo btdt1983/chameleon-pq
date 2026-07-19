@@ -48,6 +48,17 @@ const MAX_QUEUE: usize = 4096;
 /// whole batch, not one packet; a modest depth absorbs a brief producer/
 /// consumer speed mismatch without hiding a genuinely backed-up worker.
 const WORKER_CHANNEL_DEPTH: usize = 8;
+/// Below this batch size, seal/decrypt INLINE on the calling task instead of
+/// routing to the persistent worker. Live-measured regression: removing the
+/// old size threshold entirely (so even a 1-packet batch paid a channel
+/// round-trip + cross-OS-thread wake-up to the worker) made real traffic
+/// SLOWER, not faster — a channel hop to an always-warm dedicated thread is
+/// far cheaper than the old spawn_blocking dispatch it replaced, but it is
+/// not free, and light/moderate traffic is mostly small batches. Below this
+/// size, plain sequential work has no dispatch cost at all and wins; above
+/// it, the 5-14x parallel speedup (see spawn_seal_worker/spawn_decrypt_worker
+/// doc) clears the round-trip easily.
+const INLINE_THRESHOLD: usize = 32;
 /// Fix #2: depth of the sealed-batch hand-off channel between the outbound drain
 /// loop and the single UDP sender task. Bounded so a slow sender back-pressures
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
@@ -411,19 +422,44 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else {
-                        // NON-PACED throughput path: hand the batch to the
-                        // persistent seal worker (counters get assigned there,
-                        // in request order == from_tun drain order — see
-                        // spawn_seal_worker) and go straight back to draining.
-                        // No await on sealing OR sending here at all now — the
-                        // seal-relay task (spawned above) owns dispatching the
-                        // result, inline or via send_tx.
+                        // NON-PACED throughput path.
                         let batch: Vec<OutboundPacket> = drained
                             .drain(..)
                             .map(|plaintext| OutboundPacket { plaintext })
                             .collect();
-                        if seal_req_tx.send(batch).await.is_err() {
-                            break; // seal worker gone
+                        if batch.len() < INLINE_THRESHOLD {
+                            // Small: seal right here, sequentially — no
+                            // dispatch cost at all (see INLINE_THRESHOLD doc).
+                            match engine_out.encrypt_batch(batch) {
+                                Ok(wires) if wires.len() > SEND_INLINE_MAX => {
+                                    if send_tx.send(wires).await.is_err() {
+                                        break; // sender gone
+                                    }
+                                }
+                                Ok(wires) if !wires.is_empty() => {
+                                    for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                                        if let Err(e) = crate::udp::batch_send(
+                                            &socket_out, &state_out, peer_out, run, seg, gso,
+                                        )
+                                        .await
+                                        {
+                                            error!("UDP batch send (inline): {e}");
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => error!("encrypt_batch: {e}"),
+                            }
+                        } else {
+                            // Large: hand off to the persistent seal worker
+                            // (counters get assigned there, in request order
+                            // == from_tun drain order — see spawn_seal_worker)
+                            // and go straight back to draining. No await on
+                            // sealing OR sending here — the seal-relay task
+                            // (spawned above) owns dispatching the result.
+                            if seal_req_tx.send(batch).await.is_err() {
+                                break; // seal worker gone
+                            }
                         }
                     }
                 }
@@ -598,16 +634,28 @@ pub async fn run_tunnel_loops(
                             .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
                             .collect();
 
-                    // Only the data-path decrypt goes to the worker (parallel
-                    // across all cores); the (rare) handshake/rekey demux
-                    // below stays serial on this coordinator.
-                    if decrypt_req_tx.send(datagrams).await.is_err() {
-                        error!("decrypt worker gone");
-                        break 'inbound;
-                    }
-                    let results: Vec<DecryptResult> = match decrypt_resp_rx.recv().await {
-                        Some(r) => r,
-                        None => { error!("decrypt worker gone"); break 'inbound; }
+                    // Small batches decrypt right here — no dispatch cost at
+                    // all (see INLINE_THRESHOLD doc); only a genuinely large,
+                    // GRO-heavy batch goes to the persistent worker (parallel
+                    // across all cores). The (rare) handshake/rekey demux
+                    // below always stays serial on this coordinator either way.
+                    let results: Vec<DecryptResult> = if datagrams.len() < INLINE_THRESHOLD {
+                        datagrams
+                            .into_iter()
+                            .map(|(src, dg)| {
+                                let r = engine_in.sessions().decrypt_obf(&dg);
+                                (src, dg, r)
+                            })
+                            .collect()
+                    } else {
+                        if decrypt_req_tx.send(datagrams).await.is_err() {
+                            error!("decrypt worker gone");
+                            break 'inbound;
+                        }
+                        match decrypt_resp_rx.recv().await {
+                            Some(r) => r,
+                            None => { error!("decrypt worker gone"); break 'inbound; }
+                        }
                     };
 
                     for (src, datagram, result) in results {
