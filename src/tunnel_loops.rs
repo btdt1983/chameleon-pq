@@ -58,7 +58,15 @@ const WORKER_CHANNEL_DEPTH: usize = 8;
 /// size, plain sequential work has no dispatch cost at all and wins; above
 /// it, the 5-14x parallel speedup (see spawn_seal_worker/spawn_decrypt_worker
 /// doc) clears the round-trip easily.
-const INLINE_THRESHOLD: usize = 32;
+///
+/// Set to 128 — the exact old `PAR_THRESHOLD` value already live-verified
+/// (before the persistent-worker rework) to give the best measured
+/// throughput: most real batches under light/moderate load stay well under
+/// it (RECV_BATCH=32 raw slots per syscall, moderately GRO-multiplied), so
+/// this keeps that same "common case never dispatches" behavior, just with a
+/// safe (ordering-correct) worker available for the rare genuinely-huge
+/// batch instead of `spawn_blocking`.
+const INLINE_THRESHOLD: usize = 128;
 /// Fix #2: depth of the sealed-batch hand-off channel between the outbound drain
 /// loop and the single UDP sender task. Bounded so a slow sender back-pressures
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
