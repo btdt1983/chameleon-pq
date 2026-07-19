@@ -269,9 +269,12 @@ Unter Windows benötigen Sie zusätzlich `wintun.dll` von
   echtes Paket, ein Cover-Paket oder nichts gesendet wird (`ShapeMode`
   CBR/Adaptive); die async-Schleife in `main.rs` treibt ihn an
 - `engine.rs` – CPU-Verschlüsselungs-Engine: Batch-Seal/Open, **parallel über
-  alle Cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`, aus den
-  async-Schleifen mit `spawn_blocking` überbrückt); konstantzeitfähig, geringe
-  Latenz, kein GPU-Pfad (siehe DESIGN.md §11–§12 zur Begründung)
+  alle Cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`); die
+  Outbound-Schleife (`tunnel_loops.rs`) reserviert vorab einen zusammenhängenden
+  AEAD-Zählerbereich pro Batch und versiegelt ihn auf rayons warmem Thread-Pool
+  (`rayon::spawn`) – nach WireGuard-go-Vorbild, statt einer Batch-Größen-Schwelle;
+  konstantzeitfähig, geringe Latenz, kein GPU-Pfad (siehe DESIGN.md §11–§12 zur
+  Begründung)
 - `net.rs` – UDP-Schleifen; klare Ein-/Ausgangspunkte zur TUN-Schicht
 - `udp.rs` – gebündelte UDP-I/O (GSO beim Senden, GRO beim Empfangen) via
   `quinn-udp`, mit Per-Paket-Fallback auf älteren Kernels / Nicht-Linux; das
