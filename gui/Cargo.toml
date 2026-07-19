@@ -43,3 +43,10 @@ rfd = { version = "0.15", default-features = false, features = ["tokio"] }
 [[bin]]
 name = "chameleon-gui"
 path = "src/main.rs"
+
+# Embeds assets/chameleon.ico into the .exe's own PE resources at build time
+# (see build.rs) — that's what Explorer/the taskbar/Alt-Tab actually read for
+# the icon, separate from iced's runtime window icon. Windows-only, like rfd
+# above: no reason to fetch/compile it for the Linux/CI-check build.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3.0.11"

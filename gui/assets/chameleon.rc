@@ -1,0 +1,5 @@
+// Windows resource script: embeds the chameleon icon into chameleon-gui.exe
+// itself (not just iced's runtime window icon), so Explorer, the taskbar
+// button, and Alt-Tab all show it — those read the EXE's own resource, not
+// whatever the running window sets at runtime.
+IDI_ICON1 ICON "chameleon.ico"
