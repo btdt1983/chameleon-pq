@@ -14,7 +14,7 @@
 use crate::error::Result;
 use crate::frame::{Frame, FrameType};
 use crate::obf::PadPolicy;
-use crate::session::SessionManager;
+use crate::session::{Session, SessionManager};
 use bytes::Bytes;
 use rayon::prelude::*;
 use std::net::SocketAddr;
@@ -94,6 +94,48 @@ impl CryptoEngine {
         batch
             .par_iter()
             .map(|pkt| self.seal_one(&pkt.plaintext))
+            .collect()
+    }
+
+    /// Reserve `n` contiguous AEAD counters on the active session, pinning
+    /// that exact session so a later seal (possibly on another thread, after
+    /// a rekey has since swapped `current`) still lands on the right keys.
+    /// See `SessionManager::reserve` for why the pinning matters.
+    pub fn reserve(&self, n: u64) -> Result<(Arc<Session>, u64)> {
+        self.sessions.reserve(n)
+    }
+
+    /// Seal a whole batch in PARALLEL against counters already reserved via
+    /// `reserve` — `[base_counter, base_counter + batch.len())`, one per
+    /// packet in order. Output order matches input order (rayon's
+    /// `par_iter().collect()` guarantee, already relied on by
+    /// `encrypt_batch_par`), so on-wire counter order stays exactly the
+    /// order `reserve` fixed, regardless of which packet's seal finishes
+    /// first. Covers both the obfuscated (default) and plain-Frame
+    /// (`obfuscation.enabled = false`) data paths, matching `seal_one`.
+    pub fn seal_batch_with_counters(
+        &self,
+        sess: &Session,
+        base_counter: u64,
+        batch: &[OutboundPacket],
+    ) -> Result<Vec<Bytes>> {
+        batch
+            .par_iter()
+            .enumerate()
+            .map(|(i, pkt)| {
+                let counter = base_counter + i as u64;
+                if self.obf_enabled {
+                    sess.seal_obf_with_counter(
+                        counter,
+                        FrameType::Data as u8,
+                        &pkt.plaintext,
+                        self.pad_policy,
+                    )
+                } else {
+                    let ct = sess.seal_with_counter(counter, &pkt.plaintext)?;
+                    Frame::new_data(sess.session_id, counter, ct).encode()
+                }
+            })
             .collect()
     }
 
