@@ -35,3 +35,16 @@ config*.toml
 # Local environment overrides
 .env
 .env.local
+
+# Ad-hoc screenshots dropped at the repo root during debugging (e.g. speed-test
+# results shared in chat) — root-anchored so it does NOT affect the real,
+# tracked images that belong in the repo (docs/screenshot.jpg,
+# gui/assets/*.png/*.ico). Without this, cargo's default "everything not
+# gitignored" packaging rule would sweep a stray screenshot into the
+# published crate.
+/*.jpg
+/*.JPG
+/*.jpeg
+/*.JPEG
+/*.png
+/*.PNG
