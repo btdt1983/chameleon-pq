@@ -38,7 +38,15 @@ pub fn main() -> iced::Result {
     let icon =
         iced::window::icon::from_file_data(include_bytes!("../assets/chameleon-icon.png"), None)
             .ok();
-    iced::application("Chameleon-PQ", App::update, App::view)
+    // Window title carries the version too (see chameleon::VERSION doc) — a
+    // bug report naming the title bar already tells us the build. iced's
+    // `Title` trait wants either a `&'static str` or a closure, not a
+    // `String` — a closure is the natural fit here.
+    iced::application(
+        |_: &App| format!("Chameleon-PQ v{}", chameleon::VERSION),
+        App::update,
+        App::view,
+    )
         .theme(App::theme)
         .window(iced::window::Settings {
             icon,
@@ -601,7 +609,7 @@ impl App {
         let header = row![
             logo,
             column![
-                text("Chameleon-PQ").size(24),
+                text(format!("Chameleon-PQ v{}", chameleon::VERSION)).size(24),
                 text("Post-quantum VPN").size(12).color(muted),
             ]
             .spacing(1),
