@@ -32,9 +32,17 @@ use tracing::{debug, error, info, trace, warn};
 
 const MAX_BATCH: usize = 256;
 /// Upper bound on the outbound queue under pacing. When full, the newest TUN
-/// packet is tail-dropped (TCP recovers); unbounded buffering would break the
-/// constant rate and pile up latency.
-const MAX_QUEUE: usize = 1024;
+/// packet is tail-dropped; unbounded buffering would break the constant rate
+/// and pile up latency. But "TCP recovers" undersells the cost of dropping
+/// too early: TCP reads a tail-drop as congestion and halves its window, so a
+/// queue too shallow for the configured pace rate causes exactly the
+/// collapse-and-slowly-recover cycle it's meant to avoid — observed in
+/// practice on the Throughput profile (6000x8 ≈ 473 Mbit ceiling), where a
+/// single TCP burst overflowed the old 1024-packet cap in under a
+/// millisecond and tanked a whole test to ~5 Mbit. Sized to comfortably hold
+/// roughly one RTT (~40ms against a WAN peer) of Throughput's peak rate
+/// (473 Mbit/s / 8 * 0.04s / ~1232B/packet ≈ 1920 packets) with headroom.
+const MAX_QUEUE: usize = 4096;
 /// Batch threshold for the parallel crypto path (Phase C): below this size we
 /// seal/decrypt sequentially to avoid the spawn_blocking+rayon overhead under
 /// light traffic.
@@ -239,7 +247,10 @@ pub async fn run_tunnel_loops(
         // VecDeque, not Vec: the paced tick arm pops from the front every slot
         // (Vec::remove(0) would shift every remaining element — O(n) per pop,
         // O(n^2) to drain a burst).
-        let mut pending: VecDeque<OutboundPacket> = VecDeque::with_capacity(MAX_BATCH);
+        // Pre-sized to MAX_QUEUE, not MAX_BATCH: this is the buffer meant to
+        // absorb a burst up to that cap, so it shouldn't need to reallocate
+        // while doing exactly that.
+        let mut pending: VecDeque<OutboundPacket> = VecDeque::with_capacity(MAX_QUEUE);
         let mut drained: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
