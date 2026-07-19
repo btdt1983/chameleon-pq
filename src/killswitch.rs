@@ -41,6 +41,15 @@ use tracing::info;
 /// available as an escape hatch.
 pub struct KillSwitch {
     engaged: bool,
+    /// Count of pre-existing, non-Chameleon outbound "Allow" firewall rules
+    /// detected at engage time. Windows only (`None` elsewhere): Windows
+    /// Firewall lets ANY matching Allow rule win over the profile's
+    /// default-block action (see the Windows back-end doc below), so a
+    /// non-zero count here means traffic matching one of those rules can
+    /// bypass the kill switch. `nft`'s `policy drop` has no such gap, so this
+    /// is always `Some(0)`-equivalent (reported as `None`, nothing to warn
+    /// about) on Linux. Best-effort: `None` if it could not be determined.
+    pub other_allow_rules: Option<usize>,
 }
 
 impl KillSwitch {
@@ -57,8 +66,21 @@ impl KillSwitch {
             )));
         }
         engage_backend(server, tun)?;
+        let other_allow_rules = other_allow_rules_hint();
+        if let Some(n) = other_allow_rules {
+            if n > 0 {
+                tracing::warn!(
+                    "kill switch: {n} pre-existing outbound Allow firewall rule(s) detected — \
+                     Windows lets a matching Allow rule override the default-block action, so \
+                     traffic matching one of those rules is NOT guaranteed to be blocked"
+                );
+            }
+        }
         info!("kill switch ENGAGED — all traffic blocked except the tunnel, LAN and DHCP");
-        Ok(Self { engaged: true })
+        Ok(Self {
+            engaged: true,
+            other_allow_rules,
+        })
     }
 
     /// Disengage: remove the rules we installed and restore normal connectivity.
@@ -86,6 +108,13 @@ impl KillSwitch {
         teardown();
         info!("kill switch cleared (escape hatch)");
     }
+}
+
+/// Best-effort count of pre-existing outbound Allow rules that could bypass
+/// the kill switch. Windows only — see `KillSwitch::other_allow_rules`.
+#[cfg(not(target_os = "windows"))]
+fn other_allow_rules_hint() -> Option<usize> {
+    None
 }
 
 // ── nftables back-end (Linux / non-Windows) ──────────────────────────────────
@@ -258,6 +287,18 @@ fn ipv4_network(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
 // DEFAULT outbound action becomes Block (lowest precedence) and our per-path
 // Allow rules win over it. Restore sets the default back to Allow (the Windows
 // factory default).
+//
+// KNOWN GAP: this composes correctly for OUR rules, but the same precedence
+// applies to EVERYONE's rules — a pre-existing, unrelated outbound Allow rule
+// (installed by other software, or one of Windows' own built-in "Core
+// Networking" rules) also wins over our default-block, and there is no
+// standard-cmdlet way to make an Allow rule scoped to (say) the physical
+// interface lose to a Block rule scoped to the same interface without ALSO
+// blocking our own tunnel traffic on that interface (the tunnel's UDP to the
+// server leaves via the physical NIC, not the tun). Actually closing this
+// requires WFP-level weighted filters, not `New-NetFirewallRule`. Until that
+// exists, `other_allow_rules_hint` at least makes the residual exposure
+// visible instead of silent.
 
 #[cfg(target_os = "windows")]
 fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
@@ -278,6 +319,17 @@ fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
          Set-NetFirewallProfile -All -DefaultOutboundAction Block"
     );
     run_powershell(&script)
+}
+
+/// Count enabled outbound Allow rules NOT owned by us. See the KNOWN GAP note
+/// above: Windows lets any one of these override our default-block, so this
+/// is surfaced to the user rather than silently trusted. Best-effort:
+/// `None` if the query itself fails (e.g. insufficient privilege to list).
+#[cfg(target_os = "windows")]
+fn other_allow_rules_hint() -> Option<usize> {
+    let script = "(Get-NetFirewallRule -Direction Outbound -Enabled True -Action Allow | \
+                   Where-Object { $_.Group -ne 'ChameleonKS' }).Count";
+    run_powershell_capture(script).ok()?.trim().parse().ok()
 }
 
 #[cfg(target_os = "windows")]

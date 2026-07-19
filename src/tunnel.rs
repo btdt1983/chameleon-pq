@@ -51,6 +51,18 @@ const SIG_LABEL_INITIATOR: &[u8] = b"Chameleon-PQ-v1 initiator proof";
 /// `prune_old` the memory stays bounded.
 const MAX_PENDING_MSGS: usize = 64;
 
+/// Upper bound on the number of fragments a single message may claim, and on
+/// the size of any one fragment's payload. Every real handshake message is a
+/// fixed HANDSHAKE_MSG_LEN (8192 B), split into FRAG_PAYLOAD-sized (1024 B)
+/// chunks — never more than 8 fragments in practice. Without this bound, a
+/// single attacker-controlled datagram could claim `total` up to 65535 with a
+/// payload up to the UDP_BUF (64 KB) each, letting one never-completed message
+/// grow to several GB before `MAX_PENDING_MSGS` even applies (a State-Bloat-DoS
+/// pre-authentication, since reassembly runs before the L-4 cookie check).
+/// This mirrors `hsobf::MAX_FRAGMENTS`, which already enforces the same bound
+/// on the obfuscated path — this closes the gap on the cleartext path.
+const MAX_FRAGMENTS: u16 = 64;
+
 const X25519_PUB_LEN: usize = 32;
 const MLKEM_PK_LEN: usize = 1184;
 const MLKEM_CT_LEN: usize = 1088;
@@ -125,10 +137,16 @@ impl Reassembler {
         total: u16,
         payload: Bytes,
     ) -> Result<Option<Bytes>> {
-        if total == 0 || index >= total {
+        if total == 0 || total > MAX_FRAGMENTS || index >= total {
             return Err(ChameleonError::Handshake {
                 state: "reassemble".into(),
                 msg: "invalid fragment index/total".into(),
+            });
+        }
+        if payload.len() > FRAG_PAYLOAD {
+            return Err(ChameleonError::Handshake {
+                state: "reassemble".into(),
+                msg: "fragment payload larger than any real handshake chunk".into(),
             });
         }
         // DoS cap: a NEW msg_id above the limit is ignored, so a stream of

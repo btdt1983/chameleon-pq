@@ -71,8 +71,15 @@ pub async fn rekey_as_initiator(
         let mut reasm = Reassembler::default();
         let attempt_result = timeout(PER_ATTEMPT_TIMEOUT, async {
             while let Some(raw) = hs_rx.recv().await {
-                if let Some(resp_wire) = push_handshake(&mut reasm, &raw, hs_obf)? {
-                    return Ok(Some(resp_wire));
+                // A malformed/spoofed datagram here is noise, not a reason to
+                // give up the whole retry loop — mirrors how
+                // run_handshake_responder treats reassembly errors (net.rs).
+                // Only a genuinely closed channel (recv() returning None,
+                // below) should stop retrying.
+                match push_handshake(&mut reasm, &raw, hs_obf) {
+                    Ok(Some(resp_wire)) => return Ok(Some(resp_wire)),
+                    Ok(None) => {}
+                    Err(e) => debug!("rekey reassembly drop: {e}"),
                 }
             }
             Err::<Option<Bytes>, _>(crate::error::ChameleonError::ChannelClosed)
