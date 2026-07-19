@@ -38,6 +38,9 @@ pub enum ChameleonError {
 
     #[error("DNS error: {0}")]
     Dns(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChameleonError>;
