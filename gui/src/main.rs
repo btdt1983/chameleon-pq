@@ -266,6 +266,13 @@ struct App {
     ks_orphan: bool,
 }
 
+/// `(connect outcome, kill-switch engage outcome)`, produced by the async
+/// connect task. See `Message::Connected`.
+type ConnectOutcome = (
+    Result<Arc<Client>, String>,
+    Option<Result<KillSwitch, String>>,
+);
+
 #[derive(Debug, Clone)]
 enum Message {
     ConfigPathChanged(String),
@@ -278,7 +285,10 @@ enum Message {
     ProfileChanged(TrafficProfile),
     LoadConfig,
     Connect,
-    Connected(Result<Arc<Client>, String>),
+    /// `(connect outcome, kill-switch engage outcome)` — independent of each
+    /// other: if the kill switch engaged but the connect itself then failed,
+    /// we must still learn about the engaged switch (see the handler).
+    Connected(ConnectOutcome),
     Disconnect,
     Tick,
     /// Toggle the kill-switch preference (checkbox).
@@ -432,43 +442,9 @@ impl App {
                     self.log("No valid server address (host:port).");
                     return Task::none();
                 };
-                // Engage the kill switch BEFORE attempting to connect, not after
-                // (server + tun name are already known here). Engaging only once
-                // the tunnel is up leaves a real window — including the up-to-
-                // ~5s full-tunnel route install inside `Client::connect` — where
-                // the tunnel is being set up with no fail-closed backing yet. The
-                // switch's own Allow rules (tun/server/LAN/DHCP) don't require the
-                // tun interface to exist yet, so this is safe to do early.
-                if self.kill_switch {
-                    if cfg.tun.route_all {
-                        match KillSwitch::engage(server, &cfg.tun.name) {
-                            Ok(k) => {
-                                self.log("Kill switch engaged — traffic is locked to the tunnel.");
-                                // Windows only: a pre-existing outbound Allow rule
-                                // (from other software, or a Windows built-in) can
-                                // override our default-block — see killswitch.rs.
-                                // Surface that instead of implying full protection.
-                                if let Some(n) = k.other_allow_rules {
-                                    if n > 0 {
-                                        self.log(format!(
-                                            "⚠ {n} other outbound-allow firewall rule(s) found — \
-                                             traffic matching one of those could bypass the kill switch."
-                                        ));
-                                    }
-                                }
-                                self.ks = Some(k);
-                                self.ks_orphan = false;
-                            }
-                            Err(e) => self.log(format!("Kill switch failed to engage: {e}")),
-                        }
-                    } else {
-                        self.log(
-                            "Kill switch skipped: it needs full-tunnel (tun.route_all = true).",
-                        );
-                    }
-                }
                 self.connecting = true;
                 self.log(format!("Connecting to {server} …"));
+                let want_kill_switch = self.kill_switch;
                 return Task::perform(
                     async move {
                         // Log step by step: if the process dies hard (a native
@@ -476,40 +452,100 @@ impl App {
                         // Rust panic hook), the last line in the log points to
                         // exactly which step caused the crash.
                         tracing::info!("connect: step 1/3 build_auth");
-                        let auth = build_auth(&cfg).map_err(|e| e.to_string())?;
+                        let auth = match build_auth(&cfg) {
+                            Ok(a) => a,
+                            Err(e) => return (Err(e.to_string()), None),
+                        };
                         tracing::info!("connect: step 2/3 TunPair::create (Windows: admin + wintun.dll next to .exe)");
-                        let tun = TunPair::create(&cfg.tun).map_err(|e| e.to_string())?;
+                        let tun = match TunPair::create(&cfg.tun) {
+                            Ok(t) => t,
+                            Err(e) => return (Err(e.to_string()), None),
+                        };
+
+                        // Engage the kill switch now: the tun interface exists
+                        // (needed — Windows' New-NetFirewallRule -InterfaceAlias
+                        // errors "interface not found" against an adapter that
+                        // isn't registered yet), but full-tunnel routing/DNS
+                        // haven't been installed by Client::connect below yet,
+                        // so there's still no window where they're live without
+                        // fail-closed backing. A couple of retries: the adapter
+                        // can take a brief moment to become visible to Windows
+                        // right after creation (same settling delay
+                        // Client::connect's own route-install retries around).
+                        let ks: Option<Result<KillSwitch, String>> = if want_kill_switch {
+                            if cfg.tun.route_all {
+                                let mut attempt = KillSwitch::engage(server, &cfg.tun.name);
+                                for _ in 0..4 {
+                                    if attempt.is_ok() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(300))
+                                        .await;
+                                    attempt = KillSwitch::engage(server, &cfg.tun.name);
+                                }
+                                Some(attempt.map_err(|e| e.to_string()))
+                            } else {
+                                Some(Err(
+                                    "skipped: needs full-tunnel (tun.route_all = true)".into()
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+
                         tracing::info!("connect: step 3/3 Client::connect → {server}");
                         let res = Client::connect(&cfg, server, auth, tun)
                             .await
                             .map(Arc::new)
                             .map_err(|e| e.to_string());
                         tracing::info!("connect: done (ok={})", res.is_ok());
-                        res
+                        (res, ks)
                     },
                     Message::Connected,
                 );
             }
-            Message::Connected(res) => {
+            Message::Connected((client_res, ks)) => {
                 self.connecting = false;
-                match res {
+                match ks {
+                    Some(Ok(k)) => {
+                        self.log("Kill switch engaged — traffic is locked to the tunnel.");
+                        // Windows only: a pre-existing outbound Allow rule (from
+                        // other software, or a Windows built-in) can override
+                        // our default-block — see killswitch.rs. Surface that
+                        // instead of implying full protection.
+                        if let Some(n) = k.other_allow_rules {
+                            if n > 0 {
+                                self.log(format!(
+                                    "⚠ {n} other outbound-allow firewall rule(s) found — \
+                                     traffic matching one of those could bypass the kill switch."
+                                ));
+                            }
+                        }
+                        self.ks = Some(k);
+                        self.ks_orphan = false;
+                    }
+                    Some(Err(e)) => self.log(format!("Kill switch: {e}")),
+                    None => {}
+                }
+                match client_res {
                     Ok(client) => {
                         self.log(format!(
                             "Connected — session {}",
                             client.status().session_id
                         ));
-                        // The kill switch (if requested) was already engaged in
-                        // Message::Connect, before this attempt started.
+                        // The kill switch (if requested) was already engaged
+                        // above, before Client::connect started.
                         self.status = Some(client.status());
                         self.client = Some(client);
                     }
                     Err(e) => {
                         self.log(format!("Connection failed: {e}"));
-                        // The kill switch was engaged pre-emptively in
-                        // Message::Connect; a failed attempt leaves no tunnel, so
-                        // it stays up fail-closed rather than being silently
-                        // dropped — make that visible instead of leaving the user
-                        // to wonder why they're offline.
+                        // The kill switch was engaged pre-emptively (see above,
+                        // set into self.ks by the `ks` match just before this);
+                        // a failed attempt leaves no tunnel, so it stays up
+                        // fail-closed rather than being silently dropped — make
+                        // that visible instead of leaving the user to wonder why
+                        // they're offline.
                         if self.ks.is_some() {
                             self.log(
                                 "⚠ Kill switch still ACTIVE — traffic stays blocked. Retry, \
