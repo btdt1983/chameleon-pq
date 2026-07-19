@@ -1,5 +1,9 @@
 [package]
 name = "chameleon-gui"
+# NOT the version shown in the app UI/title bar — that's chameleon::VERSION,
+# read from the CORE crate's Cargo.toml (../Cargo.toml) via the path
+# dependency below, and bumps automatically with the normal release step.
+# This field is just this internal package's own (unpublished) identifier.
 version = "0.1.0"
 edition = "2021"
 publish = false
