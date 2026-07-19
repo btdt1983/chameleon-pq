@@ -43,21 +43,11 @@ const MAX_BATCH: usize = 256;
 /// roughly one RTT (~40ms against a WAN peer) of Throughput's peak rate
 /// (473 Mbit/s / 8 * 0.04s / ~1232B/packet ≈ 1920 packets) with headroom.
 const MAX_QUEUE: usize = 4096;
-/// Batch threshold for the parallel decrypt path (Phase C): below this size we
-/// decrypt sequentially to avoid the spawn_blocking+rayon dispatch overhead.
-/// AEAD open on a ~1200 B packet is low-single-digit microseconds with
-/// hardware acceleration; `spawn_blocking` (a cross-thread hand-off through
-/// tokio's blocking pool, plus the rayon work-stealing setup) costs tens of
-/// microseconds on a good day. At the old threshold (16) a batch that size
-/// finishes sequentially before the dispatch alone would — meaning any real
-/// download, whose GRO-coalesced batch size swings across this line call to
-/// call, was flip-flopping into a SLOWER path exactly when it crossed it,
-/// which reads as throughput jitter, not a hard cap. Raised well above the
-/// range light-to-moderate traffic realistically produces (RECV_BATCH=32 raw
-/// slots per syscall, each possibly GRO-multiplied) so only genuinely large,
-/// heavily-coalesced bursts — where the parallel win clearly clears the
-/// dispatch cost — take the spawn_blocking path.
-const PAR_THRESHOLD: usize = 128;
+/// Depth of the request/response channels to the persistent seal/decrypt
+/// workers (see `spawn_seal_worker`/`spawn_decrypt_worker`). Each item is one
+/// whole batch, not one packet; a modest depth absorbs a brief producer/
+/// consumer speed mismatch without hiding a genuinely backed-up worker.
+const WORKER_CHANNEL_DEPTH: usize = 8;
 /// Fix #2: depth of the sealed-batch hand-off channel between the outbound drain
 /// loop and the single UDP sender task. Bounded so a slow sender back-pressures
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
@@ -115,6 +105,75 @@ impl TunnelParams {
             cooldown_ms: t.cooldown_ms,
         }
     }
+}
+
+// ── Persistent crypto workers ──────────────────────────────────────────────
+//
+// Modeled on wireguard-go's worker-pool + channel pattern (see also: the
+// Linux kernel WireGuard module's per-CPU workqueues) rather than dispatching
+// per batch. The previous design called `tokio::task::spawn_blocking` for
+// batches above a size threshold: that hands off through THREE distinct
+// thread pools per call (the async-worker calling it, tokio's blocking pool,
+// then rayon's own pool inside `*_batch_par`), and if the blocking pool has
+// no idle thread sitting around it must actually create one — tens of
+// microseconds on a good day, much more on a cold start. Real traffic's
+// batch size swings across any fixed threshold call to call, so the code was
+// intermittently flip-flopping into that slower path — measured live as
+// throughput jitter (20ms+ vs 0.3ms on the same path without the tunnel),
+// not a hard cap.
+//
+// A dedicated OS thread that stays parked in `recv()` between batches has no
+// such dispatch cost: waking it is a plain channel send, and it can call the
+// rayon-parallel `*_batch_par` directly without another hand-off. It's safe
+// to block this thread on rayon's work — unlike a tokio async-worker or a
+// pool-shared blocking thread, it was created for exactly this job and
+// nothing else waits on it.
+
+type SealWorkerHandle = (
+    tokio::sync::mpsc::Sender<Vec<OutboundPacket>>,
+    tokio::sync::mpsc::Receiver<crate::error::Result<Vec<Bytes>>>,
+);
+type DecryptWorkerHandle = (
+    tokio::sync::mpsc::Sender<Vec<(SocketAddr, Bytes)>>,
+    tokio::sync::mpsc::Receiver<Vec<DecryptResult>>,
+);
+
+/// Spawn a dedicated thread that seals outbound batches via
+/// `CryptoEngine::encrypt_batch_par` and returns the results on the response
+/// channel, in REQUEST order (rayon's `par_iter().collect()` preserves index
+/// order within a batch, and this worker drains requests strictly FIFO), so
+/// AEAD counters/on-wire order stay monotonic in `from_tun` drain order.
+/// Exits cleanly once the request sender is dropped (tunnel teardown).
+fn spawn_seal_worker(engine: Arc<CryptoEngine>) -> SealWorkerHandle {
+    let (req_tx, mut req_rx) =
+        tokio::sync::mpsc::channel::<Vec<OutboundPacket>>(WORKER_CHANNEL_DEPTH);
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(WORKER_CHANNEL_DEPTH);
+    std::thread::spawn(move || {
+        while let Some(batch) = req_rx.blocking_recv() {
+            let result = engine.encrypt_batch_par(batch);
+            if resp_tx.blocking_send(result).is_err() {
+                break; // response receiver gone -> tunnel torn down
+            }
+        }
+    });
+    (req_tx, resp_rx)
+}
+
+/// Same pattern as `spawn_seal_worker`, for the inbound decrypt path
+/// (`CryptoEngine::decrypt_batch_par`).
+fn spawn_decrypt_worker(engine: Arc<CryptoEngine>) -> DecryptWorkerHandle {
+    let (req_tx, mut req_rx) =
+        tokio::sync::mpsc::channel::<Vec<(SocketAddr, Bytes)>>(WORKER_CHANNEL_DEPTH);
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(WORKER_CHANNEL_DEPTH);
+    std::thread::spawn(move || {
+        while let Some(datagrams) = req_rx.blocking_recv() {
+            let results = engine.decrypt_batch_par(&datagrams);
+            if resp_tx.blocking_send(results).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, resp_rx)
 }
 
 /// Live counters for a running tunnel, so a frontend (client UI) can show
@@ -254,6 +313,54 @@ pub async fn run_tunnel_loops(
             }
         });
     }
+    // Persistent seal worker (see the module-level doc above `spawn_seal_worker`)
+    // + a small relay task that applies the existing inline-vs-bulk send
+    // decision to whatever comes back sealed. Splitting sealing and dispatch
+    // into their own task means the drain loop below never waits on either —
+    // it just fires a batch at the seal worker and goes straight back to
+    // draining `from_tun`.
+    let (seal_req_tx, mut seal_resp_rx) = spawn_seal_worker(engine.clone());
+    {
+        let send_tx_relay = send_tx.clone();
+        let socket_relay = socket.clone();
+        let state_relay = sock_state.clone();
+        let peer_relay = peer;
+        let gso_relay = gso;
+        tasks.spawn(async move {
+            while let Some(result) = seal_resp_rx.recv().await {
+                match result {
+                    Ok(wires) if wires.len() > SEND_INLINE_MAX => {
+                        // Bulk: the dedicated sender task pops FIFO, so this
+                        // preserves send order across everything routed here.
+                        if send_tx_relay.send(wires).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(wires) if !wires.is_empty() => {
+                        // Small (e.g. TCP ACKs): send inline — cheap, and
+                        // avoids the send_tx hop + sender wakeup that stole
+                        // client CPU from the RX path during a download.
+                        for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                            if let Err(e) = crate::udp::batch_send(
+                                &socket_relay,
+                                &state_relay,
+                                peer_relay,
+                                run,
+                                seg,
+                                gso_relay,
+                            )
+                            .await
+                            {
+                                error!("UDP batch send (seal-relay inline): {e}");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!("seal worker: {e}"),
+                }
+            }
+        });
+    }
     tasks.spawn(async move {
         // VecDeque, not Vec: the paced tick arm pops from the front every slot
         // (Vec::remove(0) would shift every remaining element — O(n) per pop,
@@ -304,45 +411,19 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else {
-                        // NON-PACED throughput path: seal here (counters monotonic in
-                        // from_tun drain order) and hand the wires to the sender task.
-                        // No inline socket await → the loop returns to draining at once.
+                        // NON-PACED throughput path: hand the batch to the
+                        // persistent seal worker (counters get assigned there,
+                        // in request order == from_tun drain order — see
+                        // spawn_seal_worker) and go straight back to draining.
+                        // No await on sealing OR sending here at all now — the
+                        // seal-relay task (spawned above) owns dispatching the
+                        // result, inline or via send_tx.
                         let batch: Vec<OutboundPacket> = drained
                             .drain(..)
                             .map(|plaintext| OutboundPacket { plaintext })
                             .collect();
-                        match engine_out.encrypt_batch(batch) {
-                            Ok(wires) if wires.len() > SEND_INLINE_MAX => {
-                                // Bulk: hand off to the sender task so the loop keeps
-                                // draining. Parks ONLY when the sender is saturated
-                                // (back-pressure); parking here, before the next
-                                // recv_many, keeps counters in send order.
-                                if send_tx.send(wires).await.is_err() {
-                                    break; // sender gone
-                                }
-                            }
-                            Ok(wires) if !wires.is_empty() => {
-                                // Small (e.g. TCP ACKs): send inline — cheap (≤ a few
-                                // GSO syscalls), doesn't stall the loop, and avoids the
-                                // send_tx hop + sender wakeup that stole client CPU from
-                                // the RX path during a download.
-                                for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                                    if let Err(e) = crate::udp::batch_send(
-                                        &socket_out,
-                                        &state_out,
-                                        peer_out,
-                                        run,
-                                        seg,
-                                        gso,
-                                    )
-                                    .await
-                                    {
-                                        error!("UDP batch send (inline): {e}");
-                                    }
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) => error!("encrypt_batch: {e}"),
+                        if seal_req_tx.send(batch).await.is_err() {
+                            break; // seal worker gone
                         }
                     }
                 }
@@ -491,6 +572,11 @@ pub async fn run_tunnel_loops(
         let mut pending_rekey: Option<(Handshake, u32)> = None;
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
+        // Persistent decrypt worker (see spawn_decrypt_worker) — every batch
+        // goes through it, no size threshold: a channel round-trip to an
+        // already-running thread is cheap regardless of batch size, unlike
+        // the old spawn_blocking dispatch this replaces.
+        let (decrypt_req_tx, mut decrypt_resp_rx) = spawn_decrypt_worker(engine_in.clone());
 
         'inbound: loop {
             tokio::select! {
@@ -512,31 +598,16 @@ pub async fn run_tunnel_loops(
                             .map(|(a, d)| (a, Bytes::copy_from_slice(d)))
                             .collect();
 
-                    // Decrypt the batch in PARALLEL across all cores at
-                    // sufficient volume; for a small batch sequentially (avoid overhead).
-                    // Only the data-path decrypt is parallel; the (rare)
-                    // handshake/rekey demux stays serial on this coordinator.
-                    let results: Vec<DecryptResult> = if datagrams.len()
-                        >= PAR_THRESHOLD
-                    {
-                        let engine = engine_in.clone();
-                        match tokio::task::spawn_blocking(move || engine.decrypt_batch_par(&datagrams))
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("decrypt task join error: {e}");
-                                continue;
-                            }
-                        }
-                    } else {
-                        datagrams
-                            .into_iter()
-                            .map(|(src, dg)| {
-                                let r = engine_in.sessions().decrypt_obf(&dg);
-                                (src, dg, r)
-                            })
-                            .collect()
+                    // Only the data-path decrypt goes to the worker (parallel
+                    // across all cores); the (rare) handshake/rekey demux
+                    // below stays serial on this coordinator.
+                    if decrypt_req_tx.send(datagrams).await.is_err() {
+                        error!("decrypt worker gone");
+                        break 'inbound;
+                    }
+                    let results: Vec<DecryptResult> = match decrypt_resp_rx.recv().await {
+                        Some(r) => r,
+                        None => { error!("decrypt worker gone"); break 'inbound; }
                     };
 
                     for (src, datagram, result) in results {
