@@ -324,54 +324,19 @@ pub async fn run_tunnel_loops(
             }
         });
     }
-    // Persistent seal worker (see the module-level doc above `spawn_seal_worker`)
-    // + a small relay task that applies the existing inline-vs-bulk send
-    // decision to whatever comes back sealed. Splitting sealing and dispatch
-    // into their own task means the drain loop below never waits on either —
-    // it just fires a batch at the seal worker and goes straight back to
-    // draining `from_tun`.
+    // Persistent seal worker (see the module-level doc above
+    // `spawn_seal_worker`). NOTE: unlike an earlier version of this code, the
+    // drain loop below AWAITS the worker's response for a large batch before
+    // moving on to the next `from_tun` read, instead of firing-and-forgetting
+    // to a separate relay task. That fire-and-forget design let a LATER,
+    // small batch (sealed inline, synchronously, in the very next loop
+    // iteration) get its AEAD counters assigned and hit the wire before an
+    // EARLIER, large batch that was still waiting on the worker — scrambling
+    // send order relative to from_tun read order and tripping the peer's
+    // replay window on legitimate packets. Awaiting here keeps the whole
+    // drain loop strictly sequential again, matching the invariant the
+    // pre-worker code already relied on.
     let (seal_req_tx, mut seal_resp_rx) = spawn_seal_worker(engine.clone());
-    {
-        let send_tx_relay = send_tx.clone();
-        let socket_relay = socket.clone();
-        let state_relay = sock_state.clone();
-        let peer_relay = peer;
-        let gso_relay = gso;
-        tasks.spawn(async move {
-            while let Some(result) = seal_resp_rx.recv().await {
-                match result {
-                    Ok(wires) if wires.len() > SEND_INLINE_MAX => {
-                        // Bulk: the dedicated sender task pops FIFO, so this
-                        // preserves send order across everything routed here.
-                        if send_tx_relay.send(wires).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(wires) if !wires.is_empty() => {
-                        // Small (e.g. TCP ACKs): send inline — cheap, and
-                        // avoids the send_tx hop + sender wakeup that stole
-                        // client CPU from the RX path during a download.
-                        for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                            if let Err(e) = crate::udp::batch_send(
-                                &socket_relay,
-                                &state_relay,
-                                peer_relay,
-                                run,
-                                seg,
-                                gso_relay,
-                            )
-                            .await
-                            {
-                                error!("UDP batch send (seal-relay inline): {e}");
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => error!("seal worker: {e}"),
-                }
-            }
-        });
-    }
     tasks.spawn(async move {
         // VecDeque, not Vec: the paced tick arm pops from the front every slot
         // (Vec::remove(0) would shift every remaining element — O(n) per pop,
@@ -422,44 +387,58 @@ pub async fn run_tunnel_loops(
                             }
                         }
                     } else {
-                        // NON-PACED throughput path.
+                        // NON-PACED throughput path. Seal — inline for a
+                        // small batch (no dispatch cost), via the persistent
+                        // worker for a large one (parallel across cores) —
+                        // and ALWAYS wait for the sealed result before doing
+                        // anything else, whichever path was taken: counters
+                        // must be assigned in from_tun drain order, so this
+                        // can't race a later batch's inline path (see the
+                        // comment on `seal_req_tx` above `tasks.spawn`).
                         let batch: Vec<OutboundPacket> = drained
                             .drain(..)
                             .map(|plaintext| OutboundPacket { plaintext })
                             .collect();
-                        if batch.len() < INLINE_THRESHOLD {
-                            // Small: seal right here, sequentially — no
-                            // dispatch cost at all (see INLINE_THRESHOLD doc).
-                            match engine_out.encrypt_batch(batch) {
-                                Ok(wires) if wires.len() > SEND_INLINE_MAX => {
-                                    if send_tx.send(wires).await.is_err() {
-                                        break; // sender gone
-                                    }
-                                }
-                                Ok(wires) if !wires.is_empty() => {
-                                    for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                                        if let Err(e) = crate::udp::batch_send(
-                                            &socket_out, &state_out, peer_out, run, seg, gso,
-                                        )
-                                        .await
-                                        {
-                                            error!("UDP batch send (inline): {e}");
-                                        }
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(e) => error!("encrypt_batch: {e}"),
-                            }
+                        let sealed = if batch.len() < INLINE_THRESHOLD {
+                            engine_out.encrypt_batch(batch)
                         } else {
-                            // Large: hand off to the persistent seal worker
-                            // (counters get assigned there, in request order
-                            // == from_tun drain order — see spawn_seal_worker)
-                            // and go straight back to draining. No await on
-                            // sealing OR sending here — the seal-relay task
-                            // (spawned above) owns dispatching the result.
                             if seal_req_tx.send(batch).await.is_err() {
                                 break; // seal worker gone
                             }
+                            match seal_resp_rx.recv().await {
+                                Some(r) => r,
+                                None => break, // seal worker gone
+                            }
+                        };
+                        match sealed {
+                            Ok(wires) if wires.len() > SEND_INLINE_MAX => {
+                                // Bulk: hand off to the sender task so the loop
+                                // keeps draining. Parks ONLY when the sender is
+                                // saturated (back-pressure); parking here,
+                                // before the next recv_many, keeps counters in
+                                // send order.
+                                if send_tx.send(wires).await.is_err() {
+                                    break; // sender gone
+                                }
+                            }
+                            Ok(wires) if !wires.is_empty() => {
+                                // Small (e.g. TCP ACKs): send inline — cheap,
+                                // doesn't stall the loop, and avoids the
+                                // send_tx hop + sender wakeup that stole
+                                // client CPU from the RX path during a
+                                // download.
+                                for (run, seg) in crate::udp::group_equal_sized(&wires) {
+                                    if let Err(e) = crate::udp::batch_send(
+                                        &socket_out, &state_out, peer_out, run, seg, gso,
+                                    )
+                                    .await
+                                    {
+                                        error!("UDP batch send (inline): {e}");
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("seal: {e}"),
                         }
                     }
                 }
