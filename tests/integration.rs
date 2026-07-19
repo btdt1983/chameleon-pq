@@ -206,6 +206,146 @@ fn session_manager_rekey_swap_keeps_old_alive() {
     );
 }
 
+/// `reserve_counters` + `seal_obf_with_counter` decouple counter allocation
+/// from sealing on purpose (see session.rs doc) so a pipeline can fix a
+/// batch's on-wire position immediately and seal it later, possibly out of
+/// order relative to OTHER batches. This proves the decoupling itself is
+/// correct — each reserved counter still decrypts under its own value —
+/// independent of any pipeline plumbing that might call seal in a scrambled
+/// order (exactly what a warm worker pool does in practice).
+#[test]
+fn reserve_then_seal_out_of_order_is_correct() {
+    let shared = [0x30u8; 32];
+    let tx = obf_session(1, shared, true, AeadAlgo::ChaCha20Poly1305);
+    let rx = SessionManager::new(obf_session(1, shared, false, AeadAlgo::ChaCha20Poly1305));
+
+    let base = tx.reserve_counters(3).unwrap();
+
+    // Seal completely out of order: 2, 0, 1.
+    let w2 = tx
+        .seal_obf_with_counter(
+            base + 2,
+            FrameType::Data as u8,
+            b"packet-2",
+            PadPolicy::Bucketed,
+        )
+        .unwrap();
+    let w0 = tx
+        .seal_obf_with_counter(
+            base,
+            FrameType::Data as u8,
+            b"packet-0",
+            PadPolicy::Bucketed,
+        )
+        .unwrap();
+    let w1 = tx
+        .seal_obf_with_counter(
+            base + 1,
+            FrameType::Data as u8,
+            b"packet-1",
+            PadPolicy::Bucketed,
+        )
+        .unwrap();
+
+    // Each still decrypts correctly, regardless of seal order.
+    assert_eq!(&rx.decrypt_obf(&w0).unwrap().1[..], b"packet-0");
+    assert_eq!(&rx.decrypt_obf(&w1).unwrap().1[..], b"packet-1");
+    assert_eq!(&rx.decrypt_obf(&w2).unwrap().1[..], b"packet-2");
+}
+
+/// The single most safety-critical property of decoupling reserve from seal:
+/// concurrent reservations must never hand out the same counter twice (an
+/// AEAD nonce reuse would be catastrophic). `tx_counter.fetch_add` is atomic
+/// by construction, but this pins down the observable guarantee explicitly
+/// rather than relying only on that implementation detail staying true.
+#[test]
+fn concurrent_reserve_never_duplicates_a_counter() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let shared = zeroize::Zeroizing::new([0x31u8; 32]);
+    let mgr = Arc::new(SessionManager::new(
+        Session::from_handshake(1, shared, true).unwrap(),
+    ));
+
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = 200;
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let mgr = mgr.clone();
+            thread::spawn(move || {
+                let mut mine = Vec::with_capacity(PER_THREAD as usize);
+                for _ in 0..PER_THREAD {
+                    let (_sess, counter) = mgr.reserve(1).unwrap();
+                    mine.push(counter);
+                }
+                mine
+            })
+        })
+        .collect();
+
+    let mut all: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    all.sort_unstable();
+
+    assert_eq!(
+        all.len(),
+        THREADS * PER_THREAD as usize,
+        "every reservation returned"
+    );
+    let unique: std::collections::HashSet<_> = all.iter().collect();
+    assert_eq!(unique.len(), all.len(), "no counter reserved twice");
+    // Dense range starting at 0: nothing skipped, nothing double-issued.
+    let expected: Vec<u64> = (0..(THREADS as u64 * PER_THREAD)).collect();
+    assert_eq!(all, expected, "counters form a dense, gap-free range");
+}
+
+/// `SessionManager::reserve` pins the specific `Arc<Session>` it reserved
+/// against — the caller MUST seal using that exact Arc, never by re-reading
+/// `current` later, because a rekey can land in between. This proves why:
+/// reserve against session A, let a rekey install session B as `current`,
+/// then seal using the Arc `reserve` returned — it must still be valid under
+/// A's keys, and a peer holding A as `previous` must still decrypt it.
+#[test]
+fn reserved_counter_survives_a_rekey_landing_before_the_seal() {
+    let shared_a = [0x32u8; 32];
+    let sess_a = obf_session(1, shared_a, true, AeadAlgo::ChaCha20Poly1305);
+    let peer_a = obf_session(1, shared_a, false, AeadAlgo::ChaCha20Poly1305);
+    let mgr = SessionManager::new(sess_a);
+
+    // Reserve against A (the currently active session) — this is the pinned
+    // Arc a real pipeline would hold onto while sealing happens elsewhere.
+    let (pinned_sess, counter) = mgr.reserve(1).unwrap();
+
+    // A rekey lands in between: B becomes current, A becomes previous.
+    let shared_b = zeroize::Zeroizing::new([0x33u8; 32]);
+    let sess_b = Session::from_handshake(2, shared_b, true).unwrap();
+    mgr.install_new_session(sess_b);
+
+    // Seal now, against the PINNED session (A) — not by asking `mgr` again,
+    // which would hand back B.
+    let wire = pinned_sess
+        .seal_obf_with_counter(
+            counter,
+            FrameType::Data as u8,
+            b"reserved-before-rekey",
+            PadPolicy::Bucketed,
+        )
+        .unwrap();
+
+    // A peer keyed for session A decrypts it correctly — proving the wire
+    // was sealed under A's keys/counter, not B's, despite B being `current`
+    // on the LOCAL side by the time the seal actually ran. (Whether the
+    // PEER itself has since rekeyed too is a separate, already-covered
+    // scenario — see session_manager_rekey_swap_keeps_old_alive.)
+    let peer_mgr = SessionManager::new(peer_a);
+    let (ft, pt) = peer_mgr.decrypt_obf(&wire).unwrap();
+    assert_eq!(ft, FrameType::Data);
+    assert_eq!(&pt[..], b"reserved-before-rekey");
+}
+
 #[test]
 fn rekey_antistorm_gate_blocks_rapid_retrigger() {
     use chameleon::session::{Session, SessionManager};
@@ -401,10 +541,7 @@ fn hybrid_pq_handshake_tunnels_data_both_ways() {
     // and split into multiple fragments.
     let (hs_init, init_wire) = Handshake::start(&init_auth).unwrap();
     assert_eq!(init_wire.len(), chameleon::tunnel::HANDSHAKE_MSG_LEN);
-    assert!(
-        fragment(1, &init_wire).len() >= 2,
-        "PQ handshake fragments"
-    );
+    assert!(fragment(1, &init_wire).len() >= 2, "PQ handshake fragments");
 
     let init_rx = roundtrip(1, &init_wire);
     let (hs_resp, resp_wire) = Handshake::respond(init_rx, &resp_auth).unwrap();
@@ -486,10 +623,7 @@ fn aegis_session_roundtrips_many_packets() {
     // Replay of an old packet must also fail with AEGIS.
     let (c0, ct0) = tx.encrypt(b"fresh").unwrap();
     assert!(rx.decrypt(c0, &ct0).is_ok());
-    assert!(
-        rx.decrypt(c0, &ct0).is_err(),
-        "replay rejected under AEGIS"
-    );
+    assert!(rx.decrypt(c0, &ct0).is_err(), "replay rejected under AEGIS");
 }
 
 // ── Obfuscated data path (obf.rs, QUIC-style header protection + padding) ────
@@ -534,10 +668,7 @@ fn obf_tamper_rejected() {
             .unwrap()
             .to_vec();
         w[2] ^= 0xFF;
-        assert!(
-            rx.decrypt_obf(&w).is_err(),
-            "masked header tamper fails"
-        );
+        assert!(rx.decrypt_obf(&w).is_err(), "masked header tamper fails");
 
         // (b) Tamper with the ciphertext outside the sample (first ct byte). The
         //     header comes back correct, but the AEAD tag fails.
@@ -708,11 +839,7 @@ fn obf_wire_header_looks_random() {
         first_bytes.insert(w[0]);
     }
     // Each masked header is unique (counter + tag sample differ).
-    assert_eq!(
-        headers.len(),
-        200,
-        "masked headers are all unique"
-    );
+    assert_eq!(headers.len(), 200, "masked headers are all unique");
     // Byte 0 is not the constant 0x01 and varies widely (≈uniform).
     assert!(!first_bytes.contains(&0x01) || first_bytes.len() > 50);
     assert!(
@@ -1213,11 +1340,7 @@ fn encrypt_batch_par_produces_decryptable_packets() {
         assert_eq!(ft, FrameType::Data);
         recovered.insert(plain.to_vec());
     }
-    assert_eq!(
-        recovered.len(),
-        n,
-        "all {n} unique plaintexts recovered"
-    );
+    assert_eq!(recovered.len(), n, "all {n} unique plaintexts recovered");
 }
 
 /// `decrypt_batch_par` classifies: obfuscated data → Ok(Data), noise → Err
@@ -1398,7 +1521,10 @@ async fn handshake_over_udp_completes_mutual() {
         .expect("initiator handshake ok");
 
     let (resp_session, peer) = resp_task.await.unwrap().expect("responder handshake ok");
-    assert_eq!(peer, client_addr, "responder pins the initiator source address");
+    assert_eq!(
+        peer, client_addr,
+        "responder pins the initiator source address"
+    );
 
     // Since I-13 both sides derive the same session_id from the shared secret
     // (no more process-global counter), so a real data roundtrip works even in a
@@ -1516,20 +1642,11 @@ fn derived_session_id_matches_across_sides_and_differs_per_handshake() {
     let (a_i, a_r) = run();
     let (b_i, b_r) = run();
     // Both sides of one handshake arrive at the same id.
-    assert_eq!(
-        a_i, a_r,
-        "both sides derive the same session_id (I-13)"
-    );
-    assert_eq!(
-        b_i, b_r,
-        "both sides derive the same session_id (I-13)"
-    );
+    assert_eq!(a_i, a_r, "both sides derive the same session_id (I-13)");
+    assert_eq!(b_i, b_r, "both sides derive the same session_id (I-13)");
     // Two separate handshakes (fresh ephemeral shared) give different ids,
     // so current/previous can be told apart during a rekey overlap.
-    assert_ne!(
-        a_i, b_i,
-        "different handshakes -> different session_id"
-    );
+    assert_ne!(a_i, b_i, "different handshakes -> different session_id");
 }
 
 // ── L-4: return-routability cookie ───────────────────────────────────────────

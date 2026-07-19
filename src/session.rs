@@ -206,16 +206,44 @@ impl Session {
         self.rekey_at
     }
 
-    /// Encrypt an outbound packet. Returns (counter, ciphertext+tag).
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(u64, Bytes)> {
-        let counter = self.tx_counter.fetch_add(1, Ordering::Relaxed);
-        if counter >= self.rekey_at {
+    /// Reserve `n` contiguous tx counters and return the first. Decoupled
+    /// from sealing on purpose: the nonce/AAD only depend on the counter
+    /// value, not on when the seal actually runs, so a caller can fix the
+    /// ORDER of a batch of packets right here (one atomic op) and then seal
+    /// them later — sequentially, in parallel, out of completion order,
+    /// whatever — without ever risking two packets sharing a counter.
+    /// Every caller MUST seal every reserved counter exactly once: a
+    /// reserved-but-never-sealed counter just burns a nonce value, which is
+    /// harmless (nonces don't need to be contiguous), but a counter sealed
+    /// TWICE is a catastrophic AEAD nonce reuse.
+    pub fn reserve_counters(&self, n: u64) -> Result<u64> {
+        let first = self.tx_counter.fetch_add(n, Ordering::Relaxed);
+        // Check the LAST counter in the range, not just the first: a whole
+        // reserved batch must fit under rekey_at, or a later seal in the
+        // batch would silently run past the point rekeying was supposed to
+        // have happened.
+        if first.saturating_add(n.saturating_sub(1)) >= self.rekey_at {
             return Err(ChameleonError::RekeyRequired);
         }
+        Ok(first)
+    }
+
+    /// Core AEAD seal against an counter reserved earlier via
+    /// `reserve_counters` — no counter allocation here. `pub(crate)` because
+    /// callers outside this crate have no business minting raw AEAD
+    /// ciphertext without the obfuscation wrapper; `seal_obf_with_counter`
+    /// is the public equivalent for the data path this project actually uses.
+    pub(crate) fn seal_with_counter(&self, counter: u64, plaintext: &[u8]) -> Result<Bytes> {
         let nonce = self.make_nonce(self.tx_salt, counter);
         let aad = self.data_aad(counter);
         let ct = self.tx_aead.seal(&nonce, &aad, plaintext)?;
-        Ok((counter, Bytes::from(ct)))
+        Ok(Bytes::from(ct))
+    }
+
+    /// Encrypt an outbound packet. Returns (counter, ciphertext+tag).
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(u64, Bytes)> {
+        let counter = self.reserve_counters(1)?;
+        Ok((counter, self.seal_with_counter(counter, plaintext)?))
     }
 
     /// Decrypt an inbound packet. Order: check → decrypt → commit.
@@ -266,15 +294,44 @@ impl Session {
     /// encrypt that via the UNCHANGED AEAD core, and mask the header. Returns
     /// the wire-ready datagram (masked_header ‖ ct).
     pub fn seal_obf(&self, inner_type: u8, plaintext: &[u8], policy: PadPolicy) -> Result<Bytes> {
+        let counter = self.reserve_counters(1)?;
+        self.seal_obf_core(counter, inner_type, plaintext, policy)
+    }
+
+    /// Shared implementation for `seal_obf`/`seal_obf_with_counter`: pack the
+    /// inner framing, seal it, mask the header. `counter` is assumed already
+    /// reserved (via `reserve_counters` — directly or through `seal_obf`).
+    fn seal_obf_core(
+        &self,
+        counter: u64,
+        inner_type: u8,
+        plaintext: &[u8],
+        policy: PadPolicy,
+    ) -> Result<Bytes> {
         let max_framed = obf::max_framed(self.algo.tag_len());
         let framed = obf::pack_inner(inner_type, plaintext, policy, max_framed);
-        let (counter, ct) = self.encrypt(&framed)?;
+        let ct = self.seal_with_counter(counter, &framed)?;
         Ok(obf::seal_wire(
             &self.tx_obf_key,
             self.session_id,
             counter,
             &ct,
         ))
+    }
+
+    /// Seal against a counter reserved EARLIER via `reserve_counters` — the
+    /// data-path (obfuscated) equivalent of `seal_with_counter`. Used by the
+    /// tunnel's outbound pipeline: a batch's counters are reserved up front
+    /// (fixing on-wire order), then sealed here, possibly in parallel and
+    /// out of completion order — see `engine::CryptoEngine::seal_batch_with_counters`.
+    pub fn seal_obf_with_counter(
+        &self,
+        counter: u64,
+        inner_type: u8,
+        plaintext: &[u8],
+        policy: PadPolicy,
+    ) -> Result<Bytes> {
+        self.seal_obf_core(counter, inner_type, plaintext, policy)
     }
 
     /// Try to open an inbound datagram as an obfuscated data-path packet for
@@ -404,6 +461,18 @@ impl SessionManager {
         let sess = self.current.read().clone();
         let (counter, ct) = sess.encrypt(plaintext)?;
         Ok((sess.session_id, counter, ct))
+    }
+
+    /// Pin the active session and reserve `n` counters against it, in one
+    /// step. The pinning is load-bearing, not defensive: if a rekey lands
+    /// between this call and the eventual seal, the caller MUST seal
+    /// against the SAME `Arc<Session>` returned here — never re-read
+    /// `current` later — or a counter reserved on the old session's tx
+    /// sequence would get sealed under the new session's keys.
+    pub fn reserve(&self, n: u64) -> Result<(Arc<Session>, u64)> {
+        let sess = self.current.read().clone();
+        let first = sess.reserve_counters(n)?;
+        Ok((sess, first))
     }
 
     pub fn decrypt(&self, session_id: u32, counter: u64, ct: &[u8]) -> Result<Bytes> {
