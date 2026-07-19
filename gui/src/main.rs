@@ -17,7 +17,8 @@ use chameleon::config::{AppConfig, TrafficProfile};
 use chameleon::killswitch::KillSwitch;
 use chameleon::tun_iface::TunPair;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, svg, text, text_input,
+    button, checkbox, column, container, markdown, pick_list, row, scrollable, svg, text,
+    text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use std::io::Write;
@@ -28,6 +29,10 @@ use std::time::Duration;
 
 /// The project's GitHub page (linked from the GUI header).
 const REPO_URL: &str = "https://github.com/btdt1983/chameleon-pq";
+/// GitHub API endpoint for the latest release — used only when the user
+/// presses "Check for updates" (never automatically, never on launch).
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/btdt1983/chameleon-pq/releases/latest";
 
 pub fn main() -> iced::Result {
     // Diagnostics first: a Windows GUI has no console, so without this every
@@ -47,13 +52,13 @@ pub fn main() -> iced::Result {
         App::update,
         App::view,
     )
-        .theme(App::theme)
-        .window(iced::window::Settings {
-            icon,
-            ..Default::default()
-        })
-        .subscription(App::subscription)
-        .run_with(App::new)
+    .theme(App::theme)
+    .window(iced::window::Settings {
+        icon,
+        ..Default::default()
+    })
+    .subscription(App::subscription)
+    .run_with(App::new)
 }
 
 /// Path of the diagnostics log file: next to the executable (on Windows where the
@@ -264,6 +269,14 @@ struct App {
     /// A kill switch detected at startup that we did NOT create this session —
     /// left over from a previous crash / app close. Offer to clear it.
     ks_orphan: bool,
+    /// "Check for updates" outcome, shown in the sidebar. Only ever changes in
+    /// response to the user pressing the button — no automatic/startup check.
+    update_status: UpdateStatus,
+    /// The checked release's notes, pre-parsed for the markdown widget.
+    /// `None` until a check has completed successfully at least once.
+    release_notes: Option<Vec<markdown::Item>>,
+    /// The checked release's page, for the "Open release" link.
+    latest_release_url: Option<String>,
 }
 
 /// `(connect outcome, kill-switch engage outcome)`, produced by the async
@@ -272,6 +285,58 @@ type ConnectOutcome = (
     Result<Arc<Client>, String>,
     Option<Result<KillSwitch, String>>,
 );
+
+#[derive(Debug, Clone, Default)]
+enum UpdateStatus {
+    #[default]
+    NotChecked,
+    Checking,
+    UpToDate,
+    Available(String),
+    Error(String),
+}
+
+/// The subset of a GitHub release API response this app uses.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+    html_url: String,
+}
+
+/// Parse a `vX.Y.Z` / `X.Y.Z` tag into a comparable tuple. `None` for anything
+/// that doesn't fit that shape (so a malformed/unexpected tag degrades to "no
+/// comparison possible" instead of a wrong verdict).
+fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Fetch the latest GitHub release. Only ever called from the
+/// `Message::CheckForUpdates` handler — on-demand, not on launch.
+async fn fetch_latest_release() -> Result<GhRelease, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("chameleon-gui/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(LATEST_RELEASE_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned {}", resp.status()));
+    }
+    resp.json::<GhRelease>()
+        .await
+        .map_err(|e| format!("unexpected response: {e}"))
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -297,6 +362,14 @@ enum Message {
     DisableKillSwitch,
     /// Open the project's GitHub page in the default browser.
     OpenRepo,
+    /// User pressed "Check for updates" in the sidebar.
+    CheckForUpdates,
+    /// The update check completed.
+    UpdateChecked(Result<GhRelease, String>),
+    /// A link inside the rendered release notes was clicked.
+    LinkClicked(markdown::Url),
+    /// "Open release ↗" in the sidebar — opens `latest_release_url`.
+    OpenLatestRelease,
 }
 
 impl App {
@@ -323,6 +396,9 @@ impl App {
                 kill_switch: false,
                 ks: None,
                 ks_orphan,
+                update_status: UpdateStatus::NotChecked,
+                release_notes: None,
+                latest_release_url: None,
             },
             Task::none(),
         )
@@ -479,8 +555,7 @@ impl App {
                                     if attempt.is_ok() {
                                         break;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(300))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                     attempt = KillSwitch::engage(server, &cfg.tun.name);
                                 }
                                 Some(attempt.map_err(|e| e.to_string()))
@@ -612,6 +687,35 @@ impl App {
                     } else {
                         self.status = Some(st);
                     }
+                }
+            }
+            Message::CheckForUpdates => {
+                self.update_status = UpdateStatus::Checking;
+                return Task::perform(fetch_latest_release(), Message::UpdateChecked);
+            }
+            Message::UpdateChecked(res) => match res {
+                Ok(release) => {
+                    self.release_notes = Some(markdown::parse(&release.body).collect());
+                    self.latest_release_url = Some(release.html_url.clone());
+                    self.update_status = match (
+                        parse_semver(&release.tag_name),
+                        parse_semver(chameleon::VERSION),
+                    ) {
+                        (Some(latest), Some(current)) if latest > current => {
+                            UpdateStatus::Available(release.tag_name)
+                        }
+                        (Some(_), Some(_)) => UpdateStatus::UpToDate,
+                        _ => UpdateStatus::Error("couldn't compare version numbers".into()),
+                    };
+                }
+                Err(e) => self.update_status = UpdateStatus::Error(e),
+            },
+            Message::LinkClicked(url) => {
+                let _ = open::that(url.to_string());
+            }
+            Message::OpenLatestRelease => {
+                if let Some(url) = &self.latest_release_url {
+                    let _ = open::that(url);
                 }
             }
         }
@@ -838,7 +942,7 @@ impl App {
         .width(Length::Fill)
         .style(card_style);
 
-        scrollable(
+        let main_column = scrollable(
             container(
                 column![
                     header,
@@ -854,7 +958,81 @@ impl App {
             )
             .padding(22)
             .max_width(560),
+        );
+
+        row![main_column, self.sidebar(muted)]
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Right-hand panel: current version, an on-demand "Check for updates"
+    /// button (never called automatically — see `Message::CheckForUpdates`),
+    /// and the checked release's notes.
+    fn sidebar(&self, muted: Color) -> Element<'_, Message> {
+        let green = Color::from_rgb8(0x39, 0xd9, 0x7f);
+        let red = Color::from_rgb8(0xff, 0xb4, 0xb4);
+
+        let update_row: Element<Message> = match &self.update_status {
+            UpdateStatus::NotChecked => button(text("Check for updates").size(13))
+                .style(button::secondary)
+                .on_press(Message::CheckForUpdates)
+                .into(),
+            UpdateStatus::Checking => text("Checking…").size(13).color(muted).into(),
+            UpdateStatus::UpToDate => text("✓ Up to date").size(13).color(green).into(),
+            UpdateStatus::Available(ver) => column![
+                text(format!("⬆ Update available: {ver}"))
+                    .size(13)
+                    .color(green),
+                button(text("Open release ↗").size(12))
+                    .style(button::text)
+                    .on_press(Message::OpenLatestRelease),
+            ]
+            .spacing(4)
+            .into(),
+            UpdateStatus::Error(e) => column![
+                text(format!("Check failed: {e}")).size(12).color(red),
+                button(text("Retry").size(12))
+                    .style(button::secondary)
+                    .on_press(Message::CheckForUpdates),
+            ]
+            .spacing(4)
+            .into(),
+        };
+
+        let changelog: Element<Message> = match &self.release_notes {
+            Some(items) if !items.is_empty() => scrollable(
+                markdown::view(
+                    items,
+                    markdown::Settings::default(),
+                    markdown::Style::from_palette(self.theme().palette()),
+                )
+                .map(Message::LinkClicked),
+            )
+            .height(Length::Fill)
+            .into(),
+            Some(_) => text("(no release notes)").size(12).color(muted).into(),
+            None => text("Press \"Check for updates\" to see what's new.")
+                .size(12)
+                .color(muted)
+                .into(),
+        };
+
+        container(
+            column![
+                text("What's new").size(16),
+                text(format!("You're on v{}", chameleon::VERSION))
+                    .size(12)
+                    .color(muted),
+                update_row,
+                iced::widget::horizontal_rule(1),
+                changelog,
+            ]
+            .spacing(12),
         )
+        .padding(16)
+        .width(Length::Fixed(280.0))
+        .height(Length::Fill)
+        .style(card_style)
         .into()
     }
 }
@@ -905,4 +1083,30 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_semver;
+
+    #[test]
+    fn parses_with_and_without_v_prefix() {
+        assert_eq!(parse_semver("v0.8.2"), Some((0, 8, 2)));
+        assert_eq!(parse_semver("0.8.2"), Some((0, 8, 2)));
+    }
+
+    #[test]
+    fn rejects_malformed_input() {
+        assert_eq!(parse_semver("not-a-version"), None);
+        assert_eq!(parse_semver("v1.2"), None);
+        assert_eq!(parse_semver(""), None);
+    }
+
+    #[test]
+    fn orders_by_numeric_value_not_lexically() {
+        // The whole reason for a real parse instead of string compare:
+        // "0.9.0" < "0.10.0" lexically flips the wrong way, "10" < "9".
+        assert!(parse_semver("0.10.0") > parse_semver("0.9.0"));
+        assert!(parse_semver("1.0.0") > parse_semver("0.99.99"));
+    }
 }
