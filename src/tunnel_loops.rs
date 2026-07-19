@@ -43,10 +43,21 @@ const MAX_BATCH: usize = 256;
 /// roughly one RTT (~40ms against a WAN peer) of Throughput's peak rate
 /// (473 Mbit/s / 8 * 0.04s / ~1232B/packet ≈ 1920 packets) with headroom.
 const MAX_QUEUE: usize = 4096;
-/// Batch threshold for the parallel crypto path (Phase C): below this size we
-/// seal/decrypt sequentially to avoid the spawn_blocking+rayon overhead under
-/// light traffic.
-const PAR_THRESHOLD: usize = 16;
+/// Batch threshold for the parallel decrypt path (Phase C): below this size we
+/// decrypt sequentially to avoid the spawn_blocking+rayon dispatch overhead.
+/// AEAD open on a ~1200 B packet is low-single-digit microseconds with
+/// hardware acceleration; `spawn_blocking` (a cross-thread hand-off through
+/// tokio's blocking pool, plus the rayon work-stealing setup) costs tens of
+/// microseconds on a good day. At the old threshold (16) a batch that size
+/// finishes sequentially before the dispatch alone would — meaning any real
+/// download, whose GRO-coalesced batch size swings across this line call to
+/// call, was flip-flopping into a SLOWER path exactly when it crossed it,
+/// which reads as throughput jitter, not a hard cap. Raised well above the
+/// range light-to-moderate traffic realistically produces (RECV_BATCH=32 raw
+/// slots per syscall, each possibly GRO-multiplied) so only genuinely large,
+/// heavily-coalesced bursts — where the parallel win clearly clears the
+/// dispatch cost — take the spawn_blocking path.
+const PAR_THRESHOLD: usize = 128;
 /// Fix #2: depth of the sealed-batch hand-off channel between the outbound drain
 /// loop and the single UDP sender task. Bounded so a slow sender back-pressures
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly. Each
