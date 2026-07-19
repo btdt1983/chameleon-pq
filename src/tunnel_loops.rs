@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_BATCH: usize = 256;
@@ -243,7 +243,17 @@ pub async fn run_tunnel_loops(
         let mut drained: Vec<Bytes> = Vec::with_capacity(MAX_BATCH);
         let mut from_tun = from_tun;
         // Ticker: fixed slot rate when pacing, otherwise the batch-linger.
+        // MissedTickBehavior::Skip (not the tokio default Burst): if a paced
+        // slot's synchronous seal_data_full() calls ever take longer than
+        // pace_slot (e.g. burst=8 in a 166us slot at Throughput leaves only
+        // ~21us/packet — tight without AES-NI/AVX2), Burst would fire every
+        // missed tick back-to-back to catch up, which both starves other
+        // tasks (the TUN-read producer feeding `pending`) AND defeats the
+        // whole point of a CONSTANT-rate pacer (bursty catch-up is exactly
+        // the timing signal this module exists to hide). Skip just drops the
+        // ticks it couldn't make and stays on the original schedule instead.
         let mut tick = interval(if paced { pace_slot } else { linger });
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut pacer = Pacer::new(pace_mode, pace_cooldown);
         // Live-reconfigurable pacing state: a `traffic_rx` change (e.g. a GUI
         // profile switch) recomputes these without tearing down the tunnel.
@@ -427,6 +437,7 @@ pub async fn run_tunnel_loops(
                             Duration::from_micros(1_000_000u64 / eff.rate_pps.max(1) as u64);
                         pace_burst = eff.burst.max(1) as usize;
                         tick = interval(if paced { new_slot } else { linger });
+                        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                         pacer = Pacer::new(new_mode, Duration::from_millis(eff.cooldown_ms));
                         info!(
                             "live traffic switch: {} ({} pps)",
