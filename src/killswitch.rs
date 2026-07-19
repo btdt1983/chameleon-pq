@@ -39,6 +39,11 @@ use tracing::info;
 /// switch in place (fail-closed); the next launch detects it via `is_engaged`
 /// and offers to clear it, and `KillSwitch::clear` / `killswitch off` is always
 /// available as an escape hatch.
+///
+/// `Clone`: the two fields are plain data (no OS handle) — cloning is safe and
+/// only needed so a GUI can carry an engage outcome through its `Message`
+/// enum, which derives `Clone`.
+#[derive(Debug, Clone)]
 pub struct KillSwitch {
     engaged: bool,
     /// Count of pre-existing, non-Chameleon outbound "Allow" firewall rules
