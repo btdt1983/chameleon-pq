@@ -193,19 +193,33 @@ line rate. Each is measured, not assumed.
    into one syscall with UDP GSO on send and coalesce with GRO on receive
    (per-packet fallback on old kernels / non-Linux), lifting the send path to
    ~9.6 Mpps. No wire change: GSO segments are ordinary datagrams on the wire.
-3. **Multi-core seal/open.** With the syscall wall gone the next ceiling is
-   the single-core AEAD (~2 Gbit/s obf seal/open) — the crypto ran in one
-   outbound and one inbound task. `engine.rs` now seals/opens a GSO/GRO batch
-   **in parallel across all cores** with rayon (`encrypt_batch_par` /
-   `decrypt_batch_par`), bridged from the async loops with `spawn_blocking`
-   (one hand-off per batch, amortised over 64–256 packets; a small-batch
-   threshold keeps light traffic on the sequential inline path). This is
-   safe with no change to the crypto: the tx counter is an `AtomicU64`
-   (`fetch_add` → a unique nonce per packet across threads, §5), `decrypt`
-   opens **lock-free** and only the cheap check/commit take the per-session
-   replay `Mutex`, and the 2048-entry window (§6) absorbs any
-   parallel-completion reorder. `Session`/`SessionManager` are `Send + Sync`,
-   so `Arc<SessionManager>` seals from N rayon workers directly. Measured
+3. **Multi-core seal/open, wireguard-go pipeline shape.** With the syscall
+   wall gone the next ceiling is the single-core AEAD (~2 Gbit/s obf
+   seal/open) — the crypto ran in one outbound and one inbound task.
+   `engine.rs` now seals/opens a GSO/GRO batch **in parallel across all
+   cores** with rayon (`encrypt_batch_par` / `decrypt_batch_par`). Outbound
+   follows wireguard-go's own device pipeline rather than a batch-size
+   threshold (an earlier threshold design under-performed and, in one
+   iteration, shipped a real ordering bug): `tunnel_loops.rs` reserves the
+   whole batch's AEAD counter range up front — one atomic `fetch_add`,
+   fixing wire order before any parallel work starts — dispatches the seal
+   onto rayon's warm pool (`rayon::spawn`, injected into an already-running
+   pool, unlike `spawn_blocking`'s thread-pool hand-off), and a dedicated
+   sequential-sender task drains completed batches strictly in reservation
+   order before writing to the socket, so on-wire counter order never
+   depends on which batch finishes sealing first. Inbound skips the
+   ordering step entirely — the replay window (§6) and TUN write order both
+   tolerate reordering — so decrypted batches are processed as soon as they
+   complete. Every `rayon::spawn` job goes through a `catch_unwind` guard
+   (`rayon_spawn_guarded`): rayon's job type has no `catch_unwind` of its
+   own, so an escaping panic would otherwise call `std::process::abort()`
+   and kill the whole server process, not just one session. Still safe with
+   no change to the crypto: the tx counter is reserved atomically (a unique,
+   gapless nonce range per batch, §5), `decrypt` opens **lock-free** and
+   only the cheap check/commit take the per-session replay `Mutex`, and the
+   2048-entry window (§6) absorbs any parallel-completion reorder on the
+   inbound side. `Session`/`SessionManager` are `Send + Sync`, so
+   `Arc<SessionManager>` seals from N rayon workers directly. Measured
    ~4.5× (seal) / ~13× (open) on a 12-thread box. Operators can cap the pool
    with `[engine].workers` (0 = auto = all cores) to reserve cores for the
    reactor/TUN.
@@ -551,9 +565,15 @@ These are stated plainly so no one mistakes intent for proof:
   (`udp.rs`), removing the per-packet syscall wall (~0.18 → ~9.6 Mpps on a
   microbench). No wire change. See §4a.
 - **Multi-core crypto.** Batch seal/open now run in parallel across all cores
-  via rayon (`engine.rs`, `spawn_blocking`-bridged), ~4.5×/~13× on 12 threads,
-  capped by `[engine].workers`. Unpaced fast path only; no wire/crypto change.
-  See §4a.
+  via rayon (`engine.rs`), ~4.5×/~13× on 12 threads, capped by
+  `[engine].workers`. Unpaced fast path only; no wire/crypto change. See §4a.
+- **Wireguard-go-style crypto pipeline.** Outbound dispatch reserves each
+  batch's AEAD counter range up front, seals on rayon's warm pool, and a
+  dedicated sequential sender enforces wire order on the way out — replacing
+  an earlier batch-size-threshold design that under-performed and, in one
+  iteration, shipped a real counter-ordering bug. Every rayon job is
+  panic-guarded (`rayon_spawn_guarded`) to avoid a single bad packet
+  aborting the whole process. See §4a.
 - **Security-review hardening (0.5.1–0.6.0).** A self-review drove: pinning the
   control plane to the established peer (kills a reflection/amplification vector),
   a bounded initial handshake (no permanent wedge, no crash on a malformed init),

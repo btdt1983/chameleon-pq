@@ -132,7 +132,7 @@ Known scope limits:
   `profile = "off"`); with timing-shaping on (opt-in) the configured rate caps
   throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 88 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 111 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -146,7 +146,13 @@ Known scope limits:
   that a cover packet round-trips as `Padding`, and that cover and data are
   equal-length + header-distinct under `Full` padding), parallel crypto
   (parallel-sealed packets all decrypt with unique counters, and
-  `decrypt_batch_par` classifies data vs noise), role-separated handshake
+  `decrypt_batch_par` classifies data vs noise), the reserve-then-seal
+  outbound pipeline (out-of-order sealing against pre-reserved counters still
+  decrypts correctly, concurrent reservations on the same session never
+  duplicate a counter, a reserved counter survives a rekey landing before its
+  seal, wire order matches submission order even when batches finish sealing
+  in scrambled order, and a panicking rayon crypto job surfaces as an error
+  instead of aborting the process), role-separated handshake
   signatures (a reflected responder signature is rejected as a Confirm, even
   under a shared identity key), the bounded UDP handshake (mutual completion
   over real sockets + a clean timeout when no responder answers), identity
@@ -266,15 +272,25 @@ to the binary.
   a cover packet, or nothing (`ShapeMode` CBR/Adaptive); the async loop in
   `main.rs` drives it
 - `engine.rs` — CPU encryption engine: batch seal/open, run **in parallel
-  across cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`, bridged
-  from the async loops with `spawn_blocking`); constant-time, low-latency, no GPU
-  path (see DESIGN.md §11–§12 for why)
+  across cores** via rayon (`encrypt_batch_par` / `decrypt_batch_par`;
+  `seal_batch_with_counters` for the reserved-counter outbound path, see
+  `tunnel_loops.rs` below); constant-time, low-latency, no GPU path (see
+  DESIGN.md §11–§12 for why)
 - `net.rs` — UDP handshake wiring (initiator/responder, fragmentation, the L-4
   cookie) + the return-routability `CookieState`
 - `tunnel_loops.rs` — the live tunnel loops (outbound / inbound + handshake-rekey
   demux / keepalive) as a reusable `run_tunnel_loops`, plus `TunnelParams`
   (owned config) and `TunnelStats` (live tx/rx counters); `main.rs` is a thin
-  wrapper and a custom client can drive the same loop
+  wrapper and a custom client can drive the same loop. Outbound crypto follows
+  wireguard-go's own device pipeline: each drained batch reserves its AEAD
+  counter range up front (one atomic op, fixing wire order immediately),
+  seals in parallel on rayon's warm pool, and a dedicated sequential sender
+  drains results strictly in reservation order — so a slower batch can never
+  be overtaken on the wire by a faster later one. Inbound decrypt dispatches
+  the same way but skips the ordering step (the replay window and TUN write
+  order both tolerate reordering). Every `rayon::spawn` crypto job goes
+  through a panic-catching guard (`rayon_spawn_guarded`): an unguarded panic
+  in a rayon job aborts the whole process, not just one session
 - `client.rs` — client-core: `Client::connect` (handshake + start the tunnel in
   the background) with live `Status`, `build_auth`/`hs_obf_key`, and
   `security_warnings` (secure-by-default: loudly flags a weaker config). The
