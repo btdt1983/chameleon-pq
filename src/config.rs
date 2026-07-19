@@ -614,6 +614,26 @@ impl AppConfig {
                 ),
             });
         }
+        // kill_switch / dns are both meaningless without route_all (see their
+        // doc comments) and silently no-op at runtime otherwise — a user could
+        // enable one believing it protects them and `chameleon-pq check` would
+        // wave it through. Catch that here instead.
+        if self.tun.kill_switch && !self.tun.route_all {
+            return Err(ChameleonError::Handshake {
+                state: "config".into(),
+                msg: "tun.kill_switch requires tun.route_all = true (kill switch \
+                      only guards full-tunnel routing)"
+                    .into(),
+            });
+        }
+        if !self.tun.dns.is_empty() && !self.tun.route_all {
+            return Err(ChameleonError::Handshake {
+                state: "config".into(),
+                msg: "tun.dns requires tun.route_all = true (DNS-leak protection \
+                      only applies with full-tunnel routing)"
+                    .into(),
+            });
+        }
         // Optional handshake obfuscation PSK: if set, it must parse and
         // not be absurdly short (too little entropy would weaken the obfuscation).
         if let Some(psk) = self.obfuscation.psk_bytes()? {

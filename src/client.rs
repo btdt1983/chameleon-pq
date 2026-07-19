@@ -20,7 +20,7 @@ use crate::tun_iface::TunPair;
 use crate::tunnel_loops::{run_tunnel_loops, TunnelParams, TunnelStats};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -139,12 +139,17 @@ pub struct Client {
     socket: Arc<UdpSocket>,
     pad: PadPolicy,
     obf: bool,
-    /// Full-tunnel routes (WireGuard-style), held for RAII: removed when this
-    /// Client is dropped (i.e. on disconnect). `None` in split-tunnel mode.
-    _routes: Option<FullTunnelRoutes>,
-    /// DNS-leak protection, held for RAII: the OS DNS is restored when this
-    /// Client is dropped. `None` unless `[tun] dns` is set with `route_all`.
-    _dns: Option<DnsGuard>,
+    /// Full-tunnel routes (WireGuard-style), held for RAII. `None` in
+    /// split-tunnel mode. `Mutex`-wrapped (not just a plain field) so
+    /// `disconnect(&self)` can explicitly `.take()` and drop it — `Client` is
+    /// designed to be held behind an `Arc` (see `disconnect`'s doc), and with
+    /// a plain field the routes would only go away once EVERY clone of that
+    /// `Arc` is dropped, not on a `disconnect()` call itself. Otherwise falls
+    /// back to the same cleanup when the whole `Client` is dropped.
+    _routes: Mutex<Option<FullTunnelRoutes>>,
+    /// DNS-leak protection, same reasoning as `_routes`. `None` unless
+    /// `[tun] dns` is set with `route_all`.
+    _dns: Mutex<Option<DnsGuard>>,
 }
 
 // Manual Debug: CryptoEngine/SessionManager aren't Debug, but a frontend's
@@ -290,8 +295,8 @@ impl Client {
             socket: socket_close,
             pad,
             obf,
-            _routes: routes,
-            _dns: dns,
+            _routes: Mutex::new(routes),
+            _dns: Mutex::new(dns),
         })
     }
 
@@ -316,8 +321,10 @@ impl Client {
         let _ = self.traffic_tx.send(traffic);
     }
 
-    /// Close the tunnel: stop the background task. Takes `&self` (JoinHandle::abort
-    /// is `&self`) so a frontend can keep the client behind an `Arc`.
+    /// Close the tunnel: stop the background task and release the full-tunnel
+    /// routes / DNS override right away — does NOT wait for every clone of an
+    /// `Arc<Client>` to be dropped. Takes `&self` (JoinHandle::abort is `&self`)
+    /// so a frontend can keep the client behind an `Arc`.
     pub fn disconnect(&self) {
         // Best-effort authenticated Close so the server tears the session down
         // immediately (instead of waiting out its dead-peer timeout) → fast
@@ -337,6 +344,21 @@ impl Client {
         }
         self.task.abort();
         self.stats.connected.store(false, Ordering::Relaxed);
+        // Explicit release, independent of how many Arc<Client> clones exist
+        // (see the struct doc on `_routes`/`_dns`) — dropping the taken value
+        // runs FullTunnelRoutes'/DnsGuard's own RAII teardown right now.
+        drop(
+            self._routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        drop(
+            self._dns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
     }
 }
 

@@ -424,6 +424,41 @@ impl App {
                     self.log("No valid server address (host:port).");
                     return Task::none();
                 };
+                // Engage the kill switch BEFORE attempting to connect, not after
+                // (server + tun name are already known here). Engaging only once
+                // the tunnel is up leaves a real window — including the up-to-
+                // ~5s full-tunnel route install inside `Client::connect` — where
+                // the tunnel is being set up with no fail-closed backing yet. The
+                // switch's own Allow rules (tun/server/LAN/DHCP) don't require the
+                // tun interface to exist yet, so this is safe to do early.
+                if self.kill_switch {
+                    if cfg.tun.route_all {
+                        match KillSwitch::engage(server, &cfg.tun.name) {
+                            Ok(k) => {
+                                self.log("Kill switch engaged — traffic is locked to the tunnel.");
+                                // Windows only: a pre-existing outbound Allow rule
+                                // (from other software, or a Windows built-in) can
+                                // override our default-block — see killswitch.rs.
+                                // Surface that instead of implying full protection.
+                                if let Some(n) = k.other_allow_rules {
+                                    if n > 0 {
+                                        self.log(format!(
+                                            "⚠ {n} other outbound-allow firewall rule(s) found — \
+                                             traffic matching one of those could bypass the kill switch."
+                                        ));
+                                    }
+                                }
+                                self.ks = Some(k);
+                                self.ks_orphan = false;
+                            }
+                            Err(e) => self.log(format!("Kill switch failed to engage: {e}")),
+                        }
+                    } else {
+                        self.log(
+                            "Kill switch skipped: it needs full-tunnel (tun.route_all = true).",
+                        );
+                    }
+                }
                 self.connecting = true;
                 self.log(format!("Connecting to {server} …"));
                 return Task::perform(
@@ -455,37 +490,25 @@ impl App {
                             "Connected — session {}",
                             client.status().session_id
                         ));
-                        // Engage the kill switch now the tunnel is up. Only with
-                        // full-tunnel routing (otherwise blocking everything but
-                        // the tunnel would strand a split-tunnel user offline).
-                        if self.kill_switch {
-                            let full_tunnel = self.config.as_ref().is_some_and(|c| c.tun.route_all);
-                            let tun = self
-                                .config
-                                .as_ref()
-                                .map(|c| c.tun.name.clone())
-                                .unwrap_or_default();
-                            if full_tunnel {
-                                match KillSwitch::engage(client.status().peer, &tun) {
-                                    Ok(k) => {
-                                        self.ks = Some(k);
-                                        self.ks_orphan = false;
-                                        self.log("Kill switch engaged — traffic is locked to the tunnel.");
-                                    }
-                                    Err(e) => {
-                                        self.log(format!("Kill switch failed to engage: {e}"))
-                                    }
-                                }
-                            } else {
-                                self.log(
-                                    "Kill switch skipped: it needs full-tunnel (tun.route_all = true).",
-                                );
-                            }
-                        }
+                        // The kill switch (if requested) was already engaged in
+                        // Message::Connect, before this attempt started.
                         self.status = Some(client.status());
                         self.client = Some(client);
                     }
-                    Err(e) => self.log(format!("Connection failed: {e}")),
+                    Err(e) => {
+                        self.log(format!("Connection failed: {e}"));
+                        // The kill switch was engaged pre-emptively in
+                        // Message::Connect; a failed attempt leaves no tunnel, so
+                        // it stays up fail-closed rather than being silently
+                        // dropped — make that visible instead of leaving the user
+                        // to wonder why they're offline.
+                        if self.ks.is_some() {
+                            self.log(
+                                "⚠ Kill switch still ACTIVE — traffic stays blocked. Retry, \
+                                 or disable the kill switch to go online without the VPN.",
+                            );
+                        }
+                    }
                 }
             }
             Message::Disconnect => {

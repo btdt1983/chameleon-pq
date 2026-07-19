@@ -76,7 +76,7 @@ impl Frame {
 
     pub fn encode(&self) -> Result<Bytes> {
         let plen = self.payload.len();
-        if plen > MAX_PAYLOAD.max(u16::MAX as usize) {
+        if plen > MAX_PAYLOAD {
             return Err(ChameleonError::PayloadTooLarge(plen));
         }
         let mut buf = BytesMut::with_capacity(HEADER_LEN + plen);

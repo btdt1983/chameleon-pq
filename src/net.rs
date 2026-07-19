@@ -256,8 +256,20 @@ pub async fn run_handshake_responder(
     'listen: loop {
         // Phase 1: wait for a complete, processable Init.
         let mut reasm = Reassembler::default();
+        // Phase 1 waits UNBOUNDED for a complete Init (see the doc above), so a
+        // slow-trickle attacker sending fragments across many msg_ids (each
+        // left incomplete) could otherwise hold stale entries for as long as
+        // this loop runs. Prune periodically — same State-Bloat-DoS fix
+        // `tunnel_loops.rs` already applies to the rekey reassemblers.
+        let mut prune_tick = tokio::time::interval(Duration::from_secs(10));
         let (hs, peer_addr) = loop {
-            let (n, src) = socket.recv_from(&mut buf).await?;
+            let (n, src) = tokio::select! {
+                r = socket.recv_from(&mut buf) => r?,
+                _ = prune_tick.tick() => {
+                    reasm.prune_old(Duration::from_secs(10));
+                    continue;
+                }
+            };
             match push_handshake(&mut reasm, &buf[..n], hs_obf) {
                 Ok(Some(init_wire)) => {
                     // Decode cheaply to read the type + cookie BEFORE we do

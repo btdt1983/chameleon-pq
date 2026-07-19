@@ -28,6 +28,10 @@ use tracing::info;
 /// A live DNS override that restores the previous configuration on drop.
 pub struct DnsGuard {
     restore: Restore,
+    // Windows only: periodically re-covers non-tun adapters that come up AFTER
+    // install (Wi-Fi reconnect, a new virtual NIC) — see `start_refresher`.
+    #[cfg(target_os = "windows")]
+    refresher: Refresher,
 }
 
 impl DnsGuard {
@@ -50,12 +54,20 @@ impl DnsGuard {
             "DNS-leak protection ON — {} resolver(s) forced through the tunnel",
             servers.len()
         );
-        Ok(Self { restore })
+        #[cfg(target_os = "windows")]
+        let refresher = start_refresher(servers.to_vec(), tun.to_string(), restore.saved.clone());
+        Ok(Self {
+            restore,
+            #[cfg(target_os = "windows")]
+            refresher,
+        })
     }
 }
 
 impl Drop for DnsGuard {
     fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.refresher.stop();
         restore_backend(&self.restore);
         info!("DNS-leak protection off — previous DNS restored");
     }
@@ -164,10 +176,13 @@ Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -ne '__TUN__' } 
 }"#;
 
 /// Per-interface original IPv4 DNS servers to put back on drop (an empty list =
-/// the interface was on DHCP/none → reset it).
+/// the interface was on DHCP/none → reset it). Shared with the refresher thread
+/// (`Arc<Mutex<..>>`), which APPENDS newly-covered adapters as they appear —
+/// it never touches an entry already here, since by the time it runs, that
+/// adapter's "current" DNS is already OURS, not the real original.
 #[cfg(target_os = "windows")]
 struct Restore {
-    saved: Vec<(u32, Vec<IpAddr>)>,
+    saved: std::sync::Arc<std::sync::Mutex<Vec<(u32, Vec<IpAddr>)>>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -231,15 +246,22 @@ fn install_backend(servers: &[IpAddr], tun: &str) -> Result<Restore> {
         ],
     );
     let _ = run_cmd("ipconfig", &["/flushdns"]);
-    Ok(Restore { saved })
+    Ok(Restore {
+        saved: std::sync::Arc::new(std::sync::Mutex::new(saved)),
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn restore_backend(restore: &Restore) {
     // Put every interface's original IPv4 DNS back (reset to DHCP if it had none),
     // re-enable smart resolution, and flush. Best-effort.
+    let saved = restore
+        .saved
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
     let mut script = String::from("$ErrorActionPreference='SilentlyContinue'\n");
-    for (idx, orig) in &restore.saved {
+    for (idx, orig) in &saved {
         if orig.is_empty() {
             script.push_str(&format!(
                 "Set-DnsClientServerAddress -InterfaceIndex {idx} -ResetServerAddresses\n"
@@ -263,6 +285,128 @@ fn restore_backend(restore: &Restore) {
         ],
     );
     let _ = run_cmd("ipconfig", &["/flushdns"]);
+}
+
+// ── Refresher: cover adapters that come up AFTER install ──────────────────────
+//
+// `install_backend` only sees a snapshot of "up" adapters at connect time. A
+// Wi-Fi reconnect (sleep/wake, roaming), or a new virtual adapter (Docker/
+// Hyper-V/another VPN) appearing later keeps its own DHCP/ISP resolver for the
+// rest of the session — the exact multi-homed leak this module exists to
+// close, just delayed instead of prevented. This background thread re-checks
+// periodically and covers anything new, WITHOUT re-touching adapters already
+// in `saved` (re-capturing those would save OUR OWN servers as the "original"
+// and corrupt the restore).
+
+#[cfg(target_os = "windows")]
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// PowerShell: one ifIndex per line, for every currently up non-tun adapter.
+/// Cheap — used to detect newly-appeared adapters without touching their DNS.
+#[cfg(target_os = "windows")]
+const LIST_UP_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -ne '__TUN__' } | ForEach-Object { $_.ifIndex }"#;
+
+/// Capture `idx`'s current (pre-Chameleon) DNS and point it at `servers`, in
+/// one script so there is no window between "read" and "set". `idx` is a
+/// `u32` parsed from our own `Get-NetAdapter` output, so it is safe to
+/// interpolate directly (never attacker/config-controlled text).
+#[cfg(target_os = "windows")]
+fn cover_adapter(idx: u32, servers: &[IpAddr]) -> Option<Vec<IpAddr>> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'\n\
+         $o = (Get-DnsClientServerAddress -InterfaceIndex {idx} -AddressFamily IPv4).ServerAddresses -join ','\n\
+         Write-Output $o\n\
+         Set-DnsClientServerAddress -InterfaceIndex {idx} -ServerAddresses ({})\n",
+        ps_server_list(servers)
+    );
+    let out = run_powershell_capture(&script).ok()?;
+    Some(
+        out.trim()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+            .collect(),
+    )
+}
+
+/// One refresh pass: find up non-tun adapters not already in `saved`, cover
+/// each, and append its captured original to `saved`.
+#[cfg(target_os = "windows")]
+fn refresh_tick(
+    tun: &str,
+    servers: &[IpAddr],
+    saved: &std::sync::Arc<std::sync::Mutex<Vec<(u32, Vec<IpAddr>)>>>,
+) {
+    let script = LIST_UP_SCRIPT.replace("__TUN__", tun);
+    let Ok(out) = run_powershell_capture(&script) else {
+        return;
+    };
+    let up: Vec<u32> = out.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    for idx in up {
+        // Cheap check-then-cover: a small TOCTOU (another adapter could appear
+        // between the check and the lock below) is harmless — worst case it
+        // waits one more `REFRESH_INTERVAL` tick to be covered.
+        let already_covered = saved
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .any(|(i, _)| *i == idx);
+        if already_covered {
+            continue;
+        }
+        if let Some(orig) = cover_adapter(idx, servers) {
+            info!("DNS-leak protection: covering newly-up adapter (ifIndex {idx})");
+            saved
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((idx, orig));
+        }
+    }
+}
+
+/// Background thread handle for the periodic refresh. No `Drop` impl of its
+/// own — `DnsGuard::drop` calls `stop()` explicitly before restoring DNS, so
+/// the refresher cannot race a restore that is already in flight.
+#[cfg(target_os = "windows")]
+struct Refresher {
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Refresher {
+    /// Ask the thread to stop. Does not block: the thread notices within one
+    /// `REFRESH_INTERVAL` and exits on its own; we don't join it (DnsGuard's
+    /// Drop must not hang on a PowerShell call that happens to be in flight).
+    fn stop(&mut self) {
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.handle = None; // detach; the thread outlives this handle, briefly
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn start_refresher(
+    servers: Vec<IpAddr>,
+    tun: String,
+    saved: std::sync::Arc<std::sync::Mutex<Vec<(u32, Vec<IpAddr>)>>>,
+) -> Refresher {
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop_flag.clone();
+    let handle = std::thread::spawn(move || {
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(REFRESH_INTERVAL);
+            if stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            refresh_tick(&tun, &servers, &saved);
+        }
+    });
+    Refresher {
+        stop_flag,
+        handle: Some(handle),
+    }
 }
 
 /// Run a command with no console window (the GUI is a windowed subsystem app, so
