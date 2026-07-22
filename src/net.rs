@@ -255,8 +255,9 @@ pub async fn run_handshake_initiator(
             // (mutual auth).
             send_handshake(&sink, session_id, &confirm_wire, hs_obf).await?;
             info!(
-                "handshake complete (initiator, mutual), session {}",
-                session.session_id
+                "handshake complete (initiator, mutual), session {}, cipher {:?}",
+                session.session_id,
+                session.algo()
             );
             Ok(session)
         }
@@ -385,8 +386,9 @@ pub async fn run_handshake_responder(
             Ok(Ok(confirm_wire)) => match hs.confirm(confirm_wire, auth) {
                 Ok(Handshake::Established { session }) => {
                     info!(
-                        "handshake complete (responder, mutual), session {}",
-                        session.session_id
+                        "handshake complete (responder, mutual), session {}, cipher {:?}",
+                        session.session_id,
+                        session.algo()
                     );
                     return Ok((session, peer_addr));
                 }
