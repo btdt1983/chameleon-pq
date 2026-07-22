@@ -93,10 +93,11 @@ pub(crate) async fn rekey_as_initiator(
                         // Send Confirm so the responder authenticates us.
                         send_handshake(sink, new_session_id, &confirm_wire, hs_obf).await?;
                         let sid = session.session_id; // derived session_id (I-13)
+                        let algo = session.algo();
                         sessions.install_new_session(session);
                         info!(
                             "rekey complete after {attempt} attempt(s), mutual — \
-                               now on session {sid}"
+                               now on session {sid}, cipher {algo:?}"
                         );
                         Ok(())
                     }
@@ -178,9 +179,10 @@ pub fn rekey_responder_confirm(
     match hs.confirm(confirm_wire, auth)? {
         Handshake::Established { session } => {
             let sid = session.session_id; // derived session_id (I-13)
+            let algo = session.algo();
             sessions.install_new_session(session);
             info!(
-                "rekey (responder) complete, mutual — now on session {sid} (req {new_session_id})"
+                "rekey (responder) complete, mutual — now on session {sid} (req {new_session_id}), cipher {algo:?}"
             );
             Ok(())
         }
