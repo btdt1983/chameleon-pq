@@ -14,13 +14,11 @@
 
 use crate::crypto::Authenticator;
 use crate::error::Result;
-use crate::net::{build_handshake_datagrams, push_handshake, send_handshake};
+use crate::net::{build_handshake_datagrams, push_handshake, send_handshake, HandshakeSink};
 use crate::session::SessionManager;
 use crate::tunnel::{Handshake, Reassembler};
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info};
@@ -38,10 +36,11 @@ const MAX_REKEY_RETRIES: usize = 4;
 /// Response fragments arrive via `hs_rx` (fed by the inbound loop).
 /// On loss of the init or response packet the init is resent (bounded
 /// retry). The ephemeral keys stay constant across retries — only the
-/// transmission is repeated.
-pub async fn rekey_as_initiator(
-    socket: &UdpSocket,
-    peer: SocketAddr,
+/// transmission is repeated. `sink` decides how datagrams leave: straight to
+/// the socket, or handed to the outbound pacer (see `HandshakeSink`) — the
+/// caller picks based on whether a traffic profile is currently shaping timing.
+pub(crate) async fn rekey_as_initiator(
+    sink: &HandshakeSink<'_>,
     auth: &dyn Authenticator,
     sessions: &SessionManager,
     new_session_id: u32,
@@ -65,7 +64,7 @@ pub async fn rekey_as_initiator(
     for attempt in 1..=MAX_REKEY_RETRIES {
         // (Re)send the init message.
         for datagram in &init_datagrams {
-            socket.send_to(datagram, peer).await?;
+            sink.send(datagram).await?;
         }
 
         let mut reasm = Reassembler::default();
@@ -92,7 +91,7 @@ pub async fn rekey_as_initiator(
                 return match hs.finalize(resp_wire, auth)? {
                     (Handshake::Established { session }, confirm_wire) => {
                         // Send Confirm so the responder authenticates us.
-                        send_handshake(socket, peer, new_session_id, &confirm_wire, hs_obf).await?;
+                        send_handshake(sink, new_session_id, &confirm_wire, hs_obf).await?;
                         let sid = session.session_id; // derived session_id (I-13)
                         sessions.install_new_session(session);
                         info!(
@@ -143,10 +142,9 @@ pub fn schedule_retire(sessions: Arc<SessionManager>) {
 ///
 /// This two-stage model fits the fact that the inbound loop is the only reader
 /// of the socket: it first feeds the init here, and later the Confirm to
-/// `rekey_responder_confirm`.
-pub async fn rekey_as_responder(
-    socket: &UdpSocket,
-    peer: SocketAddr,
+/// `rekey_responder_confirm`. `sink` — see `rekey_as_initiator`'s doc.
+pub(crate) async fn rekey_as_responder(
+    sink: &HandshakeSink<'_>,
     auth: &dyn Authenticator,
     new_session_id: u32,
     init_wire: Bytes,
@@ -154,7 +152,7 @@ pub async fn rekey_as_responder(
 ) -> Result<Handshake> {
     match Handshake::respond(init_wire, auth)? {
         (hs @ Handshake::SentResponse { .. }, resp_wire) => {
-            send_handshake(socket, peer, new_session_id, &resp_wire, hs_obf).await?;
+            send_handshake(sink, new_session_id, &resp_wire, hs_obf).await?;
             info!(
                 "rekey (responder) response sent — awaiting confirm for session {new_session_id}"
             );

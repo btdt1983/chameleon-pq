@@ -452,11 +452,19 @@ fits one datagram (like WireGuard sizing the tunnel MTU to the path).
 **Honest limitation (what remains):** timing shaping hides the *shape* of the
 traffic, not the **existence** of the tunnel (the endpoints are known,
 site-to-site) or its **total duration**; the **initial handshake burst** is
-pre-pacer and still visible (rekey pacing is a documented follow-up); CBR costs
-constant bandwidth and adds up to ~`1/rate` latency per packet; and in Adaptive
-mode coarse volume-over-time still leaks. So this closes the timing dimension for
-the data path under CBR, but "full traffic-analysis resistance" remains a
-qualified claim.
+pre-pacer and structurally cannot be — it precedes the tunnel loops, so there
+is no pacer yet to ride. A **mid-session rekey**, by contrast, runs while the
+pacer is already live and no longer bypasses it (see `net::HandshakeSink` /
+`tunnel_loops.rs`'s `rekey_fut`): its datagrams are handed to the same slot
+schedule as data instead of sent straight to the socket, so a rekey neither
+adds an out-of-schedule burst nor — the bigger risk, since a rekey's own
+wait-for-response used to block the tick loop inline — silences the
+constant-rate cover stream while it runs. CBR still costs constant bandwidth
+and adds up to ~`1/rate` latency per packet; and in Adaptive mode coarse
+volume-over-time still leaks. So this closes the timing dimension for the
+data path (including rekeys) under CBR, but "full traffic-analysis
+resistance" remains a qualified claim — the initial handshake burst is the
+one residual this cannot reach by construction.
 
 ---
 
@@ -598,3 +606,11 @@ These are stated plainly so no one mistakes intent for proof:
   reflection; only the initial handshake needs it (rekey is already source-pinned
   to the established peer). WireGuard-style, kept always-on here since site-to-site
   handshakes are rare so the extra round-trip is negligible.
+- **Rekey pacing.** A mid-session rekey's datagrams now go through
+  `net::HandshakeSink`: straight to the socket when no traffic profile is
+  active (unchanged), or handed to the outbound pacer's own slot schedule
+  when one is (`tunnel_loops.rs`). The pacer's tick arm also no longer
+  `.await`s the rekey inline — it holds the in-flight attempt (`rekey_fut`)
+  as its own `select!` arm, so the constant-rate cover stream keeps running
+  for the full multi-round-trip duration of a rekey instead of going silent.
+  See §9a.
