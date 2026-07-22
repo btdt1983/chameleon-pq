@@ -105,17 +105,50 @@ pub(crate) fn build_handshake_datagrams(
     }
 }
 
+/// Where a handshake datagram is delivered. The INITIAL handshake always
+/// uses `Direct` — it precedes the tunnel loops (there is no pacer yet to
+/// hand off to), and DESIGN.md §9a already documents its burst as a residual,
+/// unfixable-by-construction leak. A mid-session REKEY, however, runs while
+/// the outbound loop's pacer is already live, so it can use `Paced` instead:
+/// handing its datagrams to the pacer's own slot schedule (see
+/// `tunnel_loops.rs`) instead of writing the socket itself, so the rekey
+/// rides the same constant-rate/constant-size cover stream as data instead
+/// of showing up as an out-of-schedule burst (or, worse, a gap — see the
+/// comment on `tunnel_loops::run_tunnel_loops`'s `rekey_fut`).
+pub(crate) enum HandshakeSink<'a> {
+    /// Write straight to the socket, right now.
+    Direct(&'a UdpSocket, SocketAddr),
+    /// Hand off to the outbound pacer; it sends the datagram, unmodified, in
+    /// its next available slot. The channel is small and bounded — backpressure
+    /// here is exactly the pacing we want, not a bug.
+    Paced(&'a tokio::sync::mpsc::Sender<Bytes>),
+}
+
+impl HandshakeSink<'_> {
+    pub(crate) async fn send(&self, datagram: &Bytes) -> Result<()> {
+        match self {
+            HandshakeSink::Direct(socket, peer) => {
+                socket.send_to(datagram, *peer).await?;
+                Ok(())
+            }
+            HandshakeSink::Paced(tx) => tx
+                .send(datagram.clone())
+                .await
+                .map_err(|_| ChameleonError::ChannelClosed),
+        }
+    }
+}
+
 /// Send a handshake message over the wire (obf or cleartext, see
-/// `build_handshake_datagrams`).
+/// `build_handshake_datagrams`), via whichever `sink` the caller chose.
 pub(crate) async fn send_handshake(
-    socket: &UdpSocket,
-    peer: SocketAddr,
+    sink: &HandshakeSink<'_>,
     session_id: u32,
     wire: &[u8],
     hs_obf: Option<&[u8; 32]>,
 ) -> Result<()> {
     for datagram in build_handshake_datagrams(session_id, wire, hs_obf)? {
-        socket.send_to(&datagram, peer).await?;
+        sink.send(&datagram).await?;
     }
     Ok(())
 }
@@ -167,11 +200,12 @@ pub async fn run_handshake_initiator(
     // CookieChallenge (L-4) they are rebuilt with the cookie inside.
     let mut init_datagrams = build_handshake_datagrams(session_id, &init_wire, hs_obf)?;
 
+    let sink = HandshakeSink::Direct(socket, peer);
     let mut buf = vec![0u8; UDP_BUF];
     let mut resp_wire = None;
     for attempt in 1..=HS_MAX_ATTEMPTS {
         for datagram in &init_datagrams {
-            socket.send_to(datagram, peer).await?;
+            sink.send(datagram).await?;
         }
         let mut reasm = Reassembler::default();
         let got = timeout(HS_ATTEMPT_TIMEOUT, async {
@@ -219,7 +253,7 @@ pub async fn run_handshake_initiator(
         (Handshake::Established { session }, confirm_wire) => {
             // Send the Confirm message so the responder can authenticate US
             // (mutual auth).
-            send_handshake(socket, peer, session_id, &confirm_wire, hs_obf).await?;
+            send_handshake(&sink, session_id, &confirm_wire, hs_obf).await?;
             info!(
                 "handshake complete (initiator, mutual), session {}",
                 session.session_id
@@ -293,8 +327,13 @@ pub async fn run_handshake_responder(
                         match HandshakeMessage::new_cookie_challenge(cookies.issue(&src)) {
                             Ok(ch) => match ch.encode() {
                                 Ok(wire) => {
-                                    let _ = send_handshake(socket, src, session_id, &wire, hs_obf)
-                                        .await;
+                                    let _ = send_handshake(
+                                        &HandshakeSink::Direct(socket, src),
+                                        session_id,
+                                        &wire,
+                                        hs_obf,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => warn!("cookie challenge encode: {e}"),
                             },
@@ -306,7 +345,13 @@ pub async fn run_handshake_responder(
                     // Valid cookie -> return-routable -> do the expensive handshake.
                     match Handshake::respond(init_wire, auth) {
                         Ok((hs, resp_wire)) => {
-                            send_handshake(socket, src, session_id, &resp_wire, hs_obf).await?;
+                            send_handshake(
+                                &HandshakeSink::Direct(socket, src),
+                                session_id,
+                                &resp_wire,
+                                hs_obf,
+                            )
+                            .await?;
                             break (hs, src);
                         }
                         // Invalid init (e.g. broken ML-KEM key): skip.
@@ -360,5 +405,68 @@ pub async fn run_handshake_responder(
                 continue 'listen;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Paced` must hand the datagram to the channel UNCHANGED and never touch
+    /// a socket — this is the whole point (a rekey under a traffic profile
+    /// rides the outbound pacer's own slots instead of writing the wire
+    /// itself; see `tunnel_loops.rs`'s paced tick arm, which drains this
+    /// channel).
+    #[tokio::test]
+    async fn paced_sink_delivers_to_channel_unchanged() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let sink = HandshakeSink::Paced(&tx);
+        let datagram = Bytes::from_static(b"handshake fragment");
+
+        sink.send(&datagram).await.unwrap();
+
+        let got = rx.try_recv().expect("datagram was queued, not dropped");
+        assert_eq!(got, datagram);
+    }
+
+    /// `Direct` must still hit the socket immediately (today's behaviour,
+    /// unchanged) — this is what the INITIAL handshake always uses, and what
+    /// a rekey uses whenever no traffic profile is shaping timing.
+    #[tokio::test]
+    async fn direct_sink_sends_on_the_socket() {
+        let send_sock = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let recv_sock = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let peer = recv_sock.local_addr().unwrap();
+        let sink = HandshakeSink::Direct(&send_sock, peer);
+        let datagram = Bytes::from_static(b"handshake fragment");
+
+        sink.send(&datagram).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _addr) =
+            tokio::time::timeout(Duration::from_secs(5), recv_sock.recv_from(&mut buf))
+                .await
+                .expect("datagram arrives within 5s")
+                .unwrap();
+        assert_eq!(&buf[..n], &datagram[..]);
+    }
+
+    /// A `Paced` sink whose receiver was dropped (the outbound loop tore
+    /// down mid-rekey) must surface as an error, not hang or panic — the
+    /// caller (`rekey_as_initiator`) then fails the attempt cleanly instead
+    /// of retrying forever against a channel nobody drains anymore.
+    #[tokio::test]
+    async fn paced_sink_errors_when_receiver_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        drop(rx);
+        let sink = HandshakeSink::Paced(&tx);
+
+        let result = sink.send(&Bytes::from_static(b"noise")).await;
+
+        assert!(matches!(result, Err(ChameleonError::ChannelClosed)));
     }
 }

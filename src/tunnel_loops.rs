@@ -11,6 +11,7 @@ use crate::crypto::Authenticator;
 use crate::engine::{CryptoEngine, DecryptResult, OutboundPacket};
 use crate::frame::{Frame, FrameType};
 use crate::hsobf;
+use crate::net::HandshakeSink;
 use crate::obf::PadPolicy;
 use crate::pacer::{Emit, Pacer, ShapeMode};
 use crate::rekey::{
@@ -21,7 +22,9 @@ use crate::tun_iface::TunPair;
 use crate::tunnel::{Handshake, Reassembler};
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -309,9 +312,27 @@ pub async fn run_tunnel_loops(
 
     // Channel the inbound loop uses to pass handshake frames to a running
     // rekey driver. THIS keeps the inbound loop the only socket reader.
-    let (hs_tx, mut hs_rx) = handshake_channel();
+    // Mutex-wrapped (not just `mut`): each rekey attempt's future is stored in
+    // `rekey_fut` (see the outbound loop below) and needs to OWN a handle to
+    // this receiver across loop iterations. A bare `&mut hs_rx` borrow can't
+    // work there — the borrow checker can't see that it ends when a rekey
+    // completes and `rekey_fut` goes back to `None`, since the same loop
+    // borrows it again for the NEXT rekey. An `Arc<Mutex<_>>` sidesteps that:
+    // each attempt locks it for its own duration; contention is a non-issue
+    // since `rekeying_out` already guarantees at most one attempt in flight.
+    let (hs_tx, hs_rx) = handshake_channel();
+    let hs_rx = Arc::new(tokio::sync::Mutex::new(hs_rx));
     // Marks whether a rekey is running now (prevents double initiation).
     let rekeying = Arc::new(AtomicBool::new(false));
+    // Where a REKEY's own datagrams go when pacing is active: handed off here
+    // instead of hitting the socket directly, so they ride the outbound
+    // pacer's own slot schedule (see `HandshakeSink::Paced` and the tick arm
+    // below) rather than showing up as a burst outside the constant-rate
+    // cover stream. Small and bounded — a full channel simply makes a rekey
+    // send wait for its slot, which is the pacing we want. Both the outbound
+    // loop (INITIATOR sends) and inbound loop (RESPONDER sends) need a
+    // sender; only the outbound loop drains it (it owns the pacer/tick state).
+    let (hs_send_tx, mut hs_send_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
 
     // Keepalive / dead-peer detection: epoch seconds of the last received
     // packet. A separate task sends KeepAlive on silence and closes the tunnel
@@ -327,6 +348,14 @@ pub async fn run_tunnel_loops(
     let obf_on = params.obf_enabled;
     let gso = params.gso;
     let paced = params.traffic_enabled && obf_on;
+    // Mirrors the outbound loop's local `paced` so the INBOUND loop (a
+    // separate task, doesn't see that local variable) knows whether to hand
+    // a rekey RESPONSE to the pacer or send it straight to the socket. Kept
+    // in sync on every live profile switch (see the `traffic_rx.changed()`
+    // arm below). Relaxed ordering: a stale read for one rekey response is
+    // harmless (worst case it's a slot late, or sent a moment too early),
+    // never a correctness issue.
+    let paced_state = Arc::new(AtomicBool::new(paced));
     let pace_mode = match params.traffic_mode {
         TrafficMode::Cbr => ShapeMode::Cbr,
         TrafficMode::Adaptive => ShapeMode::Adaptive,
@@ -353,6 +382,12 @@ pub async fn run_tunnel_loops(
     let rekeying_out = rekeying.clone();
     let state_out = sock_state.clone();
     let stats_out = stats.clone();
+    // The inbound loop needs its own sender (for RESPONDER rekey sends) and
+    // its own view of `paced_state` before the outbound loop below moves its
+    // originals in.
+    let hs_send_tx_in = hs_send_tx.clone();
+    let paced_state_in = paced_state.clone();
+    let paced_state_out = paced_state.clone();
     // Run the three loops in a JoinSet so all of them are aborted when this
     // function returns OR is cancelled (Client::disconnect aborts this task). A
     // plain select! on JoinHandles detaches the losers, leaking a tunnel that
@@ -425,6 +460,16 @@ pub async fn run_tunnel_loops(
         let mut pace_burst = pace_burst;
         let mut traffic_rx = traffic_rx;
         let mut traffic_live = true;
+        // In-flight INITIATOR-side rekey, if any. Polled as its own select!
+        // arm below instead of `.await`ed inline in the tick arm (as it used
+        // to be): a rekey's multi-round-trip wait for a response would
+        // otherwise block this loop from ever reaching `tick.tick()` again —
+        // which, under pacing, would silence the constant-rate cover stream
+        // for the whole rekey. That is a LOUDER signal to a passive observer
+        // than the rekey traffic itself, so this isn't just an optimization.
+        let mut rekey_fut: Option<
+            Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + '_>>,
+        > = None;
 
         loop {
             tokio::select! {
@@ -475,6 +520,17 @@ pub async fn run_tunnel_loops(
                         // the pacer already produces anyway) fits in one syscall.
                         let mut slot: Vec<Bytes> = Vec::with_capacity(pace_burst);
                         for _ in 0..pace_burst {
+                            // A queued rekey fragment takes this slot instead of
+                            // a real/cover emission — already wire-ready, no
+                            // sealing needed. This is how a mid-session rekey
+                            // rides the same constant-rate schedule as data
+                            // instead of adding extra, out-of-schedule volume
+                            // (see `HandshakeSink::Paced`). Non-blocking: only
+                            // ever takes what's already queued, never waits.
+                            if let Ok(datagram) = hs_send_rx.try_recv() {
+                                slot.push(datagram);
+                                continue;
+                            }
                             match pacer.next_emit(!pending.is_empty(), Instant::now()) {
                                 Emit::Real => {
                                     let pkt = pending
@@ -523,21 +579,54 @@ pub async fn run_tunnel_loops(
                         let new_id = crate::net::alloc_session_id();
                         info!("rekey threshold reached — starting rekey on session {new_id}");
                         // The rekey driver reads NO socket; response comes via hs_rx.
-                        let r = rekey_as_initiator(
-                            &socket_out, peer_out, auth_out.as_ref(),
-                            engine_out.sessions(), new_id, &mut hs_rx, hs_obf.as_ref(),
-                        ).await;
-                        match r {
-                            Ok(()) => schedule_retire(engine_out.sessions().clone()),
-                            Err(e) => {
-                                warn!("rekey failed: {e}");
-                                // Release the claim in the SessionManager so a
-                                // later attempt (after the anti-storm interval) can start.
-                                engine_out.sessions().abort_rekey();
-                            }
-                        }
-                        rekeying_out.store(false, Ordering::Release);
+                        // Own clones for the future below (it may outlive this
+                        // tick-arm iteration by several round trips) — `engine_out`
+                        // itself must NOT be moved in, the loop needs it back for
+                        // everything else it does.
+                        let auth_rk = auth_out.clone();
+                        let sessions_rk = engine_out.sessions().clone();
+                        let hs_send_tx_rk = hs_send_tx.clone();
+                        let socket_rk = socket_out.clone();
+                        let hs_obf_rk = hs_obf;
+                        let paced_now = paced;
+                        let hs_rx_rk = hs_rx.clone();
+                        rekey_fut = Some(Box::pin(async move {
+                            // Built HERE (not passed in) so it's owned by this
+                            // future, not borrowed from the tick arm — the sink
+                            // needs to live as long as the whole rekey does.
+                            let sink = if paced_now {
+                                HandshakeSink::Paced(&hs_send_tx_rk)
+                            } else {
+                                HandshakeSink::Direct(&socket_rk, peer_out)
+                            };
+                            // Held for the whole attempt: uncontended in
+                            // practice (`rekeying_out` already caps this at
+                            // one in-flight rekey), see `hs_rx`'s doc.
+                            let mut guard = hs_rx_rk.lock().await;
+                            rekey_as_initiator(
+                                &sink, auth_rk.as_ref(), &sessions_rk, new_id,
+                                &mut guard, hs_obf_rk.as_ref(),
+                            ).await
+                        }));
                     }
+                }
+                // Poll an in-flight INITIATOR rekey (see `rekey_fut`'s doc above
+                // the loop). This arm existing at all is the fix: the tick arm
+                // above no longer `.await`s the rekey inline, so it keeps firing
+                // — draining `hs_send_rx` and emitting cover — for the entire
+                // multi-round-trip duration of the rekey, instead of stalling.
+                res = async { rekey_fut.as_mut().unwrap().await }, if rekey_fut.is_some() => {
+                    rekey_fut = None;
+                    match res {
+                        Ok(()) => schedule_retire(engine_out.sessions().clone()),
+                        Err(e) => {
+                            warn!("rekey failed: {e}");
+                            // Release the claim in the SessionManager so a
+                            // later attempt (after the anti-storm interval) can start.
+                            engine_out.sessions().abort_rekey();
+                        }
+                    }
+                    rekeying_out.store(false, Ordering::Release);
                 }
                 // Live traffic-profile switch: recompute pacing on the fly, with
                 // no reconnect. `if traffic_live` disables this arm once every
@@ -571,6 +660,10 @@ pub async fn run_tunnel_loops(
                             }
                         }
                         paced = new_paced;
+                        // Mirror for the inbound loop, which can't see this
+                        // local `paced` (separate task) but needs to know it
+                        // when a rekey RESPONSE is due — see `paced_state`'s doc.
+                        paced_state_out.store(new_paced, Ordering::Relaxed);
                         let new_mode = match eff.mode {
                             TrafficMode::Cbr => ShapeMode::Cbr,
                             TrafficMode::Adaptive => ShapeMode::Adaptive,
@@ -715,8 +808,16 @@ pub async fn run_tunnel_loops(
                                     if let Ok(Some(blob)) = rekey_reasm.push_parts(mid, idx, tot, chunk) {
                                         if let Ok(init_wire) = hsobf::open(&k, &blob) {
                                             let new_id = crate::net::alloc_session_id();
+                                            // Paced iff the outbound loop currently is
+                                            // (see `paced_state`'s doc) — otherwise
+                                            // straight to the socket, as before.
+                                            let sink = if paced_state_in.load(Ordering::Relaxed) {
+                                                HandshakeSink::Paced(&hs_send_tx_in)
+                                            } else {
+                                                HandshakeSink::Direct(&socket_in, src)
+                                            };
                                             match rekey_as_responder(
-                                                &socket_in, src, auth_in.as_ref(),
+                                                &sink, auth_in.as_ref(),
                                                 new_id, init_wire, Some(&k),
                                             ).await {
                                                 Ok(hs) => { pending_rekey = Some((hs, new_id)); }
@@ -768,8 +869,13 @@ pub async fn run_tunnel_loops(
                                 } else if pending_rekey.is_none() {
                                     if let Ok(Some(init_wire)) = rekey_reasm.push(&frame.payload) {
                                         let new_id = crate::net::alloc_session_id();
+                                        let sink = if paced_state_in.load(Ordering::Relaxed) {
+                                            HandshakeSink::Paced(&hs_send_tx_in)
+                                        } else {
+                                            HandshakeSink::Direct(&socket_in, src)
+                                        };
                                         match rekey_as_responder(
-                                            &socket_in, src, auth_in.as_ref(),
+                                            &sink, auth_in.as_ref(),
                                             new_id, init_wire, None,
                                         ).await {
                                             Ok(hs) => { pending_rekey = Some((hs, new_id)); }
