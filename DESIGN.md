@@ -15,14 +15,25 @@ rather than guess at them.
 
 ## 1. Threat model & scope
 
-Chameleon-PQ targets **site-to-site tunnels between known endpoints** —
-infrastructure-to-infrastructure traffic where the peers are configured
-in advance with pre-shared identities. It is *not* designed as a
-consumer anonymity service (à la commercial VPN providers).
+Chameleon-PQ targets **site-to-site tunnels between known, pre-configured
+endpoints** — infrastructure-to-infrastructure traffic, or a personal client
+connecting to a server the same operator controls, where both peers already
+hold each other's identity (Ed25519/ML-DSA public keys, matched via
+`chameleon-pq init`). It is *not* an anonymity network: there is no
+multi-hop routing, no hiding the tunnel's endpoints from each other, and no
+protection if the far-end operator is malicious or compelled — you must
+trust whoever runs the other side, exactly as with any self-hosted
+WireGuard deployment. The GUI client and its full-tunnel features (kill
+switch, DNS-leak protection — see "Resolved since the first draft" below)
+make that pre-configured link *usable* for a single user; they don't change
+this trust model.
 
 Adversaries considered:
-- **Passive network observer** — can read all ciphertext. Defended by
-  AEAD encryption of the data path.
+- **Passive network observer** — can read all ciphertext, and, absent the
+  mitigations below, the datagram shapes/sizes and packet timing too.
+  Defended by AEAD encryption of the data path, plus (§9) data-path and
+  handshake-envelope obfuscation and (§9a, opt-in) constant-rate timing
+  shaping.
 - **Active man-in-the-middle** — can inject, drop, reorder, replay.
   Defended by authenticated handshake + replay protection.
 - **Future quantum adversary ("harvest now, decrypt later")** — records
@@ -31,9 +42,12 @@ Adversaries considered:
   can remain sensitive for years, so the key exchange must resist a
   quantum attack made *later* against traffic captured *now*.
 
-Explicitly **out of scope** for now: traffic-analysis resistance beyond
-fixed-length padded handshakes, and protection against a compromised
-endpoint.
+Explicitly **out of scope**: protection against a compromised endpoint
+(either peer). Traffic-analysis resistance is *partial*, not out of scope
+but not complete either (§9/§9a mitigate shape, size, and — opt-in — timing;
+the tunnel's existence/duration and the pre-pacer initial handshake burst
+are not reachable by construction). See "Summary of honest limitations" for
+the current, complete list of what remains open.
 
 ---
 
@@ -193,6 +207,11 @@ line rate. Each is measured, not assumed.
    into one syscall with UDP GSO on send and coalesce with GRO on receive
    (per-packet fallback on old kernels / non-Linux), lifting the send path to
    ~9.6 Mpps. No wire change: GSO segments are ordinary datagrams on the wire.
+   **GSO-on-send defaults OFF** (`[engine].gso = false`): on some paths (a
+   Hyper-V vSwitch, or NIC offload that doesn't pass Linux GSO through)
+   segmented sends caused massive packet loss in testing. Per-packet send is
+   correct everywhere and is the shipped default; GSO is an explicit opt-in
+   for a proven-clean Linux↔Linux path. GRO-on-receive is unaffected.
 3. **Multi-core seal/open, wireguard-go pipeline shape.** With the syscall
    wall gone the next ceiling is the single-core AEAD (~2 Gbit/s obf
    seal/open) — the crypto ran in one outbound and one inbound task.
@@ -344,8 +363,12 @@ You cannot fit a ML-KEM-bearing handshake in a single MTU-safe datagram —
 this is inherent to PQ crypto, not a design flaw. The handshake is a
 once-per-session event, so a handful of fragments there cost nothing
 meaningful. The data path stays under the MTU. With the hybrid ML-DSA
-signature now integrated (§3), `HANDSHAKE_MSG_LEN` is 8192 and a message
-spans eight fragments — fine for a one-time handshake.
+signature now integrated (§3), `HANDSHAKE_MSG_LEN` is 8192, which at this
+layer implies eight ~1032-byte fragments — fine for a one-time handshake.
+(This is the *pre-obfuscation* fragmentation. Handshake obfuscation is on
+by default — see below and §9 — and re-fragments the sealed message into a
+variable, randomised number and size of fragments, so the wire itself never
+shows this fixed eight-fragment shape.)
 
 **Data-path frame (now obfuscated — `obf.rs`):** the data path used to keep a
 small header in the clear (frame type, session_id, counter). Even without a
@@ -431,7 +454,7 @@ it as peer liveness). No new crypto, and **no wire/proto change**: `PROTO_VERSIO
 lives in the handshake, not the data path, so a peer that predates Phase 3 simply
 gets `UnknownFrameType` on a cover packet and drops it — real data still flows,
 and pacing can even be **asymmetric per direction** with no negotiation. The
-outbound loop (`main.rs`) replaces the batch-linger flush with a fixed-interval
+outbound loop (`tunnel_loops.rs`) replaces the batch-linger flush with a fixed-interval
 ticker that emits `burst` datagrams per slot via the pure `pacer::Pacer`
 scheduler: each slot dequeues a real packet if one is queued, else emits a cover
 packet (CBR / Adaptive-within-cooldown) or nothing (Adaptive-idle). Every paced
@@ -440,17 +463,23 @@ the rate *and* the size are constant. A bounded queue tail-drops real packets
 when offered load exceeds the rate (TCP recovers), which is what keeps the rate
 constant.
 
-**Modes & cost (config `[traffic]`, on by default in Adaptive):** **Adaptive**
-(the default) paces only during activity plus a cooldown and goes quiet when
-genuinely idle — no bandwidth at rest, but coarse active-vs-idle reappears.
-**CBR** streams at the configured rate 24/7 — strongest, but the rate is then a
-constant bandwidth floor *and* the throughput ceiling, so operators size
-`rate_pps × burst` to their link. In both modes the rate is the throughput
-ceiling (traffic above it tail-drops); the MTU is capped so a packet + overhead
-fits one datagram (like WireGuard sizing the tunnel MTU to the path).
+**Modes & cost (config `[traffic]`, OFF by default — `profile = off`, no
+pacing at all; enabling it defaults to Adaptive mode):** **Adaptive** (the
+default mode once pacing is enabled, e.g. `profile = balanced`) paces only
+during activity plus a cooldown and goes quiet when genuinely idle — no
+bandwidth at rest, but coarse active-vs-idle reappears. **CBR** (e.g.
+`profile = stealth`) streams at the configured rate 24/7 — strongest, but
+the rate is then a constant bandwidth floor *and* the throughput ceiling, so
+operators size `rate_pps × burst` to their link. In both modes the rate is
+the throughput ceiling (traffic above it tail-drops); the MTU is capped so a
+packet + overhead fits one datagram (like WireGuard sizing the tunnel MTU to
+the path).
 
-**Honest limitation (what remains):** timing shaping hides the *shape* of the
-traffic, not the **existence** of the tunnel (the endpoints are known,
+**Honest limitation (what remains):** timing shaping is opt-in — off by
+default, so a fresh install gets none of the protection described below
+until a `[traffic]` profile is chosen. Even when enabled, it hides the
+*shape* of the traffic, not the **existence** of the tunnel (the endpoints
+are known,
 site-to-site) or its **total duration**; the **initial handshake burst** is
 pre-pacer and structurally cannot be — it precedes the tunnel loops, so there
 is no pacer yet to ride. A **mid-session rekey**, by contrast, runs while the
@@ -566,12 +595,14 @@ These are stated plainly so no one mistakes intent for proof:
 - **Timing / cover traffic.** Constant-rate shaping (`pacer.rs`): the sender
   emits on a fixed schedule and fills idle slots with cover packets (an encrypted
   `Padding` inner type the receiver discards), dissolving bursts and
-  idle-vs-active. No wire/proto change; on by default in Adaptive mode. See §9a.
+  idle-vs-active. No wire/proto change; opt-in, **off by default**
+  (`profile = off`), defaulting to Adaptive mode once enabled. See §9a.
 - **Replay window.** Widened from 64 to 2048 entries (WireGuard scale).
   See §6.
 - **Batched UDP I/O.** GSO on send / GRO on receive via `quinn-udp`
   (`udp.rs`), removing the per-packet syscall wall (~0.18 → ~9.6 Mpps on a
-  microbench). No wire change. See §4a.
+  microbench). No wire change. GSO-on-send is opt-in, **off by default**
+  (a Hyper-V/offload path caused packet loss in testing). See §4a.
 - **Multi-core crypto.** Batch seal/open now run in parallel across all cores
   via rayon (`engine.rs`), ~4.5×/~13× on 12 threads, capped by
   `[engine].workers`. Unpaced fast path only; no wire/crypto change. See §4a.
@@ -614,3 +645,20 @@ These are stated plainly so no one mistakes intent for proof:
   as its own `select!` arm, so the constant-rate cover stream keeps running
   for the full multi-round-trip duration of a rekey instead of going silent.
   See §9a.
+- **Kill switch (`killswitch.rs`).** For the full-tunnel client: a fail-closed
+  firewall guard (nftables on Linux, Windows Firewall on Windows) that blocks
+  all egress except loopback, the tunnel transport, the TUN interface, and the
+  local subnet/DHCP. Unlike the RAII full-tunnel routes it guards (which are
+  fail-*open* — torn down on drop, so a crashed client falls back to
+  cleartext), the kill switch is deliberately NOT removed on drop: it stays
+  engaged if the tunnel dies or the client crashes, and only comes down on an
+  explicit disconnect or the `killswitch off` escape hatch. Opt-in
+  (`[tun].kill_switch = true`), and only meaningful with `[tun].route_all =
+  true` (full-tunnel mode) — see §1.
+- **DNS-leak protection (`dns.rs`).** For the full-tunnel client: when
+  `[tun].dns` lists resolvers, the client points the OS at them over the tun
+  interface instead of the LAN/ISP resolver (WireGuard-style; on Windows also
+  disables "smart multi-homed name resolution" so queries can't fan out over
+  the physical NIC too). RAII like the full-tunnel routes — fail-*open* on its
+  own, so it's meant to be paired with the kill switch above for a fail-closed
+  guarantee that a dropped tunnel can't leak DNS in cleartext either.
