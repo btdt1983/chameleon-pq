@@ -364,6 +364,18 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+impl Session {
+    /// Test-only: override the safe-usage rekey threshold. Production always
+    /// uses `1 << 48` (set in `from_handshake_with_algo`); tests use this to
+    /// force a REAL rekey after a handful of packets instead of the ~2^48
+    /// packets that would take to reach it honestly. `#[cfg(test)]`-gated, so
+    /// this never exists outside `cargo test` — no production API surface.
+    pub(crate) fn set_rekey_at_for_test(&mut self, rekey_at: u64) {
+        self.rekey_at = rekey_at;
+    }
+}
+
 // Wipe the obfuscation header keys on drop. The AEAD keys themselves live in
 // the Box<dyn DirectionalAead> and are wiped there (ring / AegisDir::drop); the
 // derived directional key bytes are Zeroizing. This way no session key remains
