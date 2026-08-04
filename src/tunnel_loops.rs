@@ -1078,4 +1078,188 @@ mod tests {
             "wire order must match submission order, not completion order"
         );
     }
+
+    /// Live rekey through the REAL tunnel loops (not a unit test of
+    /// `rekey.rs` in isolation): builds two real sessions over a loopback
+    /// handshake, forces the client's rekey threshold down (see
+    /// `Session::set_rekey_at_for_test`) so a genuine rekey fires after a
+    /// handful of packets instead of the ~2^48 it would honestly take, and
+    /// asserts BOTH sides' `current_session_id()` actually changes — that
+    /// only happens via `install_new_session()`, which only runs after the
+    /// responder's confirm-demux above (`pending_rekey.take().unwrap()`,
+    /// reached only through the `pending_rekey.is_some()` else-if arm) has
+    /// actually run and succeeded. Previously this invariant was verified
+    /// only by reading the code; this is the automated regression coverage.
+    /// Runs with handshake obfuscation both on (the shipped default — hits
+    /// the `hsobf::unmask_fragment` branch) and off (hits the cleartext
+    /// `Frame::decode` branch) — the two call sites of that unwrap.
+    async fn live_rekey_completes_and_demux_runs(hs_obf_on: bool) {
+        use crate::crypto::Ed25519Auth;
+        use crate::net::{run_handshake_initiator, run_handshake_responder};
+        use crate::session::{Session, SessionManager};
+
+        let toml_cfg = format!(
+            r#"
+[identity]
+ed25519_seed_hex     = "0303030303030303030303030303030303030303030303030303030303030303"
+peer_ed25519_pub_hex = "0404040404040404040404040404040404040404040404040404040404040404"
+[network]
+bind_addr = "127.0.0.1:0"
+[tun]
+name = "test0"
+[engine]
+batch_linger_us = 200
+workers = 2
+[obfuscation]
+enabled = true
+handshake = {hs_obf_on}
+[traffic]
+enabled = false
+"#
+        );
+        let cfg: AppConfig = toml::from_str(&toml_cfg).expect("test config parses");
+
+        let s_seed = [51u8; 32];
+        let c_seed = [52u8; 32];
+        let s_pub = Ed25519Auth::derive_public(&s_seed);
+        let c_pub = Ed25519Auth::derive_public(&c_seed);
+        let server_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&s_seed, c_pub).unwrap());
+        let client_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&c_seed, s_pub).unwrap());
+
+        // Same derivation on both sides (byte-sorted internally), exactly as
+        // client.rs::hs_obf_key / main.rs::hs_obf_key_from_cfg do it.
+        let hs_obf_key: Option<[u8; 32]> =
+            hs_obf_on.then(|| crate::hsobf::derive_hs_obf_key(&s_pub, &c_pub, None));
+
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+
+        let (resp_res, init_res) = tokio::join!(
+            run_handshake_responder(&server_sock, server_auth.as_ref(), hs_obf_key.as_ref()),
+            run_handshake_initiator(
+                &client_sock,
+                server_addr,
+                client_auth.as_ref(),
+                hs_obf_key.as_ref()
+            ),
+        );
+        let (server_session, client_addr) = resp_res.expect("responder handshake ok");
+        let mut client_session: Session = init_res.expect("initiator handshake ok");
+        let first_session_id = client_session.session_id;
+        assert_eq!(server_session.session_id, first_session_id);
+
+        // Force a real rekey after tx_counter passes 15 (20 * 3/4) instead of
+        // the production `1 << 48`.
+        client_session.set_rekey_at_for_test(20);
+
+        let server_engine = Arc::new(CryptoEngine::new(
+            Arc::new(SessionManager::new(server_session)),
+            true,
+            PadPolicy::Bucketed,
+        ));
+        let client_engine = Arc::new(CryptoEngine::new(
+            Arc::new(SessionManager::new(client_session)),
+            true,
+            PadPolicy::Bucketed,
+        ));
+
+        let (server_tun, mut server_handles) = TunPair::new_mock();
+        let (client_tun, client_handles) = TunPair::new_mock();
+
+        let params = TunnelParams::from_config(&cfg);
+        let server_stats = Arc::new(TunnelStats::default());
+        let client_stats = Arc::new(TunnelStats::default());
+        let eff = cfg.traffic.effective();
+        let (_s_traffic_tx, s_traffic_rx) = watch::channel(eff);
+        let (_c_traffic_tx, c_traffic_rx) = watch::channel(eff);
+
+        tokio::spawn(run_tunnel_loops(
+            server_sock.clone(),
+            server_engine.clone(),
+            server_tun,
+            client_addr,
+            params.clone(),
+            server_auth.clone(),
+            hs_obf_key,
+            server_stats.clone(),
+            s_traffic_rx,
+        ));
+        tokio::spawn(run_tunnel_loops(
+            client_sock.clone(),
+            client_engine.clone(),
+            client_tun,
+            server_addr,
+            params.clone(),
+            client_auth.clone(),
+            hs_obf_key,
+            client_stats.clone(),
+            c_traffic_rx,
+        ));
+
+        // Drive the client's tx counter past the forced threshold with real
+        // traffic through the mock TUN — the same path production traffic
+        // takes (recv_many -> reserve counters -> seal -> UDP send).
+        for i in 0..20u32 {
+            let pkt = Bytes::from(format!("pre-rekey packet {i}").into_bytes());
+            client_handles.inject_tx.send(pkt).await.unwrap();
+        }
+
+        // Poll current_session_id() on both sides until it changes from the
+        // handshake id AND agrees on both ends. That combination only
+        // happens once rekey_as_initiator (client) AND
+        // rekey_responder_confirm (server, via the confirm-demux this test
+        // exists to cover) have both succeeded — a rekey that merely
+        // started, or failed partway, leaves at least one side's id
+        // unchanged.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let c_id = client_engine.sessions().current_session_id();
+            let s_id = server_engine.sessions().current_session_id();
+            if c_id != first_session_id && s_id != first_session_id && c_id == s_id {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "rekey did not complete within 10s (client={c_id}, server={s_id}, \
+                 original={first_session_id})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The NEW session must actually work end to end: send one more
+        // packet and confirm it arrives — proves the confirm-demux branch
+        // didn't just run, but installed a session both sides can use.
+        let post = Bytes::from_static(b"post-rekey packet");
+        client_handles.inject_tx.send(post.clone()).await.unwrap();
+
+        // Drain the 20 queued pre-rekey packets plus the post-rekey one; the
+        // last must be the post-rekey payload, decrypted under the new session.
+        let mut last = None;
+        for _ in 0..21 {
+            last = Some(
+                tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
+                    .await
+                    .expect("server receives queued packet")
+                    .expect("channel open"),
+            );
+        }
+        assert_eq!(
+            last,
+            Some(post),
+            "data flows correctly on the rekeyed session"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_rekey_with_handshake_obfuscation_on() {
+        live_rekey_completes_and_demux_runs(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_rekey_with_handshake_obfuscation_off() {
+        live_rekey_completes_and_demux_runs(false).await;
+    }
 }
