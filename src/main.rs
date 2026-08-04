@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Chameleon-PQ — main entry point.
 //!
 //! ARCHITECTURE OF THE MAIN LOOPS (crystal-clear):

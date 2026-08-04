@@ -62,14 +62,12 @@ pub fn enlarge_socket_buffers(socket: &UdpSocket) {
 
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
-        let fd = socket.as_raw_fd();
         // Try the un-clamped FORCE variant first; fall back to the plain sockopt
         // (which socket2 sets) if we lack CAP_NET_ADMIN.
-        if !set_buffer_force(fd, libc::SO_RCVBUFFORCE, SOCKET_BUFFER_BYTES) {
+        if !set_buffer_force(socket, libc::SO_RCVBUFFORCE, SOCKET_BUFFER_BYTES as u32) {
             let _ = sref.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
         }
-        if !set_buffer_force(fd, libc::SO_SNDBUFFORCE, SOCKET_BUFFER_BYTES) {
+        if !set_buffer_force(socket, libc::SO_SNDBUFFORCE, SOCKET_BUFFER_BYTES as u32) {
             let _ = sref.set_send_buffer_size(SOCKET_BUFFER_BYTES);
         }
     }
@@ -109,13 +107,22 @@ pub fn enlarge_socket_buffers(socket: &UdpSocket) {
 
 /// Linux-only: set `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE` (bypasses `net.core.*mem_max`
 /// for a process with CAP_NET_ADMIN). Returns whether it succeeded.
+///
+/// Takes `&UdpSocket` rather than a bare `RawFd` so the borrow checker — not
+/// caller discipline — guarantees the fd stays open and isn't reused/closed
+/// out from under the syscall.
 #[cfg(target_os = "linux")]
-fn set_buffer_force(fd: std::os::fd::RawFd, optname: libc::c_int, bytes: usize) -> bool {
+#[allow(unsafe_code)]
+fn set_buffer_force(socket: &UdpSocket, optname: libc::c_int, bytes: u32) -> bool {
+    use std::os::fd::AsRawFd;
     let val = bytes as libc::c_int;
-    // SAFETY: a standard setsockopt with an `int` optval of the matching length.
+    // SAFETY: `fd` is borrowed from `socket` for the duration of this call, so
+    // it is open and refers to this socket (no close/reuse race); `&val` is an
+    // aligned, initialized `c_int` on the stack; `optlen` is exactly
+    // `size_of::<c_int>()`, matching what SO_RCVBUFFORCE/SO_SNDBUFFORCE expect.
     unsafe {
         libc::setsockopt(
-            fd,
+            socket.as_raw_fd(),
             libc::SOL_SOCKET,
             optname,
             &val as *const libc::c_int as *const libc::c_void,

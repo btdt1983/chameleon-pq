@@ -1,3 +1,10 @@
+// The crate's entire unsafe surface is one `setsockopt` FFI call
+// (`udp::set_buffer_force`, explicitly `#[allow(unsafe_code)]`); everything
+// else is safe Rust by construction, enforced here rather than by convention.
+// `deny` (not `forbid`) so that one call site can opt back in explicitly —
+// `forbid` cannot be locally overridden at all.
+#![deny(unsafe_code)]
+
 pub mod aead;
 pub mod client;
 pub mod config;
