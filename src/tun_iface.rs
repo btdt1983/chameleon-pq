@@ -55,6 +55,40 @@ impl TunPair {
         Ok(Self::spawn_io(device))
     }
 
+    /// Wrap an ALREADY-OPEN tun file descriptor (Unix only) instead of
+    /// creating a new interface. For platforms where only the OS can create
+    /// the tun device and hands the app a ready fd — chiefly Android's
+    /// `VpnService.Builder.establish()`, which returns a `ParcelFileDescriptor`
+    /// an unprivileged app could never create itself via `tun::create_as_async`'s
+    /// normal path (that tries to open `/dev/net/tun`/call `ioctl`s the app has
+    /// no permission for). `tun` 0.8's own Android backend (and, generically,
+    /// every unix backend — this is not Android-specific tun-crate behavior)
+    /// requires exactly this: `Configuration::raw_fd` set, skip device creation.
+    ///
+    /// `close_fd_on_drop(false)`: the CALLER (e.g. Android's
+    /// `ParcelFileDescriptor`) owns the fd's lifecycle, not us — closing a fd
+    /// out from under its real owner while our read task may still reference
+    /// it via `AsyncFd` is exactly the class of bug this project is careful
+    /// about elsewhere (see `udp.rs`'s fd-liveness comments). The caller MUST
+    /// keep the fd open for as long as this `TunPair` (and the tunnel it
+    /// drives) is alive, and must not close it until well after teardown —
+    /// see `Client::disconnect_and_wait`.
+    ///
+    /// Unix only: `std::os::fd::RawFd` doesn't exist on Windows (which has no
+    /// raw-fd platform to attach to in the first place — wintun always
+    /// creates its own device).
+    #[cfg(unix)]
+    pub fn from_raw_fd(fd: std::os::fd::RawFd, mtu: u16) -> Result<Self> {
+        let mut tun_cfg = tun::Configuration::default();
+        tun_cfg.raw_fd(fd).close_fd_on_drop(false).mtu(mtu);
+        let device = tun::create_as_async(&tun_cfg).map_err(|e| ChameleonError::Handshake {
+            state: "tun".into(),
+            msg: format!("failed to wrap raw tun fd {fd}: {e}"),
+        })?;
+        info!("TUN interface attached from raw fd {fd} (mtu {mtu})");
+        Ok(Self::spawn_io(device))
+    }
+
     /// In-memory mock (no kernel interface needed). Meant for tests and for
     /// clients that want to drive the tunnel loops without a real TUN. From
     /// outside you push bytes in via `inject_tx`; read output via `drain_rx`.
@@ -282,5 +316,53 @@ mod tests {
             .unwrap();
         let written = drain_rx.recv().await.unwrap();
         assert_eq!(&written[..], b"decrypted IP");
+    }
+
+    /// Exercises `from_raw_fd` end-to-end without a real kernel TUN device
+    /// (no CAP_NET_ADMIN needed) and, by extension, the Android production
+    /// path: a `UnixDatagram` pair stands in for the fd Android's
+    /// `ParcelFileDescriptor` would hand us. This is a faithful fake, not a
+    /// shortcut — `tun`'s actual recv/send bottoms out in plain read(2)/
+    /// write(2) on the fd with no tun-specific ioctls in that path, so any
+    /// valid fd exercises the entire `spawn_io` read/write task plumbing.
+    ///
+    /// `flavor = "multi_thread"`, NOT the default current-thread runtime:
+    /// this test mixes blocking `std::os::unix::net::UnixDatagram` calls
+    /// (standing in for "the kernel") with the crate's own async read/write
+    /// tasks (`tokio::spawn`ed by `spawn_io`) — on a single-threaded runtime
+    /// the blocking `test_end.recv()` below would monopolize the only OS
+    /// thread and starve the write task it's waiting on, deadlocking.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn from_raw_fd_roundtrip() {
+        use std::os::fd::IntoRawFd;
+
+        let (test_end, tun_end) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        // `into_raw_fd` transfers ownership to us (matches Android handing
+        // over a fd it otherwise keeps live) — `close_fd_on_drop(false)`
+        // means TunPair never closes it, so it leaks for this one test in a
+        // short-lived `cargo test` process; harmless.
+        let fd = tun_end.into_raw_fd();
+
+        let pair = TunPair::from_raw_fd(fd, 1500).unwrap();
+        let TunPair {
+            mut from_tun,
+            to_tun,
+            ..
+        } = pair;
+
+        // kernel → TUN direction.
+        test_end.send(b"fake IP packet").unwrap();
+        let received = from_tun.recv().await.unwrap();
+        assert_eq!(&received[..], b"fake IP packet");
+
+        // TUN → kernel direction.
+        to_tun
+            .send(Bytes::from_static(b"decrypted IP"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = test_end.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"decrypted IP");
     }
 }
