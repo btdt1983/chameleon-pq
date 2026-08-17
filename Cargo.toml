@@ -10,7 +10,14 @@ repository  = "https://github.com/btdt1983/chameleon-pq"
 homepage    = "https://github.com/btdt1983/chameleon-pq"
 keywords    = ["vpn", "post-quantum", "cryptography", "ml-kem", "wireguard"]
 categories  = ["cryptography", "network-programming", "command-line-utilities"]
-exclude     = ["/.github"]
+# No `include` allowlist, so anything sitting in the repo root ships to
+# crates.io by default regardless of git-tracked status (bit us once during
+# the 0.8.5 publish — see the commit history). `/android` holds the Android
+# app (Gradle project + a separate `chameleon-jni` crate) — real, tracked,
+# and entirely irrelevant to the published `chameleon-pq` crate, same
+# rationale as `/.github`. Re-check with `cargo package --list --allow-dirty`
+# before every future `cargo publish`, not just `git status`.
+exclude     = ["/.github", "/android"]
 
 [lib]
 name = "chameleon"

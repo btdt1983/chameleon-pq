@@ -36,6 +36,19 @@ config*.toml
 .env
 .env.local
 
+# Android app build artifacts / local toolchain state. `android/rust-jni`'s
+# own Cargo.lock stays TRACKED (matches gui/ and fuzz/ — this is not a
+# workspace member, so it needs its own lockfile committed).
+/android/rust-jni/target/
+/android/.gradle/
+/android/**/build/
+/android/local.properties
+*.jks
+*.keystore
+# The built .so is Phase D's regenerated build output (see android/README.md)
+# — never commit it, so a stale binary can never silently ship.
+/android/app/src/main/jniLibs/
+
 # Ad-hoc screenshots dropped at the repo root during debugging (e.g. speed-test
 # results shared in chat) — root-anchored so it does NOT affect the real,
 # tracked images that belong in the repo (docs/screenshot.jpg,

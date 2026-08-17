@@ -1,0 +1,51 @@
+[package]
+# Own crate, same reasoning as `../../gui` and `../../fuzz`: keeps a
+# dependency + concern (here: JNI/`unsafe`) out of the core crate. The repo
+# root is not a workspace, so `cargo build` there ignores this crate; build it
+# explicitly with `--manifest-path android/rust-jni/Cargo.toml` (see
+# `android/README.md`).
+#
+# This crate is the ONE place in the whole repo, other than the core crate's
+# single documented FFI exception (`udp.rs::set_buffer_force`), allowed to
+# write `unsafe` — the core crate's `#![deny(unsafe_code)]` (`src/lib.rs`) is
+# scoped to `src/` only and is untouched by anything here.
+name = "chameleon-jni"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "JNI bridge between the Android app shell and the chameleon-pq core crate"
+
+[lib]
+name = "chameleon_jni"
+# cdylib: Android loads this as a shared object via System.loadLibrary(). The
+# core crate stays rlib-only (unchanged) — only this crate needs a C ABI.
+crate-type = ["cdylib"]
+
+[dependencies]
+chameleon-pq = { path = "../.." }
+jni = "0.21"
+# Multi-threaded: `nativeStart`'s handshake and `nativeStop`'s teardown are
+# each run via `block_on` on a calling thread that Kotlin already keeps off
+# its main thread (Dispatchers.IO) — multi-threaded so the tunnel's own
+# background tasks (spawned by `run_tunnel_loops`) always have a worker to
+# run on independent of which thread issues a given JNI call.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+# Bridges `tracing` events to logcat. Without this, every info!/warn!/error!
+# the core crate emits (handshake state, TUN errors, route/DNS override
+# warnings) targets stdout/stderr, which Android silently discards for app
+# processes — on-device failures would be unreadable. Android-only: the crate
+# itself is `#![cfg(target_os = "android")]` (compiles to nothing elsewhere),
+# so it's gated here the same way, matching the root crate's own
+# `[target.'cfg(...)'.dependencies]` convention.
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"
+
+# Fallback ONLY so this crate stays buildable/testable off-device during
+# development (`cargo build` on a plain Linux/macOS host, no NDK needed) —
+# never linked into the real Android .so.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
