@@ -125,7 +125,11 @@ pub struct Status {
 /// gives status and can close the tunnel.
 pub struct Client {
     stats: Arc<TunnelStats>,
-    task: tokio::task::JoinHandle<()>,
+    // `Mutex<Option<..>>` (not a plain `JoinHandle`) so `disconnect_and_wait`
+    // can `.take()` and `.await` it — a plain field could only be awaited by
+    // consuming `self`, but `Client` is designed to be held behind an `Arc`
+    // (see `disconnect`'s doc). Same pattern as `_routes`/`_dns` below.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     peer: SocketAddr,
     session_id: u32,
     started_epoch: u64,
@@ -286,7 +290,7 @@ impl Client {
 
         Ok(Self {
             stats,
-            task,
+            task: Mutex::new(Some(task)),
             peer: server,
             session_id,
             started_epoch: now_secs(),
@@ -302,8 +306,15 @@ impl Client {
 
     /// Live status for a UI.
     pub fn status(&self) -> Status {
+        let task_running = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false); // taken (disconnect_and_wait already awaited it) = not running
         Status {
-            connected: self.stats.connected.load(Ordering::Relaxed) && !self.task.is_finished(),
+            connected: self.stats.connected.load(Ordering::Relaxed) && task_running,
             peer: self.peer,
             session_id: self.session_id,
             tx_bytes: self.stats.tx_bytes.load(Ordering::Relaxed),
@@ -342,7 +353,14 @@ impl Client {
                 });
             }
         }
-        self.task.abort();
+        if let Some(h) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            h.abort();
+        }
         self.stats.connected.store(false, Ordering::Relaxed);
         // Explicit release, independent of how many Arc<Client> clones exist
         // (see the struct doc on `_routes`/`_dns`) — dropping the taken value
@@ -359,6 +377,31 @@ impl Client {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take(),
         );
+    }
+
+    /// Same teardown as `disconnect`, but does not return until the tunnel
+    /// task's future has fully dropped — which is what actually runs
+    /// `TunGuard`'s abort of the TUN read/write tasks
+    /// (`tunnel_loops::run_tunnel_loops`). `disconnect` only *requests*
+    /// cancellation (`JoinHandle::abort`) and returns immediately; that is
+    /// fine for CLI/GUI, where nothing else in the process races to reuse a
+    /// released resource. It is NOT fine for a caller that does not own the
+    /// TUN file descriptor itself — e.g. Android, where `TunPair::from_raw_fd`
+    /// is created with `close_fd_on_drop(false)` because the platform
+    /// (`ParcelFileDescriptor`) owns the fd's lifecycle. Such a caller MUST
+    /// await this before closing the fd, or the OS is free to hand that fd
+    /// number to something else while Rust's TUN read task may still
+    /// reference it.
+    pub async fn disconnect_and_wait(&self) {
+        self.disconnect();
+        let handle = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(h) = handle {
+            let _ = h.await; // Err(JoinError) expected here: it was aborted above.
+        }
     }
 }
 
