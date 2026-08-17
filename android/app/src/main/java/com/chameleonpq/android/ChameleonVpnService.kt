@@ -32,8 +32,12 @@ import org.json.JSONObject
 class ChameleonVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private var pfd: ParcelFileDescriptor? = null
-    private var statusJob: kotlinx.coroutines.Job? = null
+    // Written from Dispatchers.IO/Main (both routed through this instance's
+    // single serviceScope, so no risk of a torn write), but ALSO read/written
+    // from onDestroy/onRevoke, which run on whatever thread the system
+    // dispatches them on — @Volatile costs nothing and closes that gap.
+    @Volatile private var pfd: ParcelFileDescriptor? = null
+    @Volatile private var statusJob: kotlinx.coroutines.Job? = null
 
     companion object {
         const val ACTION_CONNECT = "com.chameleonpq.android.CONNECT"
@@ -71,6 +75,16 @@ class ChameleonVpnService : VpnService() {
         _status.value = StatusUi(connecting = true)
 
         serviceScope.launch(Dispatchers.IO) {
+            // Idempotent no-op if nothing is running (nativeStop handles a
+            // None CLIENT cleanly) — but if the PREVIOUS session ended
+            // without going through stopTunnel() (a dead-peer timeout the
+            // status poller merely observed, a process restart), the Rust
+            // side's single-instance CLIENT can be left stale, and
+            // nativeStart below would hard-fail with "already connected"
+            // forever. Clearing it first makes every connect attempt
+            // self-healing instead of depending on every teardown path
+            // being perfectly clean.
+            NativeBridge.nativeStop()
             try {
                 val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
                     ?: error("no config imported")
@@ -103,11 +117,7 @@ class ChameleonVpnService : VpnService() {
                 withContext(Dispatchers.Main) { showForeground("Connected") }
                 startStatusPolling()
             } catch (e: Exception) {
-                _status.value = StatusUi(error = e.message)
-                withContext(Dispatchers.Main) {
-                    showForeground("Connection failed: ${e.message}")
-                }
-                stopTunnel()
+                stopTunnel(reason = e.message ?: "unknown error")
             }
         }
     }
@@ -132,12 +142,20 @@ class ChameleonVpnService : VpnService() {
     }
 
     /**
-     * Same teardown [MainActivity]'s Disconnect button and [onRevoke] both
-     * use. `nativeStop` must fully complete BEFORE `pfd.close()` — Rust's
-     * TUN read task may still reference the fd until it returns (see
-     * `TunPair::from_raw_fd`'s doc comment for the full reasoning).
+     * The Disconnect button's teardown path — deliberate, user/app-initiated,
+     * not a forced shutdown, so it's fine for this to be async. [reason],
+     * when set (a failed connect attempt cleaning up after itself), survives
+     * into the status the UI reads instead of being wiped by a bare
+     * `StatusUi()` reset — Phase E's failure debugging depends on this being
+     * visible somewhere other than logcat.
+     *
+     * `nativeStop` must fully complete BEFORE `pfd.close()` — Rust's TUN read
+     * task may still reference the fd until it returns (see
+     * `TunPair::from_raw_fd`'s doc comment for the full reasoning). This is
+     * NOT the only teardown path — see `onDestroy`/`onRevoke` for why a
+     * forced shutdown can't rely on this coroutine surviving to completion.
      */
-    private fun stopTunnel() {
+    private fun stopTunnel(reason: String? = null) {
         statusJob?.cancel()
         statusJob = null
         serviceScope.launch(Dispatchers.IO) {
@@ -145,7 +163,7 @@ class ChameleonVpnService : VpnService() {
             withContext(Dispatchers.Main) {
                 pfd?.close()
                 pfd = null
-                _status.value = StatusUi()
+                _status.value = StatusUi(error = reason)
                 ServiceCompat.stopForeground(
                     this@ChameleonVpnService,
                     ServiceCompat.STOP_FOREGROUND_REMOVE,
@@ -156,15 +174,38 @@ class ChameleonVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        // The user revoked VPN permission from system settings — same
-        // teardown as an explicit disconnect.
-        stopTunnel()
+        // The user revoked VPN permission from system settings. Tear down
+        // SYNCHRONOUSLY here rather than launching a coroutine in
+        // serviceScope: the AOSP default VpnService.onRevoke() (called via
+        // super below) itself calls stopSelf(), which can reach onDestroy()
+        // — cancelling serviceScope — before an async job in it finishes.
+        // nativeStop (abort already-running tasks + await their drop, no
+        // network I/O) is expected to be fast, unlike nativeStart's real
+        // handshake — an intentional, bounded exception to "never call
+        // native synchronously off a background dispatcher".
+        teardownSync()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        // Belt and suspenders: whatever path got us here (an explicit
+        // disconnect already did this and nativeStop no-ops cleanly on a
+        // None CLIENT; onRevoke above already did it too; or the system is
+        // killing this service directly), make sure the Rust side is torn
+        // down and the fd is closed before the service is actually gone —
+        // done synchronously, not via the scope this cancels next.
+        teardownSync()
         serviceScope.cancel()
         super.onDestroy()
+    }
+
+    private fun teardownSync() {
+        statusJob?.cancel()
+        statusJob = null
+        NativeBridge.nativeStop()
+        pfd?.close()
+        pfd = null
+        _status.value = StatusUi()
     }
 
     private fun ensureNotificationChannel() {

@@ -662,3 +662,11 @@ These are stated plainly so no one mistakes intent for proof:
   the physical NIC too). RAII like the full-tunnel routes — fail-*open* on its
   own, so it's meant to be paired with the kill switch above for a fail-closed
   guarantee that a dropped tunnel can't leak DNS in cleartext either.
+- **`#![deny(unsafe_code)]`.** `src/lib.rs`/`src/main.rs` assert this crate has
+  exactly one real `unsafe` block (`udp.rs::set_buffer_force`, a Linux
+  `setsockopt` FFI call, explicitly `#[allow(unsafe_code)]`) — enforced by the
+  compiler, not just convention. Scoped to this crate only: `gui/` (desktop
+  GUI) and `android/rust-jni/` (the Android app's JNI bridge, added for the
+  Android client) are separate crates outside this invariant — JNI
+  fundamentally needs `unsafe` (raw `JNIEnv`, `extern "system"` ABI), which is
+  exactly why that boundary lives in its own crate rather than in `src/`.
