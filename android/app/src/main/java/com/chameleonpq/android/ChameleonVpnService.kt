@@ -61,6 +61,8 @@ class ChameleonVpnService : VpnService() {
     )
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        DiagLog.init(this)
+        DiagLog.log("service: onStartCommand action=${intent?.action}")
         if (intent?.action == ACTION_DISCONNECT) {
             stopTunnel()
         } else {
@@ -70,8 +72,16 @@ class ChameleonVpnService : VpnService() {
     }
 
     private fun startTunnel() {
-        ensureNotificationChannel()
-        showForeground("Connecting…")
+        try {
+            ensureNotificationChannel()
+            showForeground("Connecting…")
+            DiagLog.log("service: foreground ok")
+        } catch (t: Throwable) {
+            DiagLog.log("service: foreground FAILED ${t.javaClass.simpleName}: ${t.message}")
+            _status.value = StatusUi(error = "foreground: ${t.message}")
+            stopSelf()
+            return
+        }
         _status.value = StatusUi(connecting = true)
 
         serviceScope.launch(Dispatchers.IO) {
@@ -84,11 +94,14 @@ class ChameleonVpnService : VpnService() {
             // forever. Clearing it first makes every connect attempt
             // self-healing instead of depending on every teardown path
             // being perfectly clean.
-            NativeBridge.nativeStop()
             try {
+                DiagLog.log("start: nativeStop (clear stale)")
+                NativeBridge.nativeStop()
                 val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
                     ?: error("no config imported")
+                DiagLog.log("start: config read (${configToml.length} chars)")
                 val params = TunParams.parse(NativeBridge.nativeTunParams(configToml))
+                DiagLog.log("start: params ${params.address}/${params.netmask} mtu=${params.mtu} dns=${params.dns}")
 
                 val builder = Builder()
                     .setSession("Chameleon-PQ")
@@ -109,15 +122,19 @@ class ChameleonVpnService : VpnService() {
                 val established = builder.establish()
                     ?: error("VpnService.Builder.establish() returned null (permission revoked?)")
                 pfd = established
+                DiagLog.log("start: tun established fd=${established.fd}")
 
+                DiagLog.log("start: nativeStart (handshake)…")
                 val ok = NativeBridge.nativeStart(established.fd, configToml)
                 if (!ok) error("nativeStart reported failure")
+                DiagLog.log("start: nativeStart OK")
 
                 _status.value = StatusUi(connected = true)
                 withContext(Dispatchers.Main) { showForeground("Connected") }
                 startStatusPolling()
-            } catch (e: Exception) {
-                stopTunnel(reason = e.message ?: "unknown error")
+            } catch (t: Throwable) {
+                DiagLog.log("start: FAILED ${t.javaClass.simpleName}: ${t.message}")
+                stopTunnel(reason = "${t.javaClass.simpleName}: ${t.message ?: "unknown error"}")
             }
         }
     }
@@ -128,6 +145,7 @@ class ChameleonVpnService : VpnService() {
             while (isActive) {
                 val s = JSONObject(NativeBridge.nativeStatus())
                 val connected = s.getBoolean("connected")
+                if (connected != _status.value.connected) DiagLog.log("poll: connected=$connected")
                 val tx = s.getLong("tx_bytes")
                 val rx = s.getLong("rx_bytes")
                 _status.value = StatusUi(connected = connected, txBytes = tx, rxBytes = rx)
@@ -156,6 +174,7 @@ class ChameleonVpnService : VpnService() {
      * forced shutdown can't rely on this coroutine surviving to completion.
      */
     private fun stopTunnel(reason: String? = null) {
+        DiagLog.log("stopTunnel reason=$reason")
         statusJob?.cancel()
         statusJob = null
         serviceScope.launch(Dispatchers.IO) {
@@ -174,6 +193,7 @@ class ChameleonVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        DiagLog.log("service: onRevoke")
         // The user revoked VPN permission from system settings. Tear down
         // SYNCHRONOUSLY here rather than launching a coroutine in
         // serviceScope: the AOSP default VpnService.onRevoke() (called via
@@ -188,6 +208,7 @@ class ChameleonVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        DiagLog.log("service: onDestroy")
         // Belt and suspenders: whatever path got us here (an explicit
         // disconnect already did this and nativeStop no-ops cleanly on a
         // None CLIENT; onRevoke above already did it too; or the system is

@@ -8,12 +8,14 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <!-- allowBackup="false": config.toml (private key material) lives in
              app-private storage — it must never be swept into Android's
-             cloud/adb backup. No custom launcher icon for v1 (uses the
-             platform default); swap in a real one before any real release. -->
+             cloud/adb backup. The launcher icon is the same chameleon as the desktop
+             GUI (gui/assets/chameleon.svg), as an adaptive vector icon. -->
 
         <activity
             android:name=".MainActivity"

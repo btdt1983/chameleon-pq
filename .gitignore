@@ -41,6 +41,7 @@ config*.toml
 # workspace member, so it needs its own lockfile committed).
 /android/rust-jni/target/
 /android/.gradle/
+/android/.kotlin/
 /android/**/build/
 /android/local.properties
 *.jks
