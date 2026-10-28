@@ -1,0 +1,32 @@
+#!/bin/sh
+# Shared by the .deb (postinst) and the .rpm (%post). Deliberately NOT
+# interactive: package managers run this unattended. Configuration is the
+# explicit next step: `sudo chameleon-pq setup`.
+set -e
+
+if command -v systemd-sysusers >/dev/null 2>&1; then
+    systemd-sysusers /usr/lib/sysusers.d/chameleon-pq.conf || true
+fi
+if ! getent passwd chameleon-pq >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin chameleon-pq
+fi
+
+install -d -m 0750 -o root -g chameleon-pq /etc/chameleon-pq
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    # Upgrade: pick up the new binary, but only if it was running.
+    systemctl try-restart chameleon-pq.service chameleon-pq-nft.service || true
+fi
+
+if [ ! -f /etc/chameleon-pq/server-config.toml ]; then
+    cat <<'MSG'
+
+Chameleon-PQ is installed but not configured yet.
+Run:   sudo chameleon-pq setup
+(it generates the keys + a matching client config, opens the firewall and starts the service)
+
+MSG
+fi
+exit 0

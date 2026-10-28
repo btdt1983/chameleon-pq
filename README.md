@@ -180,8 +180,49 @@ Prebuilt binaries are attached to every [release](../../releases/latest):
   with the desktop GUI (`chameleon-gui.exe`), the CLI (`chameleon-pq.exe`), the
   Microsoft-signed `wintun.dll`, an example config, and setup notes. Unzip and
   run — nothing else to install.
-- **Linux** — `chameleon-pq-linux-x86_64` (CLI).
+- **Linux server** — `chameleon-pq_<version>-1_amd64.deb` and
+  `chameleon-pq-<version>-1.x86_64.rpm`, built for glibc ≥ 2.31 (tested on
+  AlmaLinux 9.8 and Ubuntu 24.04): see [Install the server](#install-the-server-linux).
+- **Linux** — `chameleon-pq-linux-x86_64` (CLI, same glibc ≥ 2.31 build).
 - **crates.io** — `cargo install chameleon-pq` (CLI).
+
+## Install the server (Linux)
+
+Install the package, then let `setup` do the rest:
+
+```sh
+sudo apt install ./chameleon-pq_*_amd64.deb      # Debian / Ubuntu
+sudo dnf install ./chameleon-pq-*.x86_64.rpm     # AlmaLinux / RHEL / Fedora
+
+sudo chameleon-pq setup
+```
+
+`setup` asks for the server's public `ip:port`, then shows each step before it
+applies it (use `--yes` to skip the questions, `--dry-run` to only look):
+
+1. generates the server keys (Ed25519 + ML-DSA-65) and a matching **client
+   config**, cross-wired and sharing one obfuscation PSK
+2. enables IPv4 forwarding (persistent, `/etc/sysctl.d`)
+3. opens the UDP port and sets up NAT — in **firewalld** or **ufw** if one is
+   active, otherwise in its own nftables table (`inet chameleon_pq`); it also
+   adds a TCP MSS clamp on the tunnel
+4. enables and starts `chameleon-pq.service`
+
+No package manager? `sudo install -m 0755 chameleon-pq-linux-x86_64
+/usr/local/bin/chameleon-pq && sudo chameleon-pq setup` works too — `setup` then
+writes the systemd units itself.
+
+It is safe to re-run: finished steps are skipped, and an existing server config
+is kept unless you pass `--force` (which invalidates every client config; the old
+file is backed up). Copy the generated client config to your client and **delete
+it from the server**.
+
+The service runs as the unprivileged `chameleon-pq` user with only
+`CAP_NET_ADMIN` and a systemd sandbox. Its config lives in `/etc/chameleon-pq`
+(`server-config.toml`, mode 0640, `root:chameleon-pq`). Removing the package keeps
+the config; `apt purge` deletes it. One server config trusts exactly one client. With firewalld, the tunnel
+interface is placed in the `trusted` zone, so the VPN peer can reach every
+service listening on the server.
 
 ## Desktop client (GUI)
 

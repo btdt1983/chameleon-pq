@@ -1,0 +1,46 @@
+[Unit]
+Description=Chameleon-PQ VPN server
+Documentation=https://github.com/btdt1983/chameleon-pq
+After=network-online.target chameleon-pq-nft.service
+Wants=network-online.target
+# Installed but not configured yet: stay quiet instead of crash-looping.
+# Run `sudo chameleon-pq setup` to create the config.
+ConditionPathExists=/etc/chameleon-pq/server-config.toml
+
+[Service]
+Type=simple
+User=chameleon-pq
+Group=chameleon-pq
+ExecStart=/usr/bin/chameleon-pq --config /etc/chameleon-pq/server-config.toml server
+Restart=on-failure
+RestartSec=3
+
+# The only privilege needed: create the TUN device and raise the UDP socket
+# buffers (SO_RCVBUFFORCE). Not root, nothing else.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Sandboxing. /dev/net/tun must stay reachable, so no PrivateDevices=.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

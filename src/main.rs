@@ -66,6 +66,65 @@ async fn main() -> anyhow::Result<()> {
             )?;
             return Ok(());
         }
+        Command::Setup {
+            server_addr,
+            bind,
+            tun_net,
+            mtu,
+            split_tunnel,
+            kill_switch,
+            profile,
+            config_dir,
+            client_out,
+            yes,
+            dry_run,
+            force,
+            no_firewall,
+        } => {
+            #[cfg(target_os = "linux")]
+            {
+                if *kill_switch && *split_tunnel {
+                    anyhow::bail!("--kill-switch requires full-tunnel; drop --split-tunnel");
+                }
+                chameleon::sysconf::run(chameleon::sysconf::SetupArgs {
+                    server_addr: *server_addr,
+                    bind: *bind,
+                    tun_net: tun_net.clone(),
+                    mtu: *mtu,
+                    split_tunnel: *split_tunnel,
+                    kill_switch: *kill_switch,
+                    profile: profile.clone(),
+                    config_dir: config_dir.clone(),
+                    client_out: client_out.clone(),
+                    yes: *yes,
+                    dry_run: *dry_run,
+                    force: *force,
+                    no_firewall: *no_firewall,
+                })?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (
+                    server_addr,
+                    bind,
+                    tun_net,
+                    mtu,
+                    split_tunnel,
+                    kill_switch,
+                    profile,
+                    config_dir,
+                    client_out,
+                    yes,
+                    dry_run,
+                    force,
+                    no_firewall,
+                );
+                anyhow::bail!(
+                    "`setup` installs the Linux server; on this OS use `init` and run it manually"
+                );
+            }
+            return Ok(());
+        }
         Command::Check => {
             let cfg = AppConfig::load(&cli.config)?;
             println!(

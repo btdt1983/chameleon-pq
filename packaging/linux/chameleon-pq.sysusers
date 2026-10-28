@@ -1,0 +1,2 @@
+# Unprivileged account the Chameleon-PQ server runs as.
+u chameleon-pq - "Chameleon-PQ VPN server" /nonexistent /usr/sbin/nologin

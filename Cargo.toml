@@ -19,6 +19,45 @@ categories  = ["cryptography", "network-programming", "command-line-utilities"]
 # before every future `cargo publish`, not just `git status`.
 exclude     = ["/.github", "/android"]
 
+# ── Linux server packages (.deb / .rpm) ──────────────────────────────────────
+# Built by CI in an old-glibc container (see .github/workflows/ci.yml) so one
+# binary runs on Debian 11+ / Ubuntu 20.04+ / EL9. Files live in packaging/linux.
+# Install, then run `sudo chameleon-pq setup` — the scripts never configure
+# anything interactively.
+[package.metadata.deb]
+maintainer          = "btdt1983 <btdt1983@users.noreply.github.com>"
+section             = "net"
+priority            = "optional"
+# Explicit, not $auto: dpkg-shlibdeps on a newer build host would claim
+# libc6 >= <host version> even though the binary (built on Debian 11) only needs 2.31.
+depends             = "libc6 (>= 2.31), libgcc-s1, nftables, iproute2"
+extended-description = "Hybrid post-quantum VPN server. After installing run `sudo chameleon-pq setup` to generate keys, a matching client config, and to configure IP forwarding, the firewall and the service. UNAUDITED."
+maintainer-scripts  = "packaging/linux/scripts/"
+assets = [
+    ["target/release/chameleon-pq",                    "usr/bin/",                            "755"],
+    ["packaging/linux/chameleon-pq.service",           "lib/systemd/system/",                 "644"],
+    ["packaging/linux/chameleon-pq-nft.service",       "lib/systemd/system/",                 "644"],
+    ["packaging/linux/chameleon-pq.sysusers",          "usr/lib/sysusers.d/chameleon-pq.conf", "644"],
+    ["config.example.toml",                            "usr/share/doc/chameleon-pq/",         "644"],
+    ["README.md",                                      "usr/share/doc/chameleon-pq/",         "644"],
+]
+
+[package.metadata.generate-rpm]
+summary             = "Hybrid post-quantum VPN server (ML-KEM-768 + X25519, Ed25519 + ML-DSA-65)"
+post_install_script   = "packaging/linux/scripts/postinst"
+pre_uninstall_script  = "packaging/linux/scripts/prerm"
+assets = [
+    { source = "target/release/chameleon-pq",              dest = "/usr/bin/chameleon-pq",                          mode = "755" },
+    { source = "packaging/linux/chameleon-pq.service",     dest = "/usr/lib/systemd/system/chameleon-pq.service",     mode = "644" },
+    { source = "packaging/linux/chameleon-pq-nft.service", dest = "/usr/lib/systemd/system/chameleon-pq-nft.service", mode = "644" },
+    { source = "packaging/linux/chameleon-pq.sysusers",    dest = "/usr/lib/sysusers.d/chameleon-pq.conf",          mode = "644" },
+    { source = "config.example.toml",                      dest = "/usr/share/doc/chameleon-pq/config.example.toml", mode = "644", doc = true },
+    { source = "README.md",                                dest = "/usr/share/doc/chameleon-pq/README.md",          mode = "644", doc = true },
+]
+[package.metadata.generate-rpm.requires]
+nftables = "*"
+iproute  = "*"
+
 [lib]
 name = "chameleon"
 path = "src/lib.rs"
