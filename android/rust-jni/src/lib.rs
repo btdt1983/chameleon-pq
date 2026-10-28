@@ -192,6 +192,10 @@ fn native_start_inner(fd: i32, config_toml: &str) -> chameleon::Result<()> {
         .server_addr
         .ok_or_else(|| config_error("network.server_addr not set in config"))?;
 
+    // `from_raw_fd` registers the fd with the tokio reactor and spawns the
+    // TUN I/O tasks, so it must run inside the runtime's context — we are on
+    // a plain JVM thread here, not a tokio worker.
+    let _guard = runtime().enter();
     let tun = chameleon::tun_iface::TunPair::from_raw_fd(fd, cfg.tun.mtu)?;
     let auth = build_auth(&cfg)?;
     let client = runtime().block_on(Client::connect(&cfg, server, auth, tun))?;
