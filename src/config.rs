@@ -93,6 +93,53 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Guided SERVER installation (Linux, run as root): service account, config,
+    /// IP forwarding, firewall/NAT, MSS clamp and systemd units — each step is
+    /// shown and confirmed first. Safe to re-run; an existing server config is
+    /// kept unless --force.
+    Setup {
+        /// Public ip:port the CLIENT connects to. Prompted for (with a detected
+        /// default) when interactive.
+        #[arg(long)]
+        server_addr: Option<SocketAddr>,
+        /// Server bind address (port must be >= 1024: the service is unprivileged).
+        #[arg(long, default_value = "0.0.0.0:51820")]
+        bind: SocketAddr,
+        /// TUN /24 network base (server = .1, client = .2).
+        #[arg(long, default_value = "10.99.0")]
+        tun_net: String,
+        /// TUN MTU (must be <= 1232 for the obfuscated data path).
+        #[arg(long, default_value_t = 1200)]
+        mtu: u16,
+        /// Generate a split-tunnel client config (default is full-tunnel).
+        #[arg(long)]
+        split_tunnel: bool,
+        /// Enable the kill switch in the client config (requires full-tunnel).
+        #[arg(long)]
+        kill_switch: bool,
+        /// Traffic profile: off | balanced | stealth | throughput.
+        #[arg(long, default_value = "off")]
+        profile: String,
+        /// Where the server config lives.
+        #[arg(long, default_value = "/etc/chameleon-pq")]
+        config_dir: PathBuf,
+        /// Directory the generated CLIENT config is written to.
+        #[arg(long, default_value = ".")]
+        client_out: PathBuf,
+        /// Apply every step without asking.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Only show what would be done; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Regenerate the server config even if one exists (invalidates all
+        /// client configs; the old file is backed up).
+        #[arg(long)]
+        force: bool,
+        /// Skip the firewall/NAT steps (you manage forwarding and NAT yourself).
+        #[arg(long)]
+        no_firewall: bool,
+    },
     /// Validate the configuration file
     Check,
     /// Manually control the VPN kill switch (escape hatch if left engaged after

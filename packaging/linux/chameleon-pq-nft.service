@@ -1,0 +1,16 @@
+[Unit]
+Description=Chameleon-PQ firewall rules (TCP MSS clamp, NAT when firewalld is not in use)
+Documentation=https://github.com/btdt1983/chameleon-pq
+Before=chameleon-pq.service
+After=network-pre.target firewalld.service
+ConditionPathExists=/etc/chameleon-pq/chameleon-pq.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Our own table only ('inet chameleon_pq'); never touches anyone else's rules.
+ExecStart=/usr/sbin/nft -f /etc/chameleon-pq/chameleon-pq.nft
+ExecStop=-/usr/sbin/nft delete table inet chameleon_pq
+
+[Install]
+WantedBy=multi-user.target

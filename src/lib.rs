@@ -22,6 +22,8 @@ pub mod rekey;
 pub mod route;
 pub mod session;
 pub mod setup;
+#[cfg(target_os = "linux")]
+pub mod sysconf;
 pub mod tun_iface;
 pub mod tunnel;
 pub mod tunnel_loops;

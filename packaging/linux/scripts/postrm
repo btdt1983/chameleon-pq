@@ -1,0 +1,12 @@
+#!/bin/sh
+# .deb only. `remove` keeps /etc/chameleon-pq (the server's private keys);
+# `purge` deletes it. The service account is left in place (Debian policy).
+set -e
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/chameleon-pq
+    rm -f /etc/sysctl.d/99-chameleon-pq.conf
+fi
+exit 0

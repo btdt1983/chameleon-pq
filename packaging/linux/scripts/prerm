@@ -1,0 +1,12 @@
+#!/bin/sh
+# Shared by the .deb (prerm) and the .rpm (%preun). Only on real removal, not upgrade.
+set -e
+action="$1"
+case "$action" in
+    remove|0)
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl disable --now chameleon-pq.service chameleon-pq-nft.service || true
+        fi
+        ;;
+esac
+exit 0

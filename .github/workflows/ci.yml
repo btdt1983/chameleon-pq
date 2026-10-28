@@ -84,12 +84,57 @@ jobs:
           cargo audit
         continue-on-error: true   # informational — flags vulnerable/yanked deps
 
+  # Linux server packages. Built inside Debian 11 (glibc 2.31) on purpose: a
+  # binary linked against the runner's newer glibc would not start on
+  # AlmaLinux/RHEL 9 or Debian 11. The gate below fails the build if a newer
+  # glibc symbol sneaks in, so that can never ship silently.
+  linux-packages:
+    name: Linux packages (.deb / .rpm)
+    runs-on: ubuntu-latest
+    container: rust:1-bullseye
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked
+
+      - name: glibc gate (max symbol version must be <= 2.31)
+        run: |
+          max=$(objdump -T target/release/chameleon-pq | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "highest glibc symbol: $max"
+          top=$(printf '%s\n' "$max" GLIBC_2.31 | sort -V | tail -1)
+          [ "$top" = "GLIBC_2.31" ] || { echo "::error::binary needs $max (> 2.31)"; exit 1; }
+
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+
+      - name: Build .deb and .rpm
+        run: |
+          cargo deb --no-build
+          cargo generate-rpm
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: chameleon-pq-linux-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+
+      # The loose Linux binary shipped with a release is THIS one (glibc <= 2.31),
+      # not the ubuntu-latest build above, which needs a much newer glibc.
+      - name: Upload portable Linux binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: chameleon-pq-linux-portable
+          path: target/release/chameleon-pq
+
   # Tagged releases (e.g. `git tag v0.1.0 && git push --tags`) automatically
   # publish a GitHub Release with the built binaries attached.
   release:
     name: Publish release
     # Wait for the GUI build too: the Windows bundle ships the GUI client.
-    needs: [build-test, gui]
+    needs: [build-test, gui, linux-packages]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -100,7 +145,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: chameleon-pq-linux
+          name: chameleon-pq-linux-portable
           path: ./linux
       - uses: actions/download-artifact@v8
         with:
@@ -110,6 +155,10 @@ jobs:
         with:
           name: chameleon-gui-windows
           path: ./gui-win
+      - uses: actions/download-artifact@v8
+        with:
+          name: chameleon-pq-linux-packages
+          path: ./linux-packages
 
       # Wintun is not vendored in git. Fetch the official Microsoft-signed DLL
       # and pin it to the exact bytes we tested (SHA-256 of the amd64 DLL), so a
@@ -142,6 +191,8 @@ jobs:
           mv linux/chameleon-pq        chameleon-pq-linux-x86_64
           mv windows/chameleon-pq.exe  chameleon-pq-windows-x86_64.exe
           cp gui-win/chameleon-gui.exe chameleon-gui.exe
+          # Flatten the .deb/.rpm next to the other release files.
+          find linux-packages -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} . \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -151,6 +202,8 @@ jobs:
             chameleon-pq-linux-x86_64
             chameleon-pq-windows-x86_64.exe
             chameleon-gui.exe
+            chameleon-pq_*.deb
+            chameleon-pq-*.rpm
           generate_release_notes: true
 
   # Publish the crate to crates.io on a `vX.Y.Z` tag (after tests pass). Needs a
