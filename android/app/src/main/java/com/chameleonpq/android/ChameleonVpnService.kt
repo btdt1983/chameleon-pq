@@ -27,7 +27,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns the actual tunnel lifecycle. `onStartCommand` runs on the main
@@ -45,11 +44,6 @@ class ChameleonVpnService : VpnService() {
     @Volatile private var pfd: ParcelFileDescriptor? = null
     @Volatile private var tunnelJob: kotlinx.coroutines.Job? = null
     @Volatile private var userStopped = false
-    // Set by the network callback when the default (non-VPN) network changes
-    // underneath a live tunnel: the client's UDP socket is still bound to the
-    // old path, so the session is dead in practice even though the Rust side
-    // has not noticed yet. The supervisor loop reconnects on it.
-    private val networkChanged = AtomicBoolean(false)
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var lastNetwork: Network? = null
 
@@ -100,7 +94,6 @@ class ChameleonVpnService : VpnService() {
         }
         _status.value = StatusUi(connecting = true)
         userStopped = false
-        networkChanged.set(false)
         registerNetworkCallback()
 
         tunnelJob?.cancel()
@@ -111,9 +104,9 @@ class ChameleonVpnService : VpnService() {
      * Keeps the tunnel up. The FIRST attempt failing is reported to the user
      * and not retried (almost always a bad config or a revoked permission —
      * retrying would just spin). Once a session has been established, any
-     * loss — the Rust dead-peer timeout, or a network change — tears down and
-     * reconnects with backoff, because on a phone that is routine (wifi <->
-     * mobile, CGNAT mappings expiring while the screen is off).
+     * loss (the Rust dead-peer timeout) tears down and reconnects with
+     * backoff, because on a phone that is routine (CGNAT mappings expiring
+     * while the screen is off, a server too old to follow a network change).
      */
     private suspend fun supervise() {
         var everConnected = false
@@ -123,7 +116,6 @@ class ChameleonVpnService : VpnService() {
                 connectOnce()
                 everConnected = true
                 attempt = 0
-                networkChanged.set(false)
                 _status.value = StatusUi(connected = true)
                 withContext(Dispatchers.Main) { showForeground("Connected") }
                 val why = monitor()
@@ -143,7 +135,7 @@ class ChameleonVpnService : VpnService() {
             withContext(Dispatchers.Main) { showForeground("Reconnecting…") }
             // The server refuses a new handshake while it still holds the old
             // session (it declares it dead after ~60s of silence), so early
-            // retries after a network change may be rejected; keep trying.
+            // retries may be rejected; keep trying.
             val wait = RECONNECT_BACKOFF_SECS[minOf(attempt, RECONNECT_BACKOFF_SECS.size - 1)]
             attempt++
             DiagLog.log("supervise: reconnect attempt $attempt in ${wait}s")
@@ -195,7 +187,6 @@ class ChameleonVpnService : VpnService() {
             val s = JSONObject(NativeBridge.nativeStatus())
             val connected = s.getBoolean("connected")
             if (!connected) return "native reports disconnected"
-            if (networkChanged.getAndSet(false)) return "network changed"
             val tx = s.getLong("tx_bytes")
             val rx = s.getLong("rx_bytes")
             _status.value = StatusUi(connected = true, txBytes = tx, rxBytes = rx)
@@ -225,7 +216,12 @@ class ChameleonVpnService : VpnService() {
                 if (previous == network) return
                 lastNetwork = network
                 DiagLog.log("net: default network now $network (was $previous)")
-                if (previous != null) networkChanged.set(true)
+                // No reconnect here on purpose: the server follows an
+                // authenticated client to its new address (roaming), so the
+                // existing session simply continues. If the server is too old
+                // to roam, the Rust dead-peer timeout ends the session and the
+                // supervisor reconnects. A forced re-handshake now would only
+                // be refused while the server still holds the old session.
             }
 
             override fun onLost(network: Network) {
