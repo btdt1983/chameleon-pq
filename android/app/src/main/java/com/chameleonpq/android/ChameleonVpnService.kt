@@ -6,6 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
@@ -13,7 +16,9 @@ import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns the actual tunnel lifecycle. `onStartCommand` runs on the main
@@ -37,13 +43,22 @@ class ChameleonVpnService : VpnService() {
     // from onDestroy/onRevoke, which run on whatever thread the system
     // dispatches them on — @Volatile costs nothing and closes that gap.
     @Volatile private var pfd: ParcelFileDescriptor? = null
-    @Volatile private var statusJob: kotlinx.coroutines.Job? = null
+    @Volatile private var tunnelJob: kotlinx.coroutines.Job? = null
+    @Volatile private var userStopped = false
+    // Set by the network callback when the default (non-VPN) network changes
+    // underneath a live tunnel: the client's UDP socket is still bound to the
+    // old path, so the session is dead in practice even though the Rust side
+    // has not noticed yet. The supervisor loop reconnects on it.
+    private val networkChanged = AtomicBoolean(false)
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetwork: Network? = null
 
     companion object {
         const val ACTION_CONNECT = "com.chameleonpq.android.CONNECT"
         const val ACTION_DISCONNECT = "com.chameleonpq.android.DISCONNECT"
         private const val NOTIFICATION_CHANNEL_ID = "chameleon_vpn"
         private const val NOTIFICATION_ID = 1
+        private val RECONNECT_BACKOFF_SECS = intArrayOf(2, 5, 10, 15, 20, 30)
 
         // The service is the single source of truth for connection state;
         // MainActivity only observes this, it never calls NativeBridge
@@ -55,6 +70,7 @@ class ChameleonVpnService : VpnService() {
     data class StatusUi(
         val connecting: Boolean = false,
         val connected: Boolean = false,
+        val reconnecting: Boolean = false,
         val txBytes: Long = 0,
         val rxBytes: Long = 0,
         val error: String? = null,
@@ -83,80 +99,153 @@ class ChameleonVpnService : VpnService() {
             return
         }
         _status.value = StatusUi(connecting = true)
+        userStopped = false
+        networkChanged.set(false)
+        registerNetworkCallback()
 
-        serviceScope.launch(Dispatchers.IO) {
-            // Idempotent no-op if nothing is running (nativeStop handles a
-            // None CLIENT cleanly) — but if the PREVIOUS session ended
-            // without going through stopTunnel() (a dead-peer timeout the
-            // status poller merely observed, a process restart), the Rust
-            // side's single-instance CLIENT can be left stale, and
-            // nativeStart below would hard-fail with "already connected"
-            // forever. Clearing it first makes every connect attempt
-            // self-healing instead of depending on every teardown path
-            // being perfectly clean.
+        tunnelJob?.cancel()
+        tunnelJob = serviceScope.launch(Dispatchers.IO) { supervise() }
+    }
+
+    /**
+     * Keeps the tunnel up. The FIRST attempt failing is reported to the user
+     * and not retried (almost always a bad config or a revoked permission —
+     * retrying would just spin). Once a session has been established, any
+     * loss — the Rust dead-peer timeout, or a network change — tears down and
+     * reconnects with backoff, because on a phone that is routine (wifi <->
+     * mobile, CGNAT mappings expiring while the screen is off).
+     */
+    private suspend fun supervise() {
+        var everConnected = false
+        var attempt = 0
+        while (!userStopped) {
             try {
-                DiagLog.log("start: nativeStop (clear stale)")
-                NativeBridge.nativeStop()
-                val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
-                    ?: error("no config imported")
-                DiagLog.log("start: config read (${configToml.length} chars)")
-                val params = TunParams.parse(NativeBridge.nativeTunParams(configToml))
-                DiagLog.log("start: params ${params.address}/${params.netmask} mtu=${params.mtu} dns=${params.dns}")
-
-                val builder = Builder()
-                    .setSession("Chameleon-PQ")
-                    .addAddress(params.address, netmaskToPrefixLength(params.netmask))
-                    .addRoute("0.0.0.0", 0)
-                    .setMtu(params.mtu)
-                    // `Client::connect` binds its own UDP control-plane
-                    // socket internally — Kotlin never sees that fd, so
-                    // VpnService.protect() isn't an option here. Excluding
-                    // this app's whole process from the 0.0.0.0/0 route
-                    // above is the MVP fix: without it the tunnel's own
-                    // traffic loops into itself.
-                    .addDisallowedApplication(packageName)
-                for (server in params.dns) {
-                    builder.addDnsServer(server)
-                }
-
-                val established = builder.establish()
-                    ?: error("VpnService.Builder.establish() returned null (permission revoked?)")
-                pfd = established
-                DiagLog.log("start: tun established fd=${established.fd}")
-
-                DiagLog.log("start: nativeStart (handshake)…")
-                val ok = NativeBridge.nativeStart(established.fd, configToml)
-                if (!ok) error("nativeStart reported failure")
-                DiagLog.log("start: nativeStart OK")
-
+                connectOnce()
+                everConnected = true
+                attempt = 0
+                networkChanged.set(false)
                 _status.value = StatusUi(connected = true)
                 withContext(Dispatchers.Main) { showForeground("Connected") }
-                startStatusPolling()
+                val why = monitor()
+                DiagLog.log("supervise: tunnel lost ($why)")
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 DiagLog.log("start: FAILED ${t.javaClass.simpleName}: ${t.message}")
-                stopTunnel(reason = "${t.javaClass.simpleName}: ${t.message ?: "unknown error"}")
+                if (!everConnected) {
+                    stopTunnel(reason = "${t.javaClass.simpleName}: ${t.message ?: "unknown error"}")
+                    return
+                }
             }
+            if (userStopped) return
+            releaseTunnel()
+            _status.value = StatusUi(connecting = true, reconnecting = true)
+            withContext(Dispatchers.Main) { showForeground("Reconnecting…") }
+            // The server refuses a new handshake while it still holds the old
+            // session (it declares it dead after ~60s of silence), so early
+            // retries after a network change may be rejected; keep trying.
+            val wait = RECONNECT_BACKOFF_SECS[minOf(attempt, RECONNECT_BACKOFF_SECS.size - 1)]
+            attempt++
+            DiagLog.log("supervise: reconnect attempt $attempt in ${wait}s")
+            delay(wait * 1000L)
         }
     }
 
-    private fun startStatusPolling() {
-        statusJob?.cancel()
-        statusJob = serviceScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                val s = JSONObject(NativeBridge.nativeStatus())
-                val connected = s.getBoolean("connected")
-                if (connected != _status.value.connected) DiagLog.log("poll: connected=$connected")
-                val tx = s.getLong("tx_bytes")
-                val rx = s.getLong("rx_bytes")
-                _status.value = StatusUi(connected = connected, txBytes = tx, rxBytes = rx)
-                if (connected) {
-                    withContext(Dispatchers.Main) {
-                        showForeground("Connected — ↑${tx}B ↓${rx}B")
-                    }
-                }
-                delay(1000)
+    private suspend fun connectOnce() {
+        // Idempotent no-op if nothing is running (nativeStop handles a None
+        // CLIENT cleanly); clears a stale single-instance CLIENT so nativeStart
+        // can never hard-fail with "already connected" forever.
+        DiagLog.log("start: nativeStop (clear stale)")
+        NativeBridge.nativeStop()
+        val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
+            ?: error("no config imported")
+        DiagLog.log("start: config read (${configToml.length} chars)")
+        val params = TunParams.parse(NativeBridge.nativeTunParams(configToml))
+        DiagLog.log("start: params ${params.address}/${params.netmask} mtu=${params.mtu} dns=${params.dns}")
+
+        val builder = Builder()
+            .setSession("Chameleon-PQ")
+            .addAddress(params.address, netmaskToPrefixLength(params.netmask))
+            .addRoute("0.0.0.0", 0)
+            .setMtu(params.mtu)
+            // `Client::connect` binds its own UDP control-plane socket
+            // internally — Kotlin never sees that fd, so VpnService.protect()
+            // isn't an option here. Excluding this app's whole process from the
+            // 0.0.0.0/0 route above is the MVP fix: without it the tunnel's own
+            // traffic loops into itself.
+            .addDisallowedApplication(packageName)
+        for (server in params.dns) {
+            builder.addDnsServer(server)
+        }
+
+        val established = builder.establish()
+            ?: error("VpnService.Builder.establish() returned null (permission revoked?)")
+        pfd = established
+        DiagLog.log("start: tun established fd=${established.fd}")
+
+        DiagLog.log("start: nativeStart (handshake)…")
+        val ok = NativeBridge.nativeStart(established.fd, configToml)
+        if (!ok) error("nativeStart reported failure")
+        DiagLog.log("start: nativeStart OK")
+    }
+
+    /** Polls the native status until the tunnel is lost; returns why. */
+    private suspend fun monitor(): String {
+        while (true) {
+            val s = JSONObject(NativeBridge.nativeStatus())
+            val connected = s.getBoolean("connected")
+            if (!connected) return "native reports disconnected"
+            if (networkChanged.getAndSet(false)) return "network changed"
+            val tx = s.getLong("tx_bytes")
+            val rx = s.getLong("rx_bytes")
+            _status.value = StatusUi(connected = true, txBytes = tx, rxBytes = rx)
+            withContext(Dispatchers.Main) {
+                showForeground("Connected — ↑${tx}B ↓${rx}B")
+            }
+            delay(1000)
+        }
+    }
+
+    /** Stops the native client and closes the tun fd (in that order — see [stopTunnel]). */
+    private fun releaseTunnel() {
+        NativeBridge.nativeStop()
+        pfd?.close()
+        pfd = null
+    }
+
+    private fun registerNetworkCallback() {
+        if (netCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                // Our own VPN can show up as a network; only real underlying
+                // paths matter.
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+                val previous = lastNetwork
+                if (previous == network) return
+                lastNetwork = network
+                DiagLog.log("net: default network now $network (was $previous)")
+                if (previous != null) networkChanged.set(true)
+            }
+
+            override fun onLost(network: Network) {
+                DiagLog.log("net: lost $network")
+                if (lastNetwork == network) lastNetwork = null
             }
         }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            netCallback = cb
+        } catch (t: Throwable) {
+            DiagLog.log("net: callback registration FAILED ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = netCallback ?: return
+        netCallback = null
+        lastNetwork = null
+        try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(cb) } catch (_: Exception) { }
     }
 
     /**
@@ -175,9 +264,16 @@ class ChameleonVpnService : VpnService() {
      */
     private fun stopTunnel(reason: String? = null) {
         DiagLog.log("stopTunnel reason=$reason")
-        statusJob?.cancel()
-        statusJob = null
+        userStopped = true
+        unregisterNetworkCallback()
+        val job = tunnelJob
+        tunnelJob = null
         serviceScope.launch(Dispatchers.IO) {
+            // The supervisor may be inside a blocking nativeStart; wait for it
+            // to wind down before tearing the native side down underneath it.
+            // (When the supervisor itself called us after a first-attempt
+            // failure it returns right away, so the join cannot deadlock.)
+            job?.cancelAndJoin()
             NativeBridge.nativeStop()
             withContext(Dispatchers.Main) {
                 pfd?.close()
@@ -221,8 +317,10 @@ class ChameleonVpnService : VpnService() {
     }
 
     private fun teardownSync() {
-        statusJob?.cancel()
-        statusJob = null
+        userStopped = true
+        unregisterNetworkCallback()
+        tunnelJob?.cancel()
+        tunnelJob = null
         NativeBridge.nativeStop()
         pfd?.close()
         pfd = null
