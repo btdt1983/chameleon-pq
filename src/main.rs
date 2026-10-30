@@ -245,9 +245,19 @@ async fn run_server(
         let engine = build_engine(session, &cfg);
         // CLI server: no live re-profiling, but keep a sender alive for the
         // session so the outbound loop's control arm parks instead of erroring.
-        let (_traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        let (traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        let traffic_tx = Arc::new(traffic_tx);
         let mut params = chameleon::tunnel_loops::TunnelParams::from_config(&cfg);
         params.allow_roaming = true;
+        // The server shapes its own direction to match the client's profile, so
+        // both directions are concealed (opt out: [traffic] follow_client_profile).
+        params.announce_profile = false;
+        if cfg.traffic.follow_client_profile {
+            params.follow_peer = Some(chameleon::tunnel_loops::FollowPeerProfile {
+                tx: traffic_tx.clone(),
+                base: cfg.traffic.clone(),
+            });
+        }
         chameleon::tunnel_loops::run_tunnel_loops(
             socket.clone(),
             engine,

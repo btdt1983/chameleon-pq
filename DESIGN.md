@@ -463,6 +463,18 @@ the rate *and* the size are constant. A bounded queue tail-drops real packets
 when offered load exceeds the rate (TCP recovers), which is what keeps the rate
 constant.
 
+**Both directions (`follow_client_profile`).** Pacing is per direction: a client
+profile shapes only what the client sends. So the client announces its profile in
+an authenticated inner frame (`FrameType::Profile`, one byte — at start, on every
+live switch and with each keepalive) and a server with `follow_client_profile =
+true` (the default) applies the same profile to its own direction, using its own
+cooldown/budget settings. Switches are rate-limited (1 s) and a `custom` profile
+is never shared. A peer that predates the frame drops it (unknown inner type), so
+nothing needs negotiating; cleartext (obf off) profile frames are ignored because
+they are unauthenticated. Cost of trusting the client: it can make the server emit
+cover up to the chosen profile's budgeted ceiling; set the option to false to
+refuse that.
+
 **Modes & cost (config `[traffic]`, OFF by default — `profile = off`, no
 pacing at all; enabling it defaults to Adaptive mode):** **Adaptive** (the
 default mode once pacing is enabled, e.g. `profile = balanced`) paces only

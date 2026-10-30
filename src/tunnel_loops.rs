@@ -6,7 +6,7 @@
 //! The inbound loop is the ONLY socket reader (sole-reader invariant); mid-session
 //! handshake frames go via a channel to the rekey driver (see rekey.rs).
 
-use crate::config::{AppConfig, EffectiveTraffic, TrafficMode};
+use crate::config::{AppConfig, EffectiveTraffic, TrafficConfig, TrafficMode, TrafficProfile};
 use crate::crypto::Authenticator;
 use crate::engine::{CryptoEngine, DecryptResult, OutboundPacket};
 use crate::frame::{Frame, FrameType};
@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,40 @@ const MAX_QUEUE: usize = 4096;
 /// the loop (→ from_tun → wintun → TCP) instead of buffering unboundedly.
 const SEND_PIPELINE_BATCHES: usize = 16;
 
+/// How a server applies the profile its client announces: the sender feeds the
+/// outbound loop's live-reconfigure channel (the same one a GUI profile switch
+/// uses), and `base` supplies the server's own cooldown/budget settings.
+#[derive(Debug, Clone)]
+pub struct FollowPeerProfile {
+    pub tx: Arc<watch::Sender<EffectiveTraffic>>,
+    pub base: TrafficConfig,
+}
+
+/// `current_profile` value meaning "no shareable profile" (a `custom` one).
+const NO_PROFILE: u8 = u8::MAX;
+
+/// Minimum time between two applied peer-profile switches. A switch re-creates
+/// the pacer, so a peer must not be able to flap the server's shaping.
+const PEER_PROFILE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Seals and sends one authenticated `Profile` frame. Sent directly, like a
+/// keepalive: it is a few bytes and idempotent, so it need not ride the paced
+/// schedule or the ordered sealer.
+async fn send_profile_frame(
+    engine: &CryptoEngine,
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    pad: PadPolicy,
+    id: u8,
+) {
+    if let Ok(wire) = engine
+        .sessions()
+        .seal_obf(FrameType::Profile as u8, &[id], pad)
+    {
+        let _ = socket.send_to(&wire, peer).await;
+    }
+}
+
 /// The configuration values that `run_tunnel_loops` needs, OWNED (no
 /// `&AppConfig` borrow) so the loop can be spawned as a task — exactly what a
 /// client UI wants (connect → tunnel runs in the background, UI stays alive).
@@ -84,6 +118,14 @@ pub struct TunnelParams {
     /// CGNAT rebinding), WireGuard-style. Off for clients: the server's address
     /// is fixed.
     pub allow_roaming: bool,
+    /// Tell the peer our traffic profile (an authenticated `FrameType::Profile`
+    /// frame, at start, on every live change and with each keepalive). The
+    /// client's default; a server does not announce.
+    pub announce_profile: bool,
+    /// Our current profile, as announced when `announce_profile` is set.
+    pub profile: TrafficProfile,
+    /// Server only: adopt the profile the peer announces.
+    pub follow_peer: Option<FollowPeerProfile>,
     pub batch_linger_us: u64,
     pub gso: bool,
     pub obf_enabled: bool,
@@ -116,6 +158,9 @@ impl TunnelParams {
         }
         Self {
             allow_roaming: false,
+            announce_profile: true,
+            profile: t.profile,
+            follow_peer: None,
             batch_linger_us: cfg.engine.batch_linger_us,
             gso: cfg.engine.gso,
             obf_enabled: cfg.obfuscation.enabled,
@@ -319,6 +364,12 @@ pub async fn run_tunnel_loops(
         write_task,
     } = tun;
     let allow_roaming = params.allow_roaming;
+    // Profile announcements ride authenticated frames, so they need obfuscation.
+    let announce_profile = params.announce_profile && params.obf_enabled;
+    let follow_peer = params.follow_peer.clone();
+    let current_profile = Arc::new(AtomicU8::new(
+        params.profile.wire_id().unwrap_or(NO_PROFILE),
+    ));
     let peer = PeerAddr::new(peer);
     // Abort-on-drop guard: if this future is cancelled (Client::disconnect aborts
     // the task), stop the TUN read/write tasks too — the read task blocks on
@@ -418,6 +469,8 @@ pub async fn run_tunnel_loops(
     let rekeying_out = rekeying.clone();
     let state_out = sock_state.clone();
     let stats_out = stats.clone();
+    let current_profile_out = current_profile.clone();
+    let pad_out: PadPolicy = params.padding;
     // The inbound loop needs its own sender (for RESPONDER rekey sends) and
     // its own view of `paced_state` before the outbound loop below moves its
     // originals in.
@@ -707,6 +760,30 @@ pub async fn run_tunnel_loops(
                         // local `paced` (separate task) but needs to know it
                         // when a rekey RESPONSE is due — see `paced_state`'s doc.
                         paced_state_out.store(new_paced, Ordering::Relaxed);
+                        // Tell the peer, so a following server shapes ITS
+                        // direction the same way (see `FollowPeerProfile`).
+                        match eff.profile.wire_id() {
+                            Some(id) => {
+                                current_profile_out.store(id, Ordering::Relaxed);
+                                if announce_profile {
+                                    send_profile_frame(&engine_out, &socket_out, peer_out.get(), pad_out, id).await;
+                                    // The peer rate-limits switches; if this one
+                                    // came right after another it was ignored.
+                                    // Say it once more when the limit has lapsed
+                                    // (the periodic keepalive announcement is the
+                                    // slower safety net).
+                                    let (eng, sock, to) = (engine_out.clone(), socket_out.clone(), peer_out.clone());
+                                    let cur = current_profile_out.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(PEER_PROFILE_MIN_INTERVAL + Duration::from_millis(100)).await;
+                                        if cur.load(Ordering::Relaxed) == id {
+                                            send_profile_frame(&eng, &sock, to.get(), pad_out, id).await;
+                                        }
+                                    });
+                                }
+                            }
+                            None => current_profile_out.store(NO_PROFILE, Ordering::Relaxed),
+                        }
                         let new_mode = match eff.mode {
                             TrafficMode::Cbr => ShapeMode::Cbr,
                             TrafficMode::Adaptive => ShapeMode::Adaptive,
@@ -743,7 +820,11 @@ pub async fn run_tunnel_loops(
     let state_in = sock_state.clone();
     let peer_in = peer.clone();
     let stats_in = stats.clone();
+    let follow_in = follow_peer.clone();
     tasks.spawn(async move {
+        // Peer-profile following (server): what we last applied and when.
+        let mut applied_peer_profile: Option<TrafficProfile> = None;
+        let mut last_peer_switch: Option<Instant> = None;
         // Batched receive buffers (GRO): one syscall yields multiple
         // datagrams, which we run one by one through the existing demux below.
         let (mut recv_storage, mut recv_metas) = crate::udp::recv_buffers();
@@ -835,6 +916,29 @@ pub async fn run_tunnel_loops(
                                 FrameType::KeepAlive => debug!("keepalive (obf) received"),
                                 FrameType::Close => { info!("peer closed session"); break 'inbound; }
                                 FrameType::Handshake => {} // not expected via the obf path
+                                FrameType::Profile => {
+                                    // Authenticated (it came through the AEAD path).
+                                    if let Some(f) = &follow_in {
+                                        let announced = (plain.len() == 1)
+                                            .then(|| TrafficProfile::from_wire_id(plain[0]))
+                                            .flatten();
+                                        let due = last_peer_switch
+                                            .map_or(true, |t| t.elapsed() >= PEER_PROFILE_MIN_INTERVAL);
+                                        match announced {
+                                            Some(p) if Some(p) != applied_peer_profile && due => {
+                                                let mut tc = f.base.clone();
+                                                tc.profile = p;
+                                                if f.tx.send(tc.effective()).is_ok() {
+                                                    info!("following the peer's traffic profile: {p:?}");
+                                                    applied_peer_profile = Some(p);
+                                                    last_peer_switch = Some(Instant::now());
+                                                }
+                                            }
+                                            Some(_) => {} // unchanged, or too soon (re-announced later)
+                                            None => debug!("ignoring malformed profile frame"),
+                                        }
+                                    }
+                                }
                                 FrameType::Padding => trace!("cover packet discarded"),
                             }
                             continue;
@@ -964,6 +1068,9 @@ pub async fn run_tunnel_loops(
                                  tunnel stays up"
                             ),
                             FrameType::Padding => {}
+                            // Unauthenticated in the cleartext framing: a spoofed
+                            // frame must not be able to reshape our traffic.
+                            FrameType::Profile => {}
                         }
                     }
                 }
@@ -980,6 +1087,7 @@ pub async fn run_tunnel_loops(
     let engine_ka = engine.clone();
     let obf_enabled_ka = params.obf_enabled;
     let pad_policy_ka: PadPolicy = params.padding;
+    let current_profile_ka = current_profile.clone();
     // Under CBR pacing there is constant (cover) traffic anyway, so the
     // periodic keepalive send is redundant — we skip it then and keep
     // only the dead-peer detection. (Adaptive can fall idle-silent, so there
@@ -993,6 +1101,17 @@ pub async fn run_tunnel_loops(
             if idle >= PEER_DEAD_AFTER {
                 warn!("peer silent for {idle}s — declaring dead, closing tunnel");
                 break;
+            }
+            // Announce our profile (also the very first tick, i.e. at start).
+            // Repeating it makes a lost datagram or a rate-limited switch on the
+            // other side self-heal within one keepalive interval. Done before the
+            // CBR skip below: cover traffic does not carry this.
+            if announce_profile {
+                let id = current_profile_ka.load(Ordering::Relaxed);
+                if id != NO_PROFILE {
+                    send_profile_frame(&engine_ka, &socket_ka, peer_ka.get(), pad_policy_ka, id)
+                        .await;
+                }
             }
             if ka_skip_send {
                 continue; // CBR cover already provides the liveness signal
@@ -1467,5 +1586,144 @@ enabled = false
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_does_not_follow_a_new_source_address() {
         roaming_scenario(false).await;
+    }
+
+    /// Server follows the client's announced traffic profile through the REAL
+    /// tunnel loops: at start (first keepalive tick) and on a live switch.
+    /// `follow = false` is the opt-out: the server keeps its own profile.
+    async fn profile_follow_scenario(follow: bool) {
+        use crate::crypto::Ed25519Auth;
+        use crate::net::{run_handshake_initiator, run_handshake_responder};
+        use crate::session::SessionManager;
+
+        let mk = |profile: &str| -> AppConfig {
+            toml::from_str(&format!(
+                r#"
+[identity]
+ed25519_seed_hex     = "0303030303030303030303030303030303030303030303030303030303030303"
+peer_ed25519_pub_hex = "0404040404040404040404040404040404040404040404040404040404040404"
+[network]
+bind_addr = "127.0.0.1:0"
+[tun]
+name = "test0"
+[obfuscation]
+enabled = true
+handshake = true
+[traffic]
+profile = "{profile}"
+"#
+            ))
+            .unwrap()
+        };
+        let (s_cfg, c_cfg) = (mk("off"), mk("balanced"));
+        let (s_seed, c_seed) = ([81u8; 32], [82u8; 32]);
+        let s_pub = Ed25519Auth::derive_public(&s_seed);
+        let c_pub = Ed25519Auth::derive_public(&c_seed);
+        let server_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&s_seed, c_pub).unwrap());
+        let client_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&c_seed, s_pub).unwrap());
+        let hs = Some(crate::hsobf::derive_hs_obf_key(&s_pub, &c_pub, None));
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let (resp, init) = tokio::join!(
+            run_handshake_responder(&server_sock, server_auth.as_ref(), hs.as_ref()),
+            run_handshake_initiator(&client_sock, server_addr, client_auth.as_ref(), hs.as_ref()),
+        );
+        let (ss, caddr) = resp.unwrap();
+        let cs = init.unwrap();
+        let eng = |sess| {
+            Arc::new(CryptoEngine::new(
+                Arc::new(SessionManager::new(sess)),
+                true,
+                PadPolicy::Bucketed,
+            ))
+        };
+        let (s_tun, _s_h) = TunPair::new_mock();
+        let (c_tun, _c_h) = TunPair::new_mock();
+
+        // Server: the watch channel is what the outbound loop reconfigures from;
+        // we also observe it here.
+        let (s_tx, s_rx) = watch::channel(s_cfg.traffic.effective());
+        let s_tx = Arc::new(s_tx);
+        let mut s_params = TunnelParams::from_config(&s_cfg);
+        s_params.announce_profile = false;
+        if follow {
+            s_params.follow_peer = Some(FollowPeerProfile {
+                tx: s_tx.clone(),
+                base: s_cfg.traffic.clone(),
+            });
+        }
+        let observe = s_tx.subscribe();
+        let (c_tx, c_rx) = watch::channel(c_cfg.traffic.effective());
+        tokio::spawn(run_tunnel_loops(
+            server_sock.clone(),
+            eng(ss),
+            s_tun,
+            caddr,
+            s_params,
+            server_auth,
+            hs,
+            Arc::new(TunnelStats::default()),
+            s_rx,
+        ));
+        tokio::spawn(run_tunnel_loops(
+            client_sock.clone(),
+            eng(cs),
+            c_tun,
+            server_addr,
+            TunnelParams::from_config(&c_cfg),
+            client_auth,
+            hs,
+            Arc::new(TunnelStats::default()),
+            c_rx,
+        ));
+
+        let wait_for = |want: TrafficProfile| {
+            let observe = observe.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if observe.borrow().profile == want {
+                        return true;
+                    }
+                    if tokio::time::Instant::now() > deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        if !follow {
+            assert!(
+                !wait_for(TrafficProfile::Balanced).await,
+                "with follow_client_profile off the server keeps its own profile"
+            );
+            return;
+        }
+        assert!(
+            wait_for(TrafficProfile::Balanced).await,
+            "server adopts the client's profile announced at start"
+        );
+        // Live switch on the client; the server follows (after the 1 s rate limit at worst).
+        let mut tc = c_cfg.traffic.clone();
+        tc.profile = TrafficProfile::Stealth;
+        c_tx.send(tc.effective()).unwrap();
+        assert!(
+            wait_for(TrafficProfile::Stealth).await,
+            "server follows a live profile switch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_follows_the_clients_profile() {
+        profile_follow_scenario(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_keeps_its_profile_when_following_is_off() {
+        profile_follow_scenario(false).await;
     }
 }

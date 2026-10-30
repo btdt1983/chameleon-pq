@@ -119,4 +119,9 @@ cooldown_ms = 500   # adaptive: cover lasts this long after the last real packet
 # costs megabytes per stray background packet and can starve a slow uplink):
 cover_budget_packets = 64    # cover packets one activity burst may start (~79 KB)
 cover_ratio          = 0.25  # extra cover earned per real packet in the same burst
+# SERVER ONLY: adopt the traffic profile the connected client announces, so both
+# directions are shaped alike (a client profile alone only shapes what the client
+# sends; downloads would keep their natural timing). The server's own `profile`
+# applies until the client announces one. Set false to ignore the client's choice.
+follow_client_profile = true
 #                              (0 and 0 = pace only, no cover; use cbr for constant rate)

@@ -32,6 +32,11 @@ pub enum FrameType {
     /// burst- and idle-patterns disappear. Sits only in the INNER framing
     /// (obf.rs), never as a visible wire-byte.
     Padding = 0x05,
+    /// Authenticated, INNER-framing only: the sender's traffic profile (1 byte,
+    /// `TrafficProfile::wire_id`). A server that follows its client uses it to
+    /// shape its own direction the same way. A peer that predates it fails to
+    /// parse the type and drops the packet, so it is safe to send unannounced.
+    Profile = 0x06,
 }
 
 impl FrameType {
@@ -42,6 +47,7 @@ impl FrameType {
             0x03 => Ok(Self::KeepAlive),
             0x04 => Ok(Self::Close),
             0x05 => Ok(Self::Padding),
+            0x06 => Ok(Self::Profile),
             _ => Err(ChameleonError::UnknownFrameType(v)),
         }
     }
@@ -117,7 +123,9 @@ mod tests {
     fn frame_type_from_u8_covers_padding() {
         assert_eq!(FrameType::from_u8(0x05).unwrap(), FrameType::Padding);
         assert_eq!(FrameType::Padding as u8, 0x05);
+        assert_eq!(FrameType::from_u8(0x06).unwrap(), FrameType::Profile);
+        assert_eq!(FrameType::Profile as u8, 0x06);
         // Unknown type stays an error (fail-closed).
-        assert!(FrameType::from_u8(0x06).is_err());
+        assert!(FrameType::from_u8(0x07).is_err());
     }
 }
