@@ -38,6 +38,13 @@ object NativeBridge {
     external fun nativeStop()
 
     /**
+     * Sets the traffic profile (`off`, `balanced`, `throughput`, `stealth`).
+     * Remembered for the next [nativeStart] and, if a tunnel is running,
+     * applied to it live without reconnecting. Throws on an unknown name.
+     */
+    external fun nativeSetProfile(profile: String)
+
+    /**
      * Always succeeds (never throws). Returns a JSON status snapshot with
      * keys `connected`, `session_id`, `tx_bytes`, `rx_bytes`, `uptime_secs` —
      * snake_case, matching the Rust struct's field names as-is (no rename).

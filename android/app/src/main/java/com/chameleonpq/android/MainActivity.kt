@@ -52,6 +52,7 @@ class MainActivity : ComponentActivity() {
     private var hasConfig by mutableStateOf(false)
     private var importResult by mutableStateOf<String?>(null)
     private var serverAddr by mutableStateOf<String?>(null)
+    private var profile by mutableStateOf(TrafficProfile.Off)
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* granted or not, nothing else to do here */ }
@@ -85,6 +86,7 @@ class MainActivity : ComponentActivity() {
 
         hasConfig = ConfigStore.hasConfig(this)
         serverAddr = ConfigStore.serverAddr(this)
+        profile = ProfileStore.get(this)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -100,6 +102,8 @@ class MainActivity : ComponentActivity() {
                         hasConfig = hasConfig,
                         importResult = importResult,
                         serverAddr = serverAddr,
+                        profile = profile,
+                        onProfile = { selectProfile(it) },
                         onImport = { importLauncher.launch(arrayOf("*/*")) },
                         onToggleConnection = { currentlyActive ->
                             if (currentlyActive) disconnect() else connect()
@@ -107,6 +111,19 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+    }
+
+    /** Saves the choice and, if a tunnel is up, switches it live via the service. */
+    private fun selectProfile(p: TrafficProfile) {
+        profile = p
+        ProfileStore.set(this, p)
+        val st = ChameleonVpnService.status.value
+        if (st.connected || st.connecting) {
+            startService(
+                Intent(this, ChameleonVpnService::class.java)
+                    .setAction(ChameleonVpnService.ACTION_SET_PROFILE),
+            )
         }
     }
 
