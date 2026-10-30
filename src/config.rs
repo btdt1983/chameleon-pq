@@ -462,8 +462,10 @@ impl std::fmt::Display for TrafficProfile {
             // presentation-only and is not used to (de)serialize the profile.
             TrafficProfile::Stealth => "Maximum Privacy",
             TrafficProfile::Balanced => "Balanced",
-            TrafficProfile::Throughput => "High Speed, Still Private",
-            TrafficProfile::Off => "Fastest, No Obfuscation",
+            TrafficProfile::Throughput => "High Speed",
+            // "No obfuscation" was wrong: packet-shape obfuscation stays on, only the
+            // timing shaping is off.
+            TrafficProfile::Off => "Fastest",
             TrafficProfile::Custom => "Custom",
         })
     }

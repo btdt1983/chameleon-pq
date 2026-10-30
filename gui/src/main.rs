@@ -34,6 +34,27 @@ const REPO_URL: &str = "https://github.com/btdt1983/chameleon-pq";
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/btdt1983/chameleon-pq/releases/latest";
 
+/// One line per profile: what it hides and what it costs. The server follows the
+/// profile chosen here (0.9.3+; an older server keeps its own), so the numbers
+/// apply in both directions.
+fn profile_hint(p: TrafficProfile) -> &'static str {
+    match p {
+        TrafficProfile::Off => {
+            "No timing shaping: full line speed. Burst and idle patterns stay visible."
+        }
+        TrafficProfile::Balanced => {
+            "Hides when you are active, with a small cover-traffic budget. Capped at ~118 Mbit/s each way."
+        }
+        TrafficProfile::Throughput => {
+            "Like Balanced, capped at ~460 Mbit/s. About 20% slower than Fastest on a 300/150 line."
+        }
+        TrafficProfile::Stealth => {
+            "Constant traffic 24/7, capped at ~5 Mbit/s: downloads slow to ~5-10 Mbit/s and it uses bandwidth while connected."
+        }
+        TrafficProfile::Custom => "Uses the individual [traffic] fields of your config.",
+    }
+}
+
 pub fn main() -> iced::Result {
     // Diagnostics first: a Windows GUI has no console, so without this every
     // error/panic vanishes with the window. We log to a file NEXT to the binary
@@ -791,6 +812,16 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        // What the selected profile costs. The numbers are measured on a 300/150
+        // Mbit/s line (Telekom speed test) with a server that follows the client.
+        let profile_hint = row![
+            label(""),
+            text(profile_hint(self.profile))
+                .size(12)
+                .color(muted)
+                .width(Length::Fill),
+        ]
+        .spacing(8);
         let ks_row = row![
             label("Safety"),
             checkbox(
@@ -801,10 +832,12 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let settings = container(column![config_row, server_row, profile_row, ks_row].spacing(10))
-            .padding(16)
-            .width(Length::Fill)
-            .style(card_style);
+        let settings = container(
+            column![config_row, server_row, profile_row, profile_hint, ks_row].spacing(10),
+        )
+        .padding(16)
+        .width(Length::Fill)
+        .style(card_style);
 
         // Big action button: Connect / Disconnect / (busy).
         let action: Element<Message> = if self.connecting {
