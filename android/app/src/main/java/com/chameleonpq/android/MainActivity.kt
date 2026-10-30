@@ -51,6 +51,7 @@ class MainActivity : ComponentActivity() {
 
     private var hasConfig by mutableStateOf(false)
     private var importResult by mutableStateOf<String?>(null)
+    private var serverAddr by mutableStateOf<String?>(null)
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* granted or not, nothing else to do here */ }
@@ -71,6 +72,7 @@ class MainActivity : ComponentActivity() {
                 ConfigStore.importFrom(this, uri)
                 importResult = "Config imported"
                 hasConfig = true
+                serverAddr = ConfigStore.serverAddr(this)
             } catch (e: Exception) {
                 importResult = "Import failed: ${e.message}"
             }
@@ -82,6 +84,7 @@ class MainActivity : ComponentActivity() {
         DiagLog.log("activity: onCreate")
 
         hasConfig = ConfigStore.hasConfig(this)
+        serverAddr = ConfigStore.serverAddr(this)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -91,11 +94,12 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    MainScreen(
+            ChameleonTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    AppRoot(
                         hasConfig = hasConfig,
                         importResult = importResult,
+                        serverAddr = serverAddr,
                         onImport = { importLauncher.launch(arrayOf("*/*")) },
                         onToggleConnection = { currentlyActive ->
                             if (currentlyActive) disconnect() else connect()
@@ -142,78 +146,5 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, ChameleonVpnService::class.java)
             .setAction(ChameleonVpnService.ACTION_CONNECT)
         ContextCompat.startForegroundService(this, intent)
-    }
-}
-
-@Composable
-private fun MainScreen(
-    hasConfig: Boolean,
-    importResult: String?,
-    onImport: () -> Unit,
-    onToggleConnection: (currentlyActive: Boolean) -> Unit,
-) {
-    val status by ChameleonVpnService.status.collectAsState()
-    val active = status.connected || status.connecting
-    val diag by DiagLog.lines.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Image(
-            painter = painterResource(R.drawable.ic_chameleon),
-            contentDescription = "Chameleon-PQ",
-            modifier = Modifier.height(96.dp),
-        )
-        Spacer(Modifier.height(8.dp))
-        Text("Chameleon-PQ", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(24.dp))
-
-        Button(onClick = onImport) { Text("Import config") }
-        importResult?.let { Text(it, modifier = Modifier.padding(top = 8.dp)) }
-
-        Spacer(Modifier.height(24.dp))
-
-        Text(
-            when {
-                status.reconnecting -> "Reconnecting…"
-                status.connecting -> "Connecting…"
-                status.connected -> "Connected"
-                else -> "Disconnected"
-            },
-        )
-        if (status.connected) {
-            Text("↑ ${status.txBytes} bytes   ↓ ${status.rxBytes} bytes")
-        }
-        status.error?.let { Text("Error: $it") }
-
-        Spacer(Modifier.height(16.dp))
-
-        Button(onClick = { onToggleConnection(active) }, enabled = hasConfig) {
-            Text(if (active) "Disconnect" else "Connect")
-        }
-        if (!hasConfig) {
-            Text("Import a config first", modifier = Modifier.padding(top = 8.dp))
-        }
-
-        Spacer(Modifier.height(16.dp))
-        val clipboard = LocalClipboardManager.current
-        val logScroll = rememberScrollState()
-        LaunchedEffect(diag.size, diag.lastOrNull()) { logScroll.scrollTo(logScroll.maxValue) }
-        Text(
-            diag.joinToString("\n"),
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(200.dp)
-                .verticalScroll(logScroll),
-        )
-        Button(onClick = { clipboard.setText(AnnotatedString(diag.joinToString("\n"))) }) {
-            Text("Copy log")
-        }
     }
 }

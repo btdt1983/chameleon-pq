@@ -15,7 +15,7 @@
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/Theme.Chameleon">
         <!-- allowBackup="false": config.toml (private key material) lives in
              app-private storage — it must never be swept into Android's
              cloud/adb backup. The launcher icon is the same chameleon as the desktop

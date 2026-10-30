@@ -67,6 +67,14 @@ class ChameleonVpnService : VpnService() {
         val reconnecting: Boolean = false,
         val txBytes: Long = 0,
         val rxBytes: Long = 0,
+        /** Bytes/second over the last poll interval. */
+        val txRate: Long = 0,
+        val rxRate: Long = 0,
+        /** Epoch millis when this session was established (0 = not connected). */
+        val connectedSinceMs: Long = 0,
+        /** System "Always-on VPN" / "Block connections without VPN" state (the real kill switch). */
+        val alwaysOn: Boolean = false,
+        val lockdown: Boolean = false,
         val error: String? = null,
     )
 
@@ -116,9 +124,10 @@ class ChameleonVpnService : VpnService() {
                 connectOnce()
                 everConnected = true
                 attempt = 0
-                _status.value = StatusUi(connected = true)
+                val since = System.currentTimeMillis()
+                _status.value = StatusUi(connected = true, connectedSinceMs = since, alwaysOn = isAlwaysOn, lockdown = isLockdownEnabled)
                 withContext(Dispatchers.Main) { showForeground("Connected") }
-                val why = monitor()
+                val why = monitor(since)
                 DiagLog.log("supervise: tunnel lost ($why)")
             } catch (e: CancellationException) {
                 throw e
@@ -130,8 +139,12 @@ class ChameleonVpnService : VpnService() {
                 }
             }
             if (userStopped) return
-            releaseTunnel()
-            _status.value = StatusUi(connecting = true, reconnecting = true)
+            // Stop the native client but KEEP the tun interface (and with it the
+            // 0.0.0.0/0 route) established: nothing reads it, so apps' packets
+            // are dropped instead of leaking onto the open network while we
+            // reconnect. This is a kill switch in its own right.
+            NativeBridge.nativeStop()
+            _status.value = StatusUi(connecting = true, reconnecting = true, alwaysOn = isAlwaysOn, lockdown = isLockdownEnabled)
             withContext(Dispatchers.Main) { showForeground("Reconnecting…") }
             // The server refuses a new handshake while it still holds the old
             // session (it declares it dead after ~60s of silence), so early
@@ -151,6 +164,15 @@ class ChameleonVpnService : VpnService() {
         NativeBridge.nativeStop()
         val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
             ?: error("no config imported")
+        // Reconnects reuse the tun established by the first attempt (see
+        // `supervise`): only a missing tun gets (re)built here.
+        pfd?.let { existing ->
+            DiagLog.log("start: reusing tun fd=${existing.fd}")
+            DiagLog.log("start: nativeStart (handshake)…")
+            if (!NativeBridge.nativeStart(existing.fd, configToml)) error("nativeStart reported failure")
+            DiagLog.log("start: nativeStart OK")
+            return
+        }
         DiagLog.log("start: config read (${configToml.length} chars)")
         val params = TunParams.parse(NativeBridge.nativeTunParams(configToml))
         DiagLog.log("start: params ${params.address}/${params.netmask} mtu=${params.mtu} dns=${params.dns}")
@@ -182,26 +204,29 @@ class ChameleonVpnService : VpnService() {
     }
 
     /** Polls the native status until the tunnel is lost; returns why. */
-    private suspend fun monitor(): String {
+    private suspend fun monitor(since: Long): String {
+        var prevTx = -1L
+        var prevRx = -1L
+        var prevAt = 0L
         while (true) {
             val s = JSONObject(NativeBridge.nativeStatus())
-            val connected = s.getBoolean("connected")
-            if (!connected) return "native reports disconnected"
+            if (!s.getBoolean("connected")) return "native reports disconnected"
             val tx = s.getLong("tx_bytes")
             val rx = s.getLong("rx_bytes")
-            _status.value = StatusUi(connected = true, txBytes = tx, rxBytes = rx)
+            val now = System.nanoTime()
+            val dt = if (prevAt == 0L) 0.0 else (now - prevAt) / 1e9
+            val txRate = if (dt > 0 && tx >= prevTx) ((tx - prevTx) / dt).toLong() else 0L
+            val rxRate = if (dt > 0 && rx >= prevRx) ((rx - prevRx) / dt).toLong() else 0L
+            prevTx = tx; prevRx = rx; prevAt = now
+            _status.value = StatusUi(
+                connected = true, txBytes = tx, rxBytes = rx, txRate = txRate, rxRate = rxRate,
+                connectedSinceMs = since, alwaysOn = isAlwaysOn, lockdown = isLockdownEnabled,
+            )
             withContext(Dispatchers.Main) {
-                showForeground("Connected — ↑${tx}B ↓${rx}B")
+                showForeground("Connected — ↓${formatRate(rxRate)}  ↑${formatRate(txRate)}")
             }
             delay(1000)
         }
-    }
-
-    /** Stops the native client and closes the tun fd (in that order — see [stopTunnel]). */
-    private fun releaseTunnel() {
-        NativeBridge.nativeStop()
-        pfd?.close()
-        pfd = null
     }
 
     private fun registerNetworkCallback() {

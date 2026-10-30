@@ -50,6 +50,10 @@ object ConfigStore {
     fun readConfig(context: Context): String? =
         configFile(context).takeIf { it.exists() }?.readText()
 
+    /** The server endpoint from the imported config's `server_addr`, for display only. */
+    fun serverAddr(context: Context): String? =
+        readConfig(context)?.let { Regex("""server_addr\s*=\s*"([^"]+)"""").find(it)?.groupValues?.get(1) }
+
     /**
      * Imports [uri] (from `ACTION_OPEN_DOCUMENT`): reads it, validates via
      * `nativeTunParams`, and on success persists it to app-private storage.

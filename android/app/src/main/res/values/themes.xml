@@ -1,0 +1,9 @@
+<resources>
+    <!-- Window background before Compose draws: matches ChameleonTheme so there is no white flash. -->
+    <style name="Theme.Chameleon" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFF4F8F5</item>
+        <item name="android:statusBarColor">#FFF4F8F5</item>
+        <item name="android:navigationBarColor">#FFF4F8F5</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>
