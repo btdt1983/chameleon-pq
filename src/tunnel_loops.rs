@@ -1196,9 +1196,15 @@ enabled = false
         let first_session_id = client_session.session_id;
         assert_eq!(server_session.session_id, first_session_id);
 
-        // Force a real rekey after tx_counter passes 15 (20 * 3/4) instead of
-        // the production `1 << 48`.
-        client_session.set_rekey_at_for_test(20);
+        // Force a real rekey after tx_counter passes 150 (200 * 3/4) instead of
+        // the production `1 << 48`. The hard limit sits well above the traffic
+        // below ON PURPOSE: `reserve_counters` rejects a whole batch whose last
+        // counter reaches the limit, so a limit close to the packet count made
+        // this test drop its entire first batch whenever the outbound loop
+        // happened to drain the packets together (flaky on 2-CPU runners).
+        const REKEY_AT: u64 = 200;
+        const PRE_REKEY_PACKETS: u32 = 160;
+        client_session.set_rekey_at_for_test(REKEY_AT);
 
         let server_engine = Arc::new(CryptoEngine::new(
             Arc::new(SessionManager::new(server_session)),
@@ -1247,7 +1253,7 @@ enabled = false
         // Drive the client's tx counter past the forced threshold with real
         // traffic through the mock TUN — the same path production traffic
         // takes (recv_many -> reserve counters -> seal -> UDP send).
-        for i in 0..20u32 {
+        for i in 0..PRE_REKEY_PACKETS {
             let pkt = Bytes::from(format!("pre-rekey packet {i}").into_bytes());
             client_handles.inject_tx.send(pkt).await.unwrap();
         }
@@ -1280,21 +1286,27 @@ enabled = false
         let post = Bytes::from_static(b"post-rekey packet");
         client_handles.inject_tx.send(post.clone()).await.unwrap();
 
-        // Drain the 20 queued pre-rekey packets plus the post-rekey one; the
-        // last must be the post-rekey payload, decrypted under the new session.
-        let mut last = None;
-        for _ in 0..21 {
-            last = Some(
-                tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
-                    .await
-                    .expect("server receives queued packet")
-                    .expect("channel open"),
-            );
+        // Drain the queued pre-rekey packets plus the post-rekey one. Inbound
+        // decrypt is parallel by design (see the `decrypt_jobs` comment), so
+        // delivery order is NOT guaranteed: assert the SET of payloads, i.e.
+        // that nothing was lost and the post-rekey packet arrived decrypted
+        // under the new session.
+        let mut received = std::collections::HashSet::new();
+        for _ in 0..=PRE_REKEY_PACKETS {
+            let pkt = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
+                .await
+                .expect("server receives queued packet")
+                .expect("channel open");
+            received.insert(pkt);
         }
-        assert_eq!(
-            last,
-            Some(post),
+        assert!(
+            received.contains(&post),
             "data flows correctly on the rekeyed session"
+        );
+        assert_eq!(
+            received.len(),
+            PRE_REKEY_PACKETS as usize + 1,
+            "no packet lost or duplicated across the rekey"
         );
     }
 
