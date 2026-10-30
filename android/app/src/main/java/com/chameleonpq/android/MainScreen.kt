@@ -276,6 +276,7 @@ private fun Stat(label: String, value: String, modifier: Modifier = Modifier) {
 /** Traffic-profile picker; a change applies live when connected (see ChameleonVpnService). */
 @Composable
 private fun ProfileCard(selected: TrafficProfile, onSelect: (TrafficProfile) -> Unit) {
+    val onCellular by ChameleonVpnService.onCellular.collectAsState()
     Card {
         Text("Traffic profile", fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
@@ -293,6 +294,16 @@ private fun ProfileCard(selected: TrafficProfile, onSelect: (TrafficProfile) -> 
         selected.warning?.let {
             Spacer(Modifier.height(4.dp))
             Text(it, style = MaterialTheme.typography.bodySmall, color = StatusColors.Busy)
+            if (onCellular && selected != TrafficProfile.Off) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "You are on mobile data right now.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StatusColors.Warning,
+                )
+                TextButton(onClick = { onSelect(TrafficProfile.Off) }) { Text("Switch to Fastest") }
+            }
         }
     }
 }

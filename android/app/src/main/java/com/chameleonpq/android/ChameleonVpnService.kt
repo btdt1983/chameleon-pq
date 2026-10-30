@@ -60,6 +60,11 @@ class ChameleonVpnService : VpnService() {
         // directly.
         private val _status = MutableStateFlow(StatusUi())
         val status: StateFlow<StatusUi> = _status.asStateFlow()
+
+        // True while the underlying (non-VPN) network is mobile data. Kept apart
+        // from StatusUi, which is rebuilt every second.
+        private val _onCellular = MutableStateFlow(false)
+        val onCellular: StateFlow<Boolean> = _onCellular.asStateFlow()
     }
 
     data class StatusUi(
@@ -252,6 +257,7 @@ class ChameleonVpnService : VpnService() {
                 // Our own VPN can show up as a network; only real underlying
                 // paths matter.
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+                _onCellular.value = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
                 val previous = lastNetwork
                 if (previous == network) return
                 lastNetwork = network
