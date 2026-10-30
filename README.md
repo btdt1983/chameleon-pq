@@ -181,6 +181,8 @@ Prebuilt binaries are attached to every [release](../../releases/latest):
   with the desktop GUI (`chameleon-gui.exe`), the CLI (`chameleon-pq.exe`), the
   Microsoft-signed `wintun.dll`, an example config, and setup notes. Unzip and
   run — nothing else to install.
+- **Android** — [`ChameleonPQ.apk`](../../releases/latest/download/ChameleonPQ.apk)
+  (Android 14+, arm64): see [Android app](#android-app).
 - **Linux server** — `chameleon-pq_<version>-1_amd64.deb` and
   `chameleon-pq-<version>-1.x86_64.rpm`, built for glibc ≥ 2.31 (tested on
   AlmaLinux 9.8 and Ubuntu 24.04): see [Install the server](#install-the-server-linux).
@@ -244,6 +246,40 @@ It's included in the self-contained Windows bundle above, and also builds from
 source on Linux/macOS with `cargo build --release --manifest-path gui/Cargo.toml`.
 
 [iced]: https://iced.rs
+
+## Android app
+
+<p align="center">
+  <img src="docs/android-main.jpg" alt="Chameleon-PQ on Android — connected, Balanced profile" width="250">
+  &nbsp;&nbsp;
+  <img src="docs/android-profiles.jpg" alt="Traffic-profile picker and kill-switch hint" width="250">
+</p>
+
+The release also carries an Android client,
+[`ChameleonPQ.apk`](../../releases/latest/download/ChameleonPQ.apk):
+
+- one big power button, live up/down speed, a connection timer and the server
+  you are connected to;
+- a **traffic-profile picker** (Fastest · Balanced · High speed · Max privacy)
+  that switches live, without reconnecting. The server follows the client's choice
+  (`[traffic] follow_client_profile`, on by default), so both directions are shaped
+  the same way — the picker shows what each profile costs;
+- it keeps the session across wifi ↔ mobile changes (the server follows the phone
+  to its new address) and, if the tunnel does drop, reconnects **with traffic
+  blocked** instead of leaking onto the open network;
+- a kill-switch hint: Android only lets *you* turn on "Always-on VPN" and "Block
+  connections without VPN", so the app shows whether it is on and links to that
+  settings page;
+- an on-device diagnostics log (with a copy button).
+
+Install: open the `.apk` on the phone (allow "install unknown apps" for the app you
+opened it with), then import your `client-config.toml` (from `chameleon-pq init` or
+`chameleon-pq setup`). The config holds your private keys and stays in the app's
+private storage; it is not in the APK and Android backup is off.
+
+Needs **Android 14 or newer on a 64-bit ARM phone**, and has so far only been tested
+on one device (Android 14). The APK is built and signed locally by the maintainer, not
+by CI; its SHA-256 is in the release notes so you can verify the download.
 
 ## Build
 
