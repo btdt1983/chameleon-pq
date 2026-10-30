@@ -100,7 +100,8 @@ Known scope limits:
   idle-vs-active patterns are hidden. Cover packets are ordinary obf datagrams
   with an encrypted `Padding` inner type, constant-size under `Full` padding, so
   they are wire-indistinguishable from real data. Adaptive paces during
-  activity + cooldown and goes quiet when idle (no bandwidth at rest); **CBR**
+  activity + cooldown and goes quiet when idle (cover is budgeted per activity
+  burst, see `cover_budget_packets`/`cover_ratio`); **CBR**
   streams constantly for the strongest hiding at a constant cost. No wire/proto
   change — a peer that predates this safely drops cover packets
 - Per-direction keys; 2048-entry sliding-window replay protection

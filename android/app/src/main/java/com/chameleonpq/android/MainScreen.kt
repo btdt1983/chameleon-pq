@@ -294,7 +294,7 @@ private fun ProfileCard(selected: TrafficProfile, onSelect: (TrafficProfile) -> 
         selected.warning?.let {
             Spacer(Modifier.height(4.dp))
             Text(it, style = MaterialTheme.typography.bodySmall, color = StatusColors.Busy)
-            if (onCellular && selected != TrafficProfile.Off) {
+            if (onCellular && selected == TrafficProfile.Stealth) {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "You are on mobile data right now.",

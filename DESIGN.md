@@ -467,7 +467,12 @@ constant.
 pacing at all; enabling it defaults to Adaptive mode):** **Adaptive** (the
 default mode once pacing is enabled, e.g. `profile = balanced`) paces only
 during activity plus a cooldown and goes quiet when genuinely idle — no
-bandwidth at rest, but coarse active-vs-idle reappears. **CBR** (e.g.
+bandwidth at rest, but coarse active-vs-idle reappears. Its cover is
+**budgeted** (`cover_budget_packets` per activity burst plus `cover_ratio` per real
+packet): filling every empty slot of the cooldown at the full ceiling, as the first
+versions did, cost megabytes per stray background packet on a phone (measured:
+tens of MB/min at idle) and starved a 150 Mbit/s uplink's ACKs. The trade-off is
+explicit: a smaller budget conceals the activity edges less. **CBR** (e.g.
 `profile = stealth`) streams at the configured rate 24/7 — strongest, but
 the rate is then a constant bandwidth floor *and* the throughput ceiling, so
 operators size `rate_pps × burst` to their link. In both modes the rate is

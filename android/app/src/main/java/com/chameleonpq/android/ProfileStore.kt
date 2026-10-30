@@ -10,13 +10,13 @@ enum class TrafficProfile(val key: String, val label: String, val blurb: String,
     Off("off", "Fastest", "No timing shaping. Full line speed, like WireGuard."),
     Balanced(
         "balanced", "Balanced", "Hides when you are active. Uploads capped at ~115 Mbit/s.",
-        warning = "Every bit of activity triggers a burst of cover traffic at full speed. Measured: tens of MB " +
-            "per minute even when idle, up to several GB per hour. Uses mobile data and battery.",
+        warning = "Adds a limited amount of cover traffic around activity (a few dozen KB per burst, about " +
+            "+25% on real traffic).",
     ),
     Throughput(
         "throughput", "High speed", "Hides timing at high speed. Uploads capped at ~460 Mbit/s.",
-        warning = "Cover bursts reach ~170 Mbit/s on the wire, more than most uplinks. On a ~150 Mbit/s line " +
-            "this can starve download ACKs: speed tests fail or fluctuate. Uses a lot of mobile data and battery.",
+        warning = "Same limited cover as Balanced, but uploads may run up to ~460 Mbit/s, more than most " +
+            "uplinks can carry. Prefer Balanced on a slow upload line.",
     ),
     Stealth(
         "stealth", "Max privacy", "Constant traffic around the clock, capped at ~5 Mbit/s.",
