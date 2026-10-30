@@ -177,6 +177,8 @@ Vorgefertigte Binaries hängen an jedem [Release](../../releases/latest):
   mit der Desktop-GUI (`chameleon-gui.exe`), dem CLI (`chameleon-pq.exe`), der
   Microsoft-signierten `wintun.dll`, einer Beispielkonfiguration und Hinweisen.
   Entpacken und starten — sonst nichts zu installieren.
+- **Android** — [`ChameleonPQ.apk`](../../releases/latest/download/ChameleonPQ.apk)
+  (Android 14+, arm64): siehe [Android-App](#android-app).
 - **Linux-Server** — `chameleon-pq_<Version>-1_amd64.deb` und
   `chameleon-pq-<Version>-1.x86_64.rpm`, gebaut für glibc ≥ 2.31 (getestet auf
   AlmaLinux 9.8 und Ubuntu 24.04): siehe [Server installieren](#server-installieren-linux).
@@ -241,6 +243,42 @@ Er ist im eigenständigen Windows-Bundle oben enthalten und baut auch aus dem
 Quellcode unter Linux/macOS mit `cargo build --release --manifest-path gui/Cargo.toml`.
 
 [iced]: https://iced.rs
+
+## Android-App
+
+<p align="center">
+  <img src="docs/android-main.jpg" alt="Chameleon-PQ unter Android — verbunden, Profil Balanced" width="250">
+  &nbsp;&nbsp;
+  <img src="docs/android-profiles.jpg" alt="Traffic-Profil-Auswahl und Kill-Switch-Hinweis" width="250">
+</p>
+
+Das Release enthält auch einen Android-Client,
+[`ChameleonPQ.apk`](../../releases/latest/download/ChameleonPQ.apk):
+
+- ein großer Ein/Aus-Knopf, Live-Geschwindigkeit (Down/Up), Verbindungsdauer und der
+  Server, mit dem verbunden ist;
+- eine **Traffic-Profil-Auswahl** (Fastest · Balanced · High speed · Max privacy), die
+  live umschaltet, ohne neu zu verbinden. Der Server folgt der Wahl des Clients
+  (`[traffic] follow_client_profile`, standardmäßig an), sodass beide Richtungen gleich
+  geformt werden — die Auswahl zeigt, was jedes Profil kostet;
+- die Sitzung bleibt bei WLAN ↔ Mobilfunk-Wechseln bestehen (der Server folgt dem
+  Handy an die neue Adresse), und fällt der Tunnel doch aus, verbindet die App neu,
+  **mit gesperrtem Datenverkehr**, statt ins offene Netz zu lecken;
+- ein Kill-Switch-Hinweis: Android lässt nur *dich* „Always-on VPN“ und „Verbindungen
+  ohne VPN blockieren“ einschalten; die App zeigt, ob es aktiv ist, und verlinkt auf
+  diese Einstellungsseite;
+- ein Diagnose-Log auf dem Gerät (mit Kopieren-Knopf).
+
+Installation: die `.apk` auf dem Handy öffnen („Installation aus unbekannten Quellen“
+für die öffnende App erlauben), dann deine `client-config.toml` importieren (aus
+`chameleon-pq init` oder `chameleon-pq setup`). Die Konfiguration enthält deine privaten
+Schlüssel und bleibt im privaten App-Speicher; sie ist nicht in der APK, und das
+Android-Backup ist aus.
+
+Benötigt **Android 14 oder neuer auf einem 64-Bit-ARM-Handy** und wurde bisher nur auf
+einem Gerät (Android 14) getestet. Die APK wird lokal vom Maintainer gebaut und
+signiert, nicht von der CI; ihre SHA-256 steht in den Release-Notes zum Prüfen des
+Downloads.
 
 ## Build
 
