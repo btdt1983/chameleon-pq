@@ -28,6 +28,25 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// The peer's current UDP endpoint, shared by every loop. Fixed for a client;
+/// on a server with [`TunnelParams::allow_roaming`] the inbound loop updates it
+/// when an authenticated packet arrives from a new address. Read once per send
+/// batch (not per packet), so the lock is not on any hot path.
+#[derive(Clone)]
+struct PeerAddr(Arc<std::sync::RwLock<SocketAddr>>);
+
+impl PeerAddr {
+    fn new(addr: SocketAddr) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(addr)))
+    }
+    fn get(&self) -> SocketAddr {
+        *self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn set(&self, addr: SocketAddr) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = addr;
+    }
+}
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
@@ -60,6 +79,11 @@ const SEND_PIPELINE_BATCHES: usize = 16;
 /// client UI wants (connect → tunnel runs in the background, UI stays alive).
 #[derive(Debug, Clone)]
 pub struct TunnelParams {
+    /// Server side only: follow the peer when an AEAD-authenticated packet
+    /// arrives from a new source address (phone switching wifi <-> mobile, or a
+    /// CGNAT rebinding), WireGuard-style. Off for clients: the server's address
+    /// is fixed.
+    pub allow_roaming: bool,
     pub batch_linger_us: u64,
     pub gso: bool,
     pub obf_enabled: bool,
@@ -89,6 +113,7 @@ impl TunnelParams {
             );
         }
         Self {
+            allow_roaming: false,
             batch_linger_us: cfg.engine.batch_linger_us,
             gso: cfg.engine.gso,
             obf_enabled: cfg.obfuscation.enabled,
@@ -198,7 +223,7 @@ async fn run_sequential_sender(
     >,
     socket: Arc<UdpSocket>,
     state: Arc<quinn_udp::UdpSocketState>,
-    peer: SocketAddr,
+    peer: PeerAddr,
     gso: bool,
 ) {
     use tokio::sync::oneshot::error::TryRecvError;
@@ -241,7 +266,8 @@ async fn run_sequential_sender(
             continue;
         }
         for (run, seg) in crate::udp::group_equal_sized(&wires) {
-            if let Err(e) = crate::udp::batch_send(&socket, &state, peer, run, seg, gso).await {
+            if let Err(e) = crate::udp::batch_send(&socket, &state, peer.get(), run, seg, gso).await
+            {
                 error!("UDP batch send (sequential): {e}");
             }
         }
@@ -288,6 +314,8 @@ pub async fn run_tunnel_loops(
         read_task,
         write_task,
     } = tun;
+    let allow_roaming = params.allow_roaming;
+    let peer = PeerAddr::new(peer);
     // Abort-on-drop guard: if this future is cancelled (Client::disconnect aborts
     // the task), stop the TUN read/write tasks too — the read task blocks on
     // read() and would otherwise keep the interface open, breaking the next
@@ -378,7 +406,7 @@ pub async fn run_tunnel_loops(
     let engine_out = engine.clone();
     let socket_out = socket.clone();
     let auth_out = auth.clone();
-    let peer_out = peer;
+    let peer_out = peer.clone();
     let rekeying_out = rekeying.clone();
     let state_out = sock_state.clone();
     let stats_out = stats.clone();
@@ -402,14 +430,20 @@ pub async fn run_tunnel_loops(
     {
         let socket_snd = socket.clone();
         let state_snd = sock_state.clone();
-        let peer_snd = peer;
+        let peer_snd = peer.clone();
         let gso_snd = gso;
         tasks.spawn(async move {
             while let Some(wires) = send_rx.recv().await {
                 for (run, seg) in crate::udp::group_equal_sized(&wires) {
-                    if let Err(e) =
-                        crate::udp::batch_send(&socket_snd, &state_snd, peer_snd, run, seg, gso_snd)
-                            .await
+                    if let Err(e) = crate::udp::batch_send(
+                        &socket_snd,
+                        &state_snd,
+                        peer_snd.get(),
+                        run,
+                        seg,
+                        gso_snd,
+                    )
+                    .await
                     {
                         error!("UDP batch send (pipeline): {e}");
                     }
@@ -428,7 +462,7 @@ pub async fn run_tunnel_loops(
         order_rx,
         socket.clone(),
         sock_state.clone(),
-        peer,
+        peer.clone(),
         gso,
     ));
     tasks.spawn(async move {
@@ -551,7 +585,7 @@ pub async fn run_tunnel_loops(
                         }
                         for (run, seg) in crate::udp::group_equal_sized(&slot) {
                             if let Err(e) =
-                                crate::udp::batch_send(&socket_out, &state_out, peer_out, run, seg, gso).await
+                                crate::udp::batch_send(&socket_out, &state_out, peer_out.get(), run, seg, gso).await
                             {
                                 error!("UDP batch send (paced): {e}");
                             }
@@ -587,6 +621,7 @@ pub async fn run_tunnel_loops(
                         let sessions_rk = engine_out.sessions().clone();
                         let hs_send_tx_rk = hs_send_tx.clone();
                         let socket_rk = socket_out.clone();
+                        let peer_rk = peer_out.get();
                         let hs_obf_rk = hs_obf;
                         let paced_now = paced;
                         let hs_rx_rk = hs_rx.clone();
@@ -597,7 +632,7 @@ pub async fn run_tunnel_loops(
                             let sink = if paced_now {
                                 HandshakeSink::Paced(&hs_send_tx_rk)
                             } else {
-                                HandshakeSink::Direct(&socket_rk, peer_out)
+                                HandshakeSink::Direct(&socket_rk, peer_rk)
                             };
                             // Held for the whole attempt: uncontended in
                             // practice (`rekeying_out` already caps this at
@@ -691,7 +726,7 @@ pub async fn run_tunnel_loops(
     let auth_in = auth.clone();
     let last_recv_in = last_recv.clone();
     let state_in = sock_state.clone();
-    let peer_in = peer;
+    let peer_in = peer.clone();
     let stats_in = stats.clone();
     tasks.spawn(async move {
         // Batched receive buffers (GRO): one syscall yields multiple
@@ -767,6 +802,12 @@ pub async fn run_tunnel_loops(
                     for (src, datagram, result) in results {
                         // 1) Data path (decrypted in parallel): handle directly.
                         if let Ok((ft, plain)) = result {
+                            // Authenticated (AEAD tag + replay window passed), so
+                            // the source address is genuine enough to follow.
+                            if allow_roaming && src != peer_in.get() {
+                                info!("peer roamed {} -> {src}", peer_in.get());
+                                peer_in.set(src);
+                            }
                             let now = now_secs();
                             last_recv_in.store(now, Ordering::Relaxed);
                             stats_in.last_recv_epoch.store(now, Ordering::Relaxed);
@@ -794,7 +835,7 @@ pub async fn run_tunnel_loops(
                         // allow reflection/amplification toward a victim and
                         // waste rekey crypto on noise. The data path above is
                         // already protected by the AEAD tag and need not be pinned.
-                        if src != peer_in {
+                        if src != peer_in.get() {
                             continue;
                         }
 
@@ -856,6 +897,10 @@ pub async fn run_tunnel_loops(
                                     frame.session_id, frame.sequence, &frame.payload)
                                 {
                                     Ok(plain) => {
+                                        if allow_roaming && src != peer_in.get() {
+                                            info!("peer roamed {} -> {src}", peer_in.get());
+                                            peer_in.set(src);
+                                        }
                                         trace!("inbound {} bytes -> TUN", plain.len());
                                         stats_in.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
                                         if to_tun.send(plain).await.is_err() { break 'inbound; }
@@ -916,7 +961,7 @@ pub async fn run_tunnel_loops(
     // arrived for too long. Runs as the third task alongside in/outbound.
     let socket_ka = socket.clone();
     let last_recv_ka = last_recv.clone();
-    let peer_ka = peer;
+    let peer_ka = peer.clone();
     let engine_ka = engine.clone();
     let obf_enabled_ka = params.obf_enabled;
     let pad_policy_ka: PadPolicy = params.padding;
@@ -956,7 +1001,7 @@ pub async fn run_tunnel_loops(
                 .ok()
             };
             if let Some(wire) = wire {
-                let _ = socket_ka.send_to(&wire, peer_ka).await;
+                let _ = socket_ka.send_to(&wire, peer_ka.get()).await;
             }
         }
     });
@@ -1036,7 +1081,7 @@ mod tests {
             order_rx,
             Arc::new(send_sock),
             state,
-            peer,
+            PeerAddr::new(peer),
             false, // gso off: one send per element, simplest to reason about
         ));
 
@@ -1261,5 +1306,139 @@ enabled = false
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn live_rekey_with_handshake_obfuscation_off() {
         live_rekey_completes_and_demux_runs(false).await;
+    }
+
+    /// Server-side roaming through the REAL tunnel loops: after the handshake
+    /// the client "moves" to a second socket (new source port, as after a
+    /// network change) and sends an authenticated packet from it. With
+    /// roaming on, the server must deliver it AND send its own traffic to the
+    /// new address from then on; with roaming off it must keep the original
+    /// address (the client case).
+    async fn roaming_scenario(allow_roaming: bool) {
+        use crate::crypto::Ed25519Auth;
+        use crate::net::{run_handshake_initiator, run_handshake_responder};
+        use crate::session::SessionManager;
+
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[identity]
+ed25519_seed_hex     = "0303030303030303030303030303030303030303030303030303030303030303"
+peer_ed25519_pub_hex = "0404040404040404040404040404040404040404040404040404040404040404"
+[network]
+bind_addr = "127.0.0.1:0"
+[tun]
+name = "test0"
+[obfuscation]
+enabled = true
+handshake = true
+[traffic]
+enabled = false
+"#,
+        )
+        .expect("test config parses");
+
+        let (s_seed, c_seed) = ([61u8; 32], [62u8; 32]);
+        let s_pub = Ed25519Auth::derive_public(&s_seed);
+        let c_pub = Ed25519Auth::derive_public(&c_seed);
+        let server_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&s_seed, c_pub).unwrap());
+        let client_auth: Arc<dyn Authenticator> =
+            Arc::new(Ed25519Auth::new(&c_seed, s_pub).unwrap());
+        let hs_obf_key = Some(crate::hsobf::derive_hs_obf_key(&s_pub, &c_pub, None));
+
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+
+        let (resp, init) = tokio::join!(
+            run_handshake_responder(&server_sock, server_auth.as_ref(), hs_obf_key.as_ref()),
+            run_handshake_initiator(
+                &client_a,
+                server_addr,
+                client_auth.as_ref(),
+                hs_obf_key.as_ref()
+            ),
+        );
+        let (server_session, addr_a) = resp.expect("responder handshake ok");
+        let client_session = init.expect("initiator handshake ok");
+        let client_sessions = SessionManager::new(client_session);
+
+        let (server_tun, mut server_handles) = TunPair::new_mock();
+        let (_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        let mut params = TunnelParams::from_config(&cfg);
+        params.allow_roaming = allow_roaming;
+        tokio::spawn(run_tunnel_loops(
+            server_sock.clone(),
+            Arc::new(CryptoEngine::new(
+                Arc::new(SessionManager::new(server_session)),
+                true,
+                PadPolicy::Bucketed,
+            )),
+            server_tun,
+            addr_a,
+            params,
+            server_auth.clone(),
+            hs_obf_key,
+            Arc::new(TunnelStats::default()),
+            traffic_rx,
+        ));
+
+        // Datagrams the server queued for A during/after the handshake are not
+        // what this test is about; drain them so only post-roaming traffic is
+        // judged below.
+        let mut scratch = [0u8; 2048];
+        while tokio::time::timeout(Duration::from_millis(300), client_a.recv_from(&mut scratch))
+            .await
+            .is_ok()
+        {}
+
+        // Authenticated Data packet from the NEW address (socket B).
+        let wire = client_sessions
+            .seal_obf(
+                FrameType::Data as u8,
+                b"hello from the new address",
+                PadPolicy::Bucketed,
+            )
+            .unwrap();
+        client_b.send_to(&wire, server_addr).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
+            .await
+            .expect("server delivers the packet")
+            .expect("channel open");
+        assert_eq!(&got[..], b"hello from the new address");
+
+        // Server -> client traffic: who receives it?
+        server_handles
+            .inject_tx
+            .send(Bytes::from_static(b"reply"))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (expect_sock, other_sock) = if allow_roaming {
+            (&client_b, &*client_a)
+        } else {
+            (&*client_a, &client_b)
+        };
+        tokio::time::timeout(Duration::from_secs(5), expect_sock.recv_from(&mut buf))
+            .await
+            .expect("server replies to the expected address")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), other_sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "reply must not also go to the other address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_follows_authenticated_peer_to_new_address() {
+        roaming_scenario(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_does_not_follow_a_new_source_address() {
+        roaming_scenario(false).await;
     }
 }

@@ -246,12 +246,14 @@ async fn run_server(
         // CLI server: no live re-profiling, but keep a sender alive for the
         // session so the outbound loop's control arm parks instead of erroring.
         let (_traffic_tx, traffic_rx) = watch::channel(cfg.traffic.effective());
+        let mut params = chameleon::tunnel_loops::TunnelParams::from_config(&cfg);
+        params.allow_roaming = true;
         chameleon::tunnel_loops::run_tunnel_loops(
             socket.clone(),
             engine,
             tun,
             peer,
-            chameleon::tunnel_loops::TunnelParams::from_config(&cfg),
+            params,
             auth.clone(),
             hs_obf,
             Arc::new(chameleon::tunnel_loops::TunnelStats::default()),
