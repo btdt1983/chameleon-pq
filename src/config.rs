@@ -422,6 +422,28 @@ pub enum TrafficProfile {
 }
 
 impl TrafficProfile {
+    /// One-byte id sent in a `FrameType::Profile` frame. `Custom` has none: its
+    /// raw fields live in the sender's own config and are not shared.
+    pub fn wire_id(self) -> Option<u8> {
+        match self {
+            TrafficProfile::Off => Some(0),
+            TrafficProfile::Balanced => Some(1),
+            TrafficProfile::Throughput => Some(2),
+            TrafficProfile::Stealth => Some(3),
+            TrafficProfile::Custom => None,
+        }
+    }
+
+    pub fn from_wire_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(TrafficProfile::Off),
+            1 => Some(TrafficProfile::Balanced),
+            2 => Some(TrafficProfile::Throughput),
+            3 => Some(TrafficProfile::Stealth),
+            _ => None,
+        }
+    }
+
     /// All profiles in fixed order — for UI selection lists (client GUI).
     pub const ALL: [TrafficProfile; 5] = [
         TrafficProfile::Stealth,
@@ -451,6 +473,8 @@ impl std::fmt::Display for TrafficProfile {
 /// applied. This is what the data path (`tunnel_loops`) actually uses.
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveTraffic {
+    /// The profile these parameters came from (announced to a following peer).
+    pub profile: TrafficProfile,
     pub enabled: bool,
     pub mode: TrafficMode,
     pub rate_pps: u32,
@@ -498,6 +522,13 @@ pub struct TrafficConfig {
     /// long transfer still gets proportional cover without ever exceeding it.
     #[serde(default = "default_cover_ratio")]
     pub cover_ratio: f32,
+    /// Server only: adopt the traffic profile the connected client announces,
+    /// so both directions are shaped the same way (the client alone only
+    /// shapes what it sends). The server's own `profile` is used until the
+    /// client announces one. A profile switch is rate-limited. Set to false to
+    /// keep the server's configured profile regardless of the client.
+    #[serde(default = "default_follow_client_profile")]
+    pub follow_client_profile: bool,
 }
 
 impl Default for TrafficConfig {
@@ -511,6 +542,7 @@ impl Default for TrafficConfig {
             cooldown_ms: default_cooldown_ms(),
             cover_budget_packets: default_cover_budget_packets(),
             cover_ratio: default_cover_ratio(),
+            follow_client_profile: default_follow_client_profile(),
         }
     }
 }
@@ -525,6 +557,7 @@ impl TrafficConfig {
         match self.profile {
             // 256×2 = 512 pps × ~1232 B ≈ 5 Mbit/s, constant.
             Stealth => EffectiveTraffic {
+                profile: self.profile,
                 enabled: true,
                 mode: TrafficMode::Cbr,
                 rate_pps: 256,
@@ -535,6 +568,7 @@ impl TrafficConfig {
             },
             // 3000×4 = 12k pps × ~1232 B ≈ 115 Mbit/s, only during activity.
             Balanced => EffectiveTraffic {
+                profile: self.profile,
                 enabled: true,
                 mode: TrafficMode::Adaptive,
                 rate_pps: 3000,
@@ -545,6 +579,7 @@ impl TrafficConfig {
             },
             // 6000×8 = 48k pps × ~1232 B ≈ 460 Mbit/s, only during activity.
             Throughput => EffectiveTraffic {
+                profile: self.profile,
                 enabled: true,
                 mode: TrafficMode::Adaptive,
                 rate_pps: 6000,
@@ -555,6 +590,7 @@ impl TrafficConfig {
             },
             // Pacer off — WireGuard-comparable (native timing/speed).
             Off => EffectiveTraffic {
+                profile: self.profile,
                 enabled: false,
                 mode: self.mode,
                 rate_pps: self.rate_pps,
@@ -565,6 +601,7 @@ impl TrafficConfig {
             },
             // Fully manual.
             Custom => EffectiveTraffic {
+                profile: self.profile,
                 enabled: self.enabled,
                 mode: self.mode,
                 rate_pps: self.rate_pps,
@@ -624,6 +661,9 @@ fn default_cover_budget_packets() -> u32 {
 }
 fn default_cover_ratio() -> f32 {
     0.25
+}
+fn default_follow_client_profile() -> bool {
+    true
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────
@@ -870,6 +910,7 @@ mod tests {
             cooldown_ms: 250,
             cover_budget_packets: 8,
             cover_ratio: 0.5,
+            follow_client_profile: true,
         };
         let e = t.effective();
         assert!(e.enabled && e.mode == TrafficMode::Cbr && e.rate_pps == 1234 && e.burst == 7);
