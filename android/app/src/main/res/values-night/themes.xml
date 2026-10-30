@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Chameleon" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0E1B14</item>
+        <item name="android:statusBarColor">#FF0E1B14</item>
+        <item name="android:navigationBarColor">#FF0E1B14</item>
+    </style>
+</resources>
