@@ -3,9 +3,12 @@ package com.chameleonpq.android
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,6 +16,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -49,7 +58,10 @@ class MainActivity : ComponentActivity() {
     private val vpnPrepareLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             DiagLog.log("activity: vpn prepare result=${result.resultCode}")
-            if (result.resultCode == RESULT_OK) startVpnService()
+            if (result.resultCode == RESULT_OK) {
+                startVpnService()
+                requestBatteryExemption()
+            }
         }
 
     private val importLauncher =
@@ -100,6 +112,7 @@ class MainActivity : ComponentActivity() {
             vpnPrepareLauncher.launch(prepareIntent)
         } else {
             startVpnService()
+            requestBatteryExemption()
         }
     }
 
@@ -107,6 +120,21 @@ class MainActivity : ComponentActivity() {
         val intent = Intent(this, ChameleonVpnService::class.java)
             .setAction(ChameleonVpnService.ACTION_DISCONNECT)
         startService(intent)
+    }
+
+    /** One-time ask to be exempt from battery optimisation (Doze freezes the tunnel with the screen off). */
+    private fun requestBatteryExemption() {
+        val pm = getSystemService(PowerManager::class.java)
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        try {
+            DiagLog.log("activity: requesting battery-optimisation exemption")
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    .setData(Uri.parse("package:$packageName")),
+            )
+        } catch (t: Throwable) {
+            DiagLog.log("activity: battery exemption request FAILED ${t.javaClass.simpleName}")
+        }
     }
 
     private fun startVpnService() {
@@ -151,6 +179,7 @@ private fun MainScreen(
 
         Text(
             when {
+                status.reconnecting -> "Reconnecting…"
                 status.connecting -> "Connecting…"
                 status.connected -> "Connected"
                 else -> "Disconnected"
@@ -171,10 +200,20 @@ private fun MainScreen(
         }
 
         Spacer(Modifier.height(16.dp))
+        val clipboard = LocalClipboardManager.current
+        val logScroll = rememberScrollState()
+        LaunchedEffect(diag.size, diag.lastOrNull()) { logScroll.scrollTo(logScroll.maxValue) }
         Text(
-            diag.takeLast(14).joinToString("\n"),
+            diag.joinToString("\n"),
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp)
+                .verticalScroll(logScroll),
         )
+        Button(onClick = { clipboard.setText(AnnotatedString(diag.joinToString("\n"))) }) {
+            Text("Copy log")
+        }
     }
 }
