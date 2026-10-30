@@ -106,7 +106,26 @@ fn androidize(cfg: &mut AppConfig) {
         cfg.tun.kill_switch = false;
     }
     cfg.tun.dns = effective_dns(&cfg.tun);
+
+    // A phone is never silent: background apps send small packets every few
+    // seconds, and each one starts an adaptive-profile cooldown during which
+    // EVERY empty slot is filled with cover at the profile's full ceiling
+    // (~7 MB per trigger at Balanced, ~29 MB at High speed). Measured on a
+    // real device that is tens of MB per minute at idle and enough to starve
+    // the uplink's ACKs. A shorter cooldown cuts that proportionally, at the
+    // price of a shorter smoothing tail after real activity.
+    if cfg.traffic.cooldown_ms > ANDROID_MAX_COOLDOWN_MS {
+        tracing::info!(
+            "traffic: cooldown {} ms -> {} ms on Android",
+            cfg.traffic.cooldown_ms,
+            ANDROID_MAX_COOLDOWN_MS
+        );
+        cfg.traffic.cooldown_ms = ANDROID_MAX_COOLDOWN_MS;
+    }
 }
+
+/// Upper bound for `[traffic] cooldown_ms` on Android (the core default is 500).
+const ANDROID_MAX_COOLDOWN_MS: u64 = 100;
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {

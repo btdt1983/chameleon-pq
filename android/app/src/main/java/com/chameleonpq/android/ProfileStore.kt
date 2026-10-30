@@ -8,11 +8,20 @@ import android.content.Context
  */
 enum class TrafficProfile(val key: String, val label: String, val blurb: String, val warning: String? = null) {
     Off("off", "Fastest", "No timing shaping. Full line speed, like WireGuard."),
-    Balanced("balanced", "Balanced", "Hides when you are active. Up to ~115 Mbit/s, silent when idle."),
-    Throughput("throughput", "High speed", "Hides timing at high speed. Up to ~460 Mbit/s, silent when idle."),
+    Balanced(
+        "balanced", "Balanced", "Hides when you are active. Uploads capped at ~115 Mbit/s.",
+        warning = "Every bit of activity triggers a burst of cover traffic at full speed. Measured: tens of MB " +
+            "per minute even when idle, up to several GB per hour. Uses mobile data and battery.",
+    ),
+    Throughput(
+        "throughput", "High speed", "Hides timing at high speed. Uploads capped at ~460 Mbit/s.",
+        warning = "Cover bursts reach ~170 Mbit/s on the wire, more than most uplinks. On a ~150 Mbit/s line " +
+            "this can starve download ACKs: speed tests fail or fluctuate. Uses a lot of mobile data and battery.",
+    ),
     Stealth(
         "stealth", "Max privacy", "Constant traffic around the clock, capped at ~5 Mbit/s.",
-        warning = "Sends cover traffic all the time while connected: uses mobile data and battery.",
+        warning = "Sends cover traffic all the time while connected and slows downloads to ~5-10 Mbit/s. " +
+            "Uses mobile data and battery.",
     ),
 }
 
