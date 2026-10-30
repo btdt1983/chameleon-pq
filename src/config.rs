@@ -456,6 +456,10 @@ pub struct EffectiveTraffic {
     pub rate_pps: u32,
     pub burst: u16,
     pub cooldown_ms: u64,
+    /// Adaptive only: cover packets allowed per activity burst ("trigger").
+    pub cover_budget_packets: u32,
+    /// Adaptive only: extra cover packets earned per real packet sent.
+    pub cover_ratio: f32,
 }
 
 /// `[traffic]` section: constant-rate pacing + cover traffic against timing
@@ -482,6 +486,18 @@ pub struct TrafficConfig {
     /// Adaptive: how long cover keeps running after the last real packet (ms).
     #[serde(default = "default_cooldown_ms")]
     pub cooldown_ms: u64,
+    /// Adaptive only: how many cover packets one activity burst (a "trigger":
+    /// the first real packet after the tunnel was idle) may start, at most.
+    /// Without a limit every empty slot during the cooldown is filled at the
+    /// profile's full ceiling, which costs megabytes per stray background
+    /// packet. 0 = no cover beyond what `cover_ratio` earns.
+    #[serde(default = "default_cover_budget_packets")]
+    pub cover_budget_packets: u32,
+    /// Adaptive only: extra cover packets earned per real packet sent in the
+    /// same activity burst (0.25 = at most +25% on top of real traffic), so a
+    /// long transfer still gets proportional cover without ever exceeding it.
+    #[serde(default = "default_cover_ratio")]
+    pub cover_ratio: f32,
 }
 
 impl Default for TrafficConfig {
@@ -493,6 +509,8 @@ impl Default for TrafficConfig {
             rate_pps: default_rate_pps(),
             burst: default_burst(),
             cooldown_ms: default_cooldown_ms(),
+            cover_budget_packets: default_cover_budget_packets(),
+            cover_ratio: default_cover_ratio(),
         }
     }
 }
@@ -512,6 +530,8 @@ impl TrafficConfig {
                 rate_pps: 256,
                 burst: 2,
                 cooldown_ms: cd,
+                cover_budget_packets: self.cover_budget_packets,
+                cover_ratio: self.cover_ratio,
             },
             // 3000×4 = 12k pps × ~1232 B ≈ 115 Mbit/s, only during activity.
             Balanced => EffectiveTraffic {
@@ -520,6 +540,8 @@ impl TrafficConfig {
                 rate_pps: 3000,
                 burst: 4,
                 cooldown_ms: cd,
+                cover_budget_packets: self.cover_budget_packets,
+                cover_ratio: self.cover_ratio,
             },
             // 6000×8 = 48k pps × ~1232 B ≈ 460 Mbit/s, only during activity.
             Throughput => EffectiveTraffic {
@@ -528,6 +550,8 @@ impl TrafficConfig {
                 rate_pps: 6000,
                 burst: 8,
                 cooldown_ms: cd,
+                cover_budget_packets: self.cover_budget_packets,
+                cover_ratio: self.cover_ratio,
             },
             // Pacer off — WireGuard-comparable (native timing/speed).
             Off => EffectiveTraffic {
@@ -536,6 +560,8 @@ impl TrafficConfig {
                 rate_pps: self.rate_pps,
                 burst: self.burst,
                 cooldown_ms: cd,
+                cover_budget_packets: self.cover_budget_packets,
+                cover_ratio: self.cover_ratio,
             },
             // Fully manual.
             Custom => EffectiveTraffic {
@@ -544,6 +570,8 @@ impl TrafficConfig {
                 rate_pps: self.rate_pps,
                 burst: self.burst,
                 cooldown_ms: cd,
+                cover_budget_packets: self.cover_budget_packets,
+                cover_ratio: self.cover_ratio,
             },
         }
     }
@@ -589,6 +617,13 @@ fn default_burst() -> u16 {
 }
 fn default_cooldown_ms() -> u64 {
     500
+}
+/// ~79 KB of cover per trigger at 1232 B per packet.
+fn default_cover_budget_packets() -> u32 {
+    64
+}
+fn default_cover_ratio() -> f32 {
+    0.25
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────
@@ -833,6 +868,8 @@ mod tests {
             rate_pps: 1234,
             burst: 7,
             cooldown_ms: 250,
+            cover_budget_packets: 8,
+            cover_ratio: 0.5,
         };
         let e = t.effective();
         assert!(e.enabled && e.mode == TrafficMode::Cbr && e.rate_pps == 1234 && e.burst == 7);

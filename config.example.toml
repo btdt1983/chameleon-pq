@@ -115,3 +115,8 @@ mode     = "adaptive"
 rate_pps = 256      # emission slots per second
 burst    = 2        # packets per slot (rate = rate_pps × burst)
 cooldown_ms = 500   # adaptive: cover lasts this long after the last real packet
+# Adaptive cover is BUDGETED, not filled to the ceiling (an unbudgeted cooldown
+# costs megabytes per stray background packet and can starve a slow uplink):
+cover_budget_packets = 64    # cover packets one activity burst may start (~79 KB)
+cover_ratio          = 0.25  # extra cover earned per real packet in the same burst
+#                              (0 and 0 = pace only, no cover; use cbr for constant rate)

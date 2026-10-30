@@ -13,7 +13,7 @@ use crate::frame::{Frame, FrameType};
 use crate::hsobf;
 use crate::net::HandshakeSink;
 use crate::obf::PadPolicy;
-use crate::pacer::{Emit, Pacer, ShapeMode};
+use crate::pacer::{CoverBudget, Emit, Pacer, ShapeMode};
 use crate::rekey::{
     handshake_channel, rekey_as_initiator, rekey_as_responder, rekey_responder_confirm,
     schedule_retire,
@@ -93,6 +93,8 @@ pub struct TunnelParams {
     pub rate_pps: u32,
     pub burst: u16,
     pub cooldown_ms: u64,
+    pub cover_budget_packets: u32,
+    pub cover_ratio: f32,
 }
 
 impl TunnelParams {
@@ -123,6 +125,8 @@ impl TunnelParams {
             rate_pps: t.rate_pps,
             burst: t.burst,
             cooldown_ms: t.cooldown_ms,
+            cover_budget_packets: t.cover_budget_packets,
+            cover_ratio: t.cover_ratio,
         }
     }
 }
@@ -391,6 +395,10 @@ pub async fn run_tunnel_loops(
     let pace_slot = Duration::from_micros(1_000_000u64 / params.rate_pps.max(1) as u64);
     let pace_burst = params.burst.max(1) as usize;
     let pace_cooldown = Duration::from_millis(params.cooldown_ms);
+    let pace_budget = CoverBudget {
+        per_trigger: params.cover_budget_packets,
+        ratio: params.cover_ratio,
+    };
 
     // Shared GSO/GRO state for batched UDP I/O (quinn-udp). Rarely fails;
     // on a kernel without GSO/GRO quinn-udp falls back to per-packet on its own.
@@ -487,7 +495,7 @@ pub async fn run_tunnel_loops(
         // ticks it couldn't make and stays on the original schedule instead.
         let mut tick = interval(if paced { pace_slot } else { linger });
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut pacer = Pacer::new(pace_mode, pace_cooldown);
+        let mut pacer = Pacer::new(pace_mode, pace_cooldown, pace_budget);
         // Live-reconfigurable pacing state: a `traffic_rx` change (e.g. a GUI
         // profile switch) recomputes these without tearing down the tunnel.
         let mut paced = paced;
@@ -708,7 +716,14 @@ pub async fn run_tunnel_loops(
                         pace_burst = eff.burst.max(1) as usize;
                         tick = interval(if paced { new_slot } else { linger });
                         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                        pacer = Pacer::new(new_mode, Duration::from_millis(eff.cooldown_ms));
+                        pacer = Pacer::new(
+                            new_mode,
+                            Duration::from_millis(eff.cooldown_ms),
+                            CoverBudget {
+                                per_trigger: eff.cover_budget_packets,
+                                ratio: eff.cover_ratio,
+                            },
+                        );
                         info!(
                             "live traffic switch: {} ({} pps)",
                             if paced { "paced" } else { "off" },
