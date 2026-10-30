@@ -18,7 +18,7 @@
 //! that queues or replaces.
 
 use chameleon::client::{build_auth, Client};
-use chameleon::config::AppConfig;
+use chameleon::config::{AppConfig, TrafficConfig, TrafficProfile};
 use chameleon::ChameleonError;
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
@@ -29,6 +29,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
+/// Traffic profile chosen in the UI. Wins over `[traffic] profile` in the
+/// imported config: the app, not the TOML, is where a user picks it. Survives
+/// across (re)connects.
+static PROFILE_OVERRIDE: Mutex<Option<TrafficProfile>> = Mutex::new(None);
+/// `[traffic]` section of the running session, so a live profile switch keeps
+/// its other fields (cooldown). `None` while disconnected.
+static TRAFFIC: Mutex<Option<TrafficConfig>> = Mutex::new(None);
 static LOG_INIT: std::sync::Once = std::sync::Once::new();
 
 fn runtime() -> &'static tokio::runtime::Runtime {
@@ -187,6 +194,9 @@ fn native_start_inner(fd: i32, config_toml: &str) -> chameleon::Result<()> {
 
     let mut cfg = AppConfig::from_toml_str(config_toml)?;
     androidize(&mut cfg);
+    if let Some(p) = *PROFILE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) {
+        cfg.traffic.profile = p;
+    }
     let server = cfg
         .network
         .server_addr
@@ -200,6 +210,7 @@ fn native_start_inner(fd: i32, config_toml: &str) -> chameleon::Result<()> {
     let auth = build_auth(&cfg)?;
     let client = runtime().block_on(Client::connect(&cfg, server, auth, tun))?;
 
+    *TRAFFIC.lock().unwrap_or_else(|p| p.into_inner()) = Some(cfg.traffic.clone());
     *CLIENT.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(client));
     Ok(())
 }
@@ -245,6 +256,7 @@ pub extern "system" fn Java_com_chameleonpq_android_NativeBridge_nativeStart<'lo
 /// `pfd.close()` MUST wait for this to return before closing the fd (see
 /// `TunPair::from_raw_fd`'s doc for why).
 fn native_stop_inner() {
+    *TRAFFIC.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let client = CLIENT.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(client) = client {
         runtime().block_on(client.disconnect_and_wait());
@@ -264,6 +276,67 @@ pub extern "system" fn Java_com_chameleonpq_android_NativeBridge_nativeStop<'loc
             "java/lang/RuntimeException",
             format!("internal error: {msg}"),
         );
+    }
+}
+
+// ── nativeSetProfile ─────────────────────────────────────────────────────
+
+/// Config-file spelling of a profile (what the UI sends). `custom` is not
+/// offered in the app.
+fn parse_profile(name: &str) -> Option<TrafficProfile> {
+    match name {
+        "off" => Some(TrafficProfile::Off),
+        "balanced" => Some(TrafficProfile::Balanced),
+        "throughput" => Some(TrafficProfile::Throughput),
+        "stealth" => Some(TrafficProfile::Stealth),
+        _ => None,
+    }
+}
+
+/// Remembers the profile for the next connect and, if a tunnel is running,
+/// applies it live (same path as the desktop GUI: `Client::set_traffic`).
+fn native_set_profile_inner(name: &str) -> chameleon::Result<()> {
+    let profile = parse_profile(name)
+        .ok_or_else(|| config_error(format!("unknown traffic profile '{name}'")))?;
+    *PROFILE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = Some(profile);
+
+    let client = CLIENT.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let mut traffic = TRAFFIC.lock().unwrap_or_else(|p| p.into_inner());
+    if let (Some(client), Some(tc)) = (client, traffic.as_mut()) {
+        tc.profile = profile;
+        client.set_traffic(tc.effective());
+        tracing::info!("traffic profile changed live: {name}");
+    }
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_chameleonpq_android_NativeBridge_nativeSetProfile<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    profile: JString<'local>,
+) {
+    init_logging();
+    let name: String = match env.get_string(&profile) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("bad string arg: {e}"));
+            return;
+        }
+    };
+    match catch_unwind(AssertUnwindSafe(|| native_set_profile_inner(&name))) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
+        }
+        Err(payload) => {
+            let msg = panic_message(&*payload);
+            tracing::error!("panic in nativeSetProfile: {msg}");
+            let _ = env.throw_new(
+                "java/lang/RuntimeException",
+                format!("internal error: {msg}"),
+            );
+        }
     }
 }
 

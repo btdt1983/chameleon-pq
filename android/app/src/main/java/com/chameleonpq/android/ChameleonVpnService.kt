@@ -50,6 +50,7 @@ class ChameleonVpnService : VpnService() {
     companion object {
         const val ACTION_CONNECT = "com.chameleonpq.android.CONNECT"
         const val ACTION_DISCONNECT = "com.chameleonpq.android.DISCONNECT"
+        const val ACTION_SET_PROFILE = "com.chameleonpq.android.SET_PROFILE"
         private const val NOTIFICATION_CHANNEL_ID = "chameleon_vpn"
         private const val NOTIFICATION_ID = 1
         private val RECONNECT_BACKOFF_SECS = intArrayOf(2, 5, 10, 15, 20, 30)
@@ -83,6 +84,18 @@ class ChameleonVpnService : VpnService() {
         DiagLog.log("service: onStartCommand action=${intent?.action}")
         if (intent?.action == ACTION_DISCONNECT) {
             stopTunnel()
+        } else if (intent?.action == ACTION_SET_PROFILE) {
+            // Live switch while connected; the choice itself is already saved
+            // by the UI and is re-applied on every (re)connect in connectOnce.
+            val profile = ProfileStore.get(this)
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    NativeBridge.nativeSetProfile(profile.key)
+                    DiagLog.log("profile: now ${profile.key}")
+                } catch (t: Throwable) {
+                    DiagLog.log("profile: FAILED ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
         } else {
             startTunnel()
         }
@@ -164,6 +177,8 @@ class ChameleonVpnService : VpnService() {
         NativeBridge.nativeStop()
         val configToml = ConfigStore.readConfig(this@ChameleonVpnService)
             ?: error("no config imported")
+        // The profile chosen in the UI wins over the config's, on every (re)connect.
+        NativeBridge.nativeSetProfile(ProfileStore.get(this@ChameleonVpnService).key)
         // Reconnects reuse the tun established by the first attempt (see
         // `supervise`): only a missing tun gets (re)built here.
         pfd?.let { existing ->

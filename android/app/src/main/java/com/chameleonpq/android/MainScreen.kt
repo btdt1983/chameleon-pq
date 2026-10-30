@@ -12,6 +12,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -69,6 +71,8 @@ fun AppRoot(
     hasConfig: Boolean,
     importResult: String?,
     serverAddr: String?,
+    profile: TrafficProfile,
+    onProfile: (TrafficProfile) -> Unit,
     onImport: () -> Unit,
     onToggleConnection: (currentlyActive: Boolean) -> Unit,
 ) {
@@ -77,7 +81,7 @@ fun AppRoot(
         BackHandler { showDiag = false }
         DiagnosticsScreen(onBack = { showDiag = false })
     } else {
-        MainScreen(hasConfig, importResult, serverAddr, onImport, onToggleConnection, onShowDiagnostics = { showDiag = true })
+        MainScreen(hasConfig, importResult, serverAddr, profile, onProfile, onImport, onToggleConnection, onShowDiagnostics = { showDiag = true })
     }
 }
 
@@ -86,6 +90,8 @@ private fun MainScreen(
     hasConfig: Boolean,
     importResult: String?,
     serverAddr: String?,
+    profile: TrafficProfile,
+    onProfile: (TrafficProfile) -> Unit,
     onImport: () -> Unit,
     onToggleConnection: (currentlyActive: Boolean) -> Unit,
     onShowDiagnostics: () -> Unit,
@@ -162,6 +168,9 @@ private fun MainScreen(
                 }
             }
         }
+
+        Spacer(Modifier.height(12.dp))
+        ProfileCard(profile, onProfile)
 
         if (status.connected || status.reconnecting) {
             Spacer(Modifier.height(12.dp))
@@ -261,6 +270,30 @@ private fun Stat(label: String, value: String, modifier: Modifier = Modifier) {
     Column(modifier) {
         Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Medium)
+    }
+}
+
+/** Traffic-profile picker; a change applies live when connected (see ChameleonVpnService). */
+@Composable
+private fun ProfileCard(selected: TrafficProfile, onSelect: (TrafficProfile) -> Unit) {
+    Card {
+        Text("Traffic profile", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (p in TrafficProfile.values()) {
+                FilterChip(
+                    selected = p == selected,
+                    onClick = { onSelect(p) },
+                    label = { Text(p.label) },
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(selected.blurb, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        selected.warning?.let {
+            Spacer(Modifier.height(4.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall, color = StatusColors.Busy)
+        }
     }
 }
 
