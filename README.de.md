@@ -135,7 +135,7 @@ Bekannte Einschränkungen des Geltungsbereichs:
   Modus** (`traffic.enabled = false`); mit Timing-Shaping an (Standard) begrenzt
   die Rate den Durchsatz — Geschwindigkeit und Timing-Verschleierung sind
   gegensätzliche Dimensionen, zwischen denen man wählt
-- 84 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
+- 137 Tests, die Handshake (inkl. gegenseitiger Auth + Fragmentierung),
   hybride ML-DSA-Auth (und dass ein falscher PQ-Schlüssel scheitert, selbst
   wenn Ed25519 passt), AEAD-Aushandlung und AEGIS-Sessions, Associated-Data-
   Header-Bindung, Datenpfad, Replay (inkl. weitem Reordering), MITM (beide
@@ -236,7 +236,10 @@ einen nativen Desktop-Client, **chameleon-gui**, in reinem Rust mit [iced] gebau
 - ein Dark-Theme mit dem Chamäleon-Logo und passendem Taskleisten-Symbol;
 - `config.toml` auswählen, verbinden / trennen und den Live-Status verfolgen;
 - ein übersichtlicher Traffic-Profil-Auswähler (Maximum Privacy · Balanced · High
-  Speed · Fastest) und ein integriertes Log — ohne Konsolenfenster im Hintergrund;
+  Speed · Fastest) mit einer Hinweiszeile darunter, die sagt, was das gewählte
+  Profil verbirgt und was es kostet (z. B. ist Balanced auf ~118 Mbit/s je
+  Richtung begrenzt, Maximum Privacy auf ~5 Mbit/s), plus ein integriertes Log —
+  ohne Konsolenfenster im Hintergrund;
 - ein Link direkt zu diesem Repository in der Kopfzeile.
 
 Er ist im eigenständigen Windows-Bundle oben enthalten und baut auch aus dem

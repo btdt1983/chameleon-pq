@@ -244,7 +244,7 @@ line rate. Each is measured, not assumed.
    reactor/TUN.
 
 **Scope, stated plainly:** the parallel path only helps the *unpaced* fast
-path (`traffic.enabled = false`). With timing/cover shaping on (the default,
+path (`profile = off`, the default). With timing/cover shaping on (opt-in,
 §9a) the configured `rate_pps × burst` caps throughput on purpose, so the
 crypto is not the bound and the paced path stays single-threaded to keep its
 exact rate/burst/size guarantee. Raw speed and timing-analysis resistance are
