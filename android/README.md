@@ -1,8 +1,8 @@
 # Chameleon-PQ for Android
 
-MVP Android client. See `/root/.claude/plans/nifty-enchanting-crab.md` (or the
-git history around this directory's introduction) for the full design —
-this file only covers what's needed to build and run it.
+Android client for Chameleon-PQ. The git history around this directory's
+introduction has the full design; this file only covers what's needed to build
+and run it.
 
 ## Layout
 
