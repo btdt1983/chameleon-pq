@@ -133,7 +133,7 @@ Known scope limits:
   `profile = "off"`); with timing-shaping on (opt-in) the configured rate caps
   throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 111 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 137 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
@@ -239,7 +239,9 @@ desktop client, **chameleon-gui**, built in pure Rust with [iced]:
 - a dark theme with the chameleon logo and a matching taskbar icon;
 - pick your `config.toml`, connect / disconnect, and watch live status;
 - a friendly traffic-profile selector (Maximum Privacy · Balanced · High Speed ·
-  Fastest) and an in-app log — with no console window in the background;
+  Fastest) with a one-line hint under it saying what the chosen profile hides and
+  what it costs (e.g. Balanced is capped at ~118 Mbit/s each way, Maximum Privacy
+  at ~5 Mbit/s), plus an in-app log — with no console window in the background;
 - a link straight to this repository from the header.
 
 It's included in the self-contained Windows bundle above, and also builds from

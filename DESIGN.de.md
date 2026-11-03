@@ -16,15 +16,27 @@ Entscheidungen nachvollziehen können, statt sie erraten zu müssen.
 
 ## 1. Bedrohungsmodell & Geltungsbereich
 
-Chameleon-PQ zielt auf **Site-to-Site-Tunnel zwischen bekannten Endpunkten**
-ab – Infrastruktur-zu-Infrastruktur-Verkehr, bei dem die Peers vorab mit
-vorab geteilten Identitäten konfiguriert werden. Es ist *nicht* als
-Anonymitätsdienst für Endnutzer konzipiert (wie bei kommerziellen
-VPN-Anbietern).
+Chameleon-PQ zielt auf **Site-to-Site-Tunnel zwischen bekannten,
+vorkonfigurierten Endpunkten** ab – Infrastruktur-zu-Infrastruktur-Verkehr
+oder ein persönlicher Client, der sich mit einem Server verbindet, den
+derselbe Betreiber kontrolliert, wobei beide Peers die Identität des anderen
+bereits kennen (Ed25519-/ML-DSA-Public-Keys, abgeglichen über
+`chameleon-pq init`). Es ist *kein* Anonymitätsnetzwerk: es gibt kein
+Multi-Hop-Routing, kein Verbergen der Tunnel-Endpunkte voreinander und keinen
+Schutz, falls der Betreiber der Gegenseite böswillig ist oder zur
+Zusammenarbeit gezwungen wird – man muss demjenigen vertrauen, der die andere
+Seite betreibt, genau wie bei jeder selbst gehosteten WireGuard-Installation.
+Der GUI-Client und seine Full-Tunnel-Funktionen (Kill-Switch,
+DNS-Leak-Schutz – siehe „Seit dem ersten Entwurf gelöst“ unten) machen diese
+vorkonfigurierte Verbindung für einen einzelnen Nutzer *praktikabel*; sie
+ändern dieses Vertrauensmodell nicht.
 
 Berücksichtigte Angreifer:
-- **Passiver Netzwerkbeobachter** – kann den gesamten Chiffretext lesen.
-  Abgewehrt durch AEAD-Verschlüsselung des Datenpfads.
+- **Passiver Netzwerkbeobachter** – kann den gesamten Chiffretext lesen und,
+  ohne die unten beschriebenen Gegenmaßnahmen, auch Datagramm-Formen/-Größen
+  und das Paket-Timing. Abgewehrt durch AEAD-Verschlüsselung des Datenpfads
+  sowie (§9) Verschleierung von Datenpfad und Handshake-Hülle und (§9a,
+  optional) Constant-Rate-Timing-Shaping.
 - **Aktiver Man-in-the-Middle** – kann einschleusen, verwerfen, umordnen,
   wiederholen (Replay). Abgewehrt durch authentifizierten Handshake +
   Replay-Schutz.
@@ -36,9 +48,13 @@ Berücksichtigte Angreifer:
   Quantenangriff standhalten, der *später* gegen *heute* aufgezeichneten
   Verkehr geführt wird.
 
-Ausdrücklich **außerhalb des Geltungsbereichs** für den Moment:
-Widerstandsfähigkeit gegen Verkehrsanalyse über längenfeste, aufgefüllte
-Handshakes hinaus sowie Schutz gegen einen kompromittierten Endpunkt.
+Ausdrücklich **außerhalb des Geltungsbereichs**: Schutz gegen einen
+kompromittierten Endpunkt (jeder der beiden Peers). Verkehrsanalyse-Resistenz
+ist *teilweise* vorhanden – weder außerhalb des Geltungsbereichs noch
+vollständig (§9/§9a mildern Form, Größe und – optional – Timing; die Existenz
+und Dauer des Tunnels sowie der initiale Handshake-Burst vor dem Pacer sind
+konstruktionsbedingt nicht erreichbar). Die aktuelle, vollständige Liste des
+noch Offenen steht in „Zusammenfassung der ehrlichen Einschränkungen“.
 
 ---
 
@@ -190,6 +206,83 @@ Quantensicherheit.
 
 ---
 
+## 4a. Durchsatz: automatische Chiffrenwahl, gebündelte I/O, Multi-Core-Krypto
+
+Keine der folgenden Änderungen berührt das Wire-Format oder die Krypto – sie
+beseitigen lediglich die drei Obergrenzen zwischen dem ausgehandelten AEAD und
+der tatsächlichen Leitungsgeschwindigkeit. Jede ist gemessen, nicht
+angenommen.
+
+1. **Die automatische Chiffrenwahl ist ein Benchmark, nicht nur ein
+   Feature-Flag.** Die AES-*NI*-Erkennung (§4) ist notwendig, aber nicht
+   hinreichend: Auf einer CPU mit AES-NI, aber schmalem SIMD (z. B. Westmere,
+   AES-NI ohne AVX) greift der Schnellpfad der `aegis`-Crate nicht, und AEGIS
+   läuft um eine Größenordnung *langsamer* als ChaCha20. Daher führt
+   `preferred()` beim Start einen einmaligen Mikro-Benchmark aus (einen festen
+   Puffer unter jeder Chiffre vielfach versiegeln) und wählt, was auf dieser
+   Hardware tatsächlich schneller ist; ohne AES-NI bleibt es bei ChaCha20.
+   Aushandlung und Transcript-Bindung oben bleiben unverändert – der
+   Benchmark entscheidet nur über die *Präferenz* dieses Knotens.
+2. **Gebündelte UDP-I/O (GSO/GRO).** Der Syscall pro Paket
+   (`sendto`/`recvmmsg`) ist die erste Mauer: Ein Mikro-Benchmark erreicht bei
+   einem Datagramm nach dem anderen nur etwa ~0,18 Mpps. `udp.rs` kapselt
+   `quinn-udp`, um viele Datagramme mit UDP-GSO beim Senden in einen Syscall
+   zu bündeln und sie per GRO beim Empfangen zusammenzufassen (Fallback auf
+   Einzelpakete bei alten Kernels / außerhalb von Linux); der Sendepfad steigt
+   damit auf ~9,6 Mpps. Keine Wire-Änderung: GSO-Segmente sind auf der Leitung
+   gewöhnliche Datagramme. **GSO-beim-Senden ist standardmäßig AUS**
+   (`[engine].gso = false`): Auf manchen Pfaden (ein Hyper-V-vSwitch oder
+   NIC-Offload, das Linux-GSO nicht durchreicht) verursachten gesegmentierte
+   Sendungen in Tests massiven Paketverlust. Das Senden einzelner Pakete ist
+   überall korrekt und der ausgelieferte Standard; GSO ist ein explizites
+   Opt-in für einen nachweislich sauberen Linux↔Linux-Pfad.
+   GRO-beim-Empfangen ist davon nicht betroffen.
+3. **Multi-Core-Seal/Open, Pipeline nach dem Vorbild von wireguard-go.** Ist
+   die Syscall-Mauer weg, ist die nächste Grenze das AEAD auf einem Kern
+   (~2 Gbit/s Seal/Open mit Obfuskation) – die Krypto lief in einem
+   Outbound- und einem Inbound-Task. `engine.rs` versiegelt/öffnet nun einen
+   GSO/GRO-Batch **parallel auf allen Kernen** mit rayon
+   (`encrypt_batch_par` / `decrypt_batch_par`). Outbound folgt der eigenen
+   Geräte-Pipeline von wireguard-go statt einer Batch-Größen-Schwelle (ein
+   früheres Schwellen-Design blieb hinter den Erwartungen zurück und lieferte
+   in einer Iteration einen echten Reihenfolgefehler aus): `tunnel_loops.rs`
+   reserviert den gesamten AEAD-Zählerbereich des Batches im Voraus – ein
+   einziges atomares `fetch_add`, das die Wire-Reihenfolge festlegt, bevor
+   irgendeine parallele Arbeit beginnt –, schickt das Versiegeln an den
+   warmen rayon-Pool (`rayon::spawn`, in einen bereits laufenden Pool
+   eingespeist, anders als die Thread-Pool-Übergabe von `spawn_blocking`),
+   und ein dedizierter sequenzieller Sender-Task leert fertige Batches strikt
+   in Reservierungsreihenfolge, bevor er auf den Socket schreibt – die
+   Zählerreihenfolge auf der Leitung hängt also nie davon ab, welcher Batch
+   zuerst fertig versiegelt ist. Inbound überspringt den Ordnungsschritt
+   ganz – Replay-Fenster (§6) und TUN-Schreibreihenfolge vertragen beide
+   Umordnung –, entschlüsselte Batches werden daher sofort nach Abschluss
+   verarbeitet. Jeder `rayon::spawn`-Job läuft durch einen
+   `catch_unwind`-Schutz (`rayon_spawn_guarded`): Der Job-Typ von rayon hat
+   kein eigenes `catch_unwind`, ein entweichender Panic würde sonst
+   `std::process::abort()` aufrufen und den ganzen Serverprozess beenden,
+   nicht nur eine Session. Weiterhin sicher und ohne Änderung der Krypto: Der
+   Tx-Zähler wird atomar reserviert (ein eindeutiger, lückenloser
+   Nonce-Bereich pro Batch, §5), `decrypt` öffnet **lock-frei**, und nur die
+   billige Prüfung/Übernahme nimmt den Replay-`Mutex` pro Session; das
+   2048-Einträge-Fenster (§6) fängt jede Umordnung durch parallelen Abschluss
+   auf der Inbound-Seite ab. `Session`/`SessionManager` sind
+   `Send + Sync`, sodass `Arc<SessionManager>` direkt aus N rayon-Workern
+   versiegelt. Gemessen ~4,5× (Seal) / ~13× (Open) auf einer Maschine mit
+   12 Threads. Betreiber können den Pool mit `[engine].workers` begrenzen
+   (0 = auto = alle Kerne), um Kerne für Reactor/TUN freizuhalten.
+
+**Der Geltungsbereich, klar gesagt:** Der parallele Pfad hilft nur dem
+*ungepacten* Schnellpfad (`profile = off`, Standard). Ist Timing-/Cover-Shaping
+aktiv (Opt-in, §9a), begrenzt das konfigurierte `rate_pps × burst` den
+Durchsatz absichtlich, die Krypto ist dann nicht die Grenze, und der gepacte
+Pfad bleibt single-threaded, um seine exakte Rate-/Burst-/Größen-Garantie zu
+halten. Rohgeschwindigkeit und Resistenz gegen Timing-Analyse sind gegenläufige
+Dimensionen; dieses Design lässt die Wahl, es tut nicht so, als bekäme man
+beides gleichzeitig.
+
+---
+
 ## 5. Nonce-Verwaltung
 
 **Entscheidung:** Jede Richtung erhält eine 96-Bit-Nonce, aufgebaut aus einem
@@ -314,9 +407,13 @@ nicht in ein einzelnes MTU-sicheres Datagramm packen – das ist der PQ-Krypto
 inhärent, kein Designfehler. Der Handshake ist ein einmaliges Ereignis pro
 Session, daher kosten dort einige Fragmente nichts Nennenswertes. Der
 Datenpfad bleibt unter der MTU. Mit der nun integrierten hybriden
-ML-DSA-Signatur (§3) ist `HANDSHAKE_MSG_LEN` 8192, und eine Nachricht
-erstreckt sich über acht Fragmente – für einen einmaligen Handshake
-unproblematisch.
+ML-DSA-Signatur (§3) ist `HANDSHAKE_MSG_LEN` 8192, was auf dieser Ebene acht
+Fragmente zu je ~1032 Byte bedeutet – für einen einmaligen Handshake
+unproblematisch. (Das ist die Fragmentierung *vor* der Verschleierung. Die
+Handshake-Verschleierung ist standardmäßig an – siehe unten und §9 – und
+fragmentiert die versiegelte Nachricht in eine variable, zufällige Anzahl und
+Größe von Fragmenten neu, sodass die Leitung selbst nie diese feste
+Acht-Fragmente-Form zeigt.)
 
 **Datenpfad-Frame (jetzt verschleiert – `obf.rs`):** Früher hielt der
 Datenpfad einen kleinen Header im Klartext (Frame-Typ, session_id, Zähler).
@@ -407,7 +504,7 @@ verwirft es (zählt aber als Lebenszeichen). Keine neue Krypto und **keine
 Wire-/Proto-Änderung**: `PROTO_VERSION` lebt im Handshake, nicht im Datenpfad,
 also erhält ein Peer, der Phase 3 nicht kennt, einfach `UnknownFrameType` und
 verwirft das Cover-Paket – echte Daten fließen weiter, und Pacing kann sogar pro
-Richtung **asymmetrisch** sein, ohne Aushandlung. Die Outbound-Schleife (`main.rs`)
+Richtung **asymmetrisch** sein, ohne Aushandlung. Die Outbound-Schleife (`tunnel_loops.rs`)
 ersetzt den Batch-Linger-Flush durch einen festen Ticker, der pro Slot `burst`
 Datagramme über den reinen `pacer::Pacer`-Scheduler sendet: jedes Slot nimmt ein
 echtes Paket aus der Warteschlange, sonst ein Cover-Paket (CBR /
@@ -416,23 +513,60 @@ Adaptive-innerhalb-Cooldown) oder nichts (Adaptive-Idle). Jedes gepacte Datagram
 Rate *und* Größe konstant sind. Eine begrenzte Warteschlange verwirft echte
 Pakete per Tail-Drop, wenn die Last die Rate übersteigt (TCP erholt sich).
 
-**Modi & Kosten (Config `[traffic]`, standardmäßig an im Adaptive-Modus):**
-**Adaptive** (Standard) pact nur während Aktivität plus Cooldown und wird still,
+**Beide Richtungen (`follow_client_profile`).** Das Pacing gilt pro Richtung:
+Ein Client-Profil formt nur, was der Client sendet. Daher kündigt der Client
+sein Profil in einem authentifizierten inneren Frame an (`FrameType::Profile`,
+ein Byte – beim Start, bei jedem Live-Wechsel und mit jedem Keepalive), und
+ein Server mit `follow_client_profile = true` (Standard) wendet dasselbe
+Profil auf seine eigene Richtung an, mit seinen eigenen
+Cooldown-/Budget-Einstellungen. Wechsel sind ratenbegrenzt (1 s), und ein
+`custom`-Profil wird nie weitergegeben. Ein Peer, der den Frame nicht kennt,
+verwirft ihn (unbekannter innerer Typ), es muss also nichts ausgehandelt
+werden; Profil-Frames im Klartext (Obfuskation aus) werden ignoriert, da sie
+nicht authentifiziert sind. Der Preis des Vertrauens in den Client: Er kann
+den Server veranlassen, Cover-Traffic bis zur budgetierten Obergrenze des
+gewählten Profils zu senden; mit `false` lässt sich das ablehnen.
+
+**Modi & Kosten (Config `[traffic]`, standardmäßig AUS – `profile = off`,
+überhaupt kein Pacing; wird es aktiviert, ist der Adaptive-Modus der
+Standard):** **Adaptive** (der Standardmodus, sobald Pacing aktiv ist, z. B.
+`profile = balanced`) pact nur während Aktivität plus Cooldown und wird still,
 wenn echt idle – keine Bandbreite in Ruhe, aber grobes Aktiv-vs-Idle taucht
-wieder auf. **CBR** sendet mit der konfigurierten Rate rund um die Uhr – am
+wieder auf. Sein Cover ist **budgetiert** (`cover_budget_packets` pro
+Aktivitäts-Burst plus `cover_ratio` pro echtem Paket): Jeden leeren Slot des
+Cooldowns mit voller Obergrenze zu füllen, wie in den ersten Versionen, kostete
+auf einem Smartphone Megabytes pro vereinzeltem Hintergrundpaket (gemessen:
+Dutzende MB/min im Leerlauf) und erstickte die ACKs einer
+150-Mbit/s-Uplink-Strecke. Der Zielkonflikt ist ausdrücklich: Ein kleineres
+Budget verschleiert die Aktivitätsränder weniger. **CBR** (z. B.
+`profile = stealth`) sendet mit der konfigurierten Rate rund um die Uhr – am
 stärksten, aber die Rate ist dann eine konstante Bandbreiten-Untergrenze *und*
-das Durchsatz-Limit. In beiden Modi ist die Rate das Durchsatz-Limit (Verkehr
+das Durchsatz-Limit, daher dimensionieren Betreiber `rate_pps × burst` passend
+zu ihrer Leitung. In beiden Modi ist die Rate das Durchsatz-Limit (Verkehr
 darüber wird verworfen); die MTU ist begrenzt, sodass Paket + Overhead in ein
 Datagramm passen (wie WireGuard die Tunnel-MTU an den Pfad anpasst).
 
-**Ehrliche Einschränkung (was bleibt):** Timing-Shaping verbirgt die *Form* des
-Verkehrs, nicht die **Existenz** der Tunnel (die Endpunkte sind bekannt,
-Site-to-Site) oder ihre **Gesamtdauer**; der **initiale Handshake-Burst** liegt
-vor dem Pacer und bleibt sichtbar (Rekey-Pacing ist ein dokumentierter
-Nachfolger); CBR kostet konstante Bandbreite und fügt bis zu ~`1/Rate` Latenz pro
-Paket hinzu; und im Adaptive-Modus leckt grobes Volumen-über-Zeit weiter. Das
-schließt also die Timing-Dimension für den Datenpfad unter CBR, aber
-„vollständige Verkehrsanalyse-Resistenz“ bleibt eine qualifizierte Behauptung.
+**Ehrliche Einschränkung (was bleibt):** Timing-Shaping ist Opt-in – standardmäßig
+aus, eine frische Installation erhält den unten beschriebenen Schutz also
+nicht, bis ein `[traffic]`-Profil gewählt wird. Auch wenn aktiviert, verbirgt es
+die *Form* des Verkehrs, nicht die **Existenz** des Tunnels (die Endpunkte sind
+bekannt, Site-to-Site) oder seine **Gesamtdauer**; der **initiale
+Handshake-Burst** liegt vor dem Pacer und kann es konstruktionsbedingt nicht
+anders sein – er geht den Tunnel-Schleifen voraus, es gibt also noch keinen
+Pacer, auf den er aufsetzen könnte. Ein **Rekey mitten in der Session**
+dagegen läuft, während der Pacer bereits aktiv ist, und umgeht ihn nicht mehr
+(siehe `net::HandshakeSink` / `rekey_fut` in `tunnel_loops.rs`): Seine
+Datagramme werden in denselben Slot-Plan eingereiht wie Daten, statt direkt auf
+den Socket geschrieben zu werden; ein Rekey fügt so weder einen Burst außerhalb
+des Plans hinzu noch – das größere Risiko, da das Warten auf die Antwort
+früher die Tick-Schleife inline blockierte – lässt er den Constant-Rate-Cover-
+Strom verstummen, solange er läuft. CBR kostet weiterhin konstante Bandbreite
+und fügt bis zu ~`1/Rate` Latenz pro Paket hinzu; und im Adaptive-Modus leckt
+grobes Volumen-über-Zeit weiter. Das schließt also die Timing-Dimension für den
+Datenpfad (einschließlich Rekeys) unter CBR, aber „vollständige
+Verkehrsanalyse-Resistenz“ bleibt eine qualifizierte Behauptung – der initiale
+Handshake-Burst ist der eine Rest, den dies konstruktionsbedingt nicht
+erreichen kann.
 
 ---
 
@@ -538,12 +672,95 @@ Diese werden klar benannt, damit niemand Absicht mit Beweis verwechselt:
 - **Timing / Cover-Traffic.** Constant-Rate-Shaping (`pacer.rs`): der Sender
   sendet auf einem festen Takt und füllt leere Slots mit Cover-Paketen (ein
   verschlüsselter `Padding`-Inner-Type, den der Empfänger verwirft), sodass
-  Bursts und Aktiv-vs-Idle aufgehen. Keine Wire-/Proto-Änderung; standardmäßig an
-  im Adaptive-Modus. Siehe §9a.
+  Bursts und Aktiv-vs-Idle aufgehen. Keine Wire-/Proto-Änderung; Opt-in,
+  **standardmäßig aus** (`profile = off`), nach Aktivierung standardmäßig im
+  Adaptive-Modus. Siehe §9a.
 - **Datenpfad verschleiert.** QUIC-artiger Header-Schutz (`obf.rs`): Der Header
   wird mit einem Keystream aus einer AEAD-Tag-Probe maskiert, der echte
   Frame-Typ wird in der Payload verschlüsselt, und konfigurierbares
   Längen-Padding verbirgt die Größen – jedes Datagramm sieht jetzt wie
-  Zufallsbytes aus. Die Handshake-Hülle bleibt Klartext (Phase 2). Siehe §9.
+  Zufallsbytes aus. Siehe §9.
 - **Replay-Fenster.** Von 64 auf 2048 Einträge erweitert (WireGuard-Maßstab).
   Siehe §6.
+- **Gebündelte UDP-I/O.** GSO beim Senden / GRO beim Empfangen über `quinn-udp`
+  (`udp.rs`) beseitigt die Syscall-Mauer pro Paket (~0,18 → ~9,6 Mpps im
+  Mikro-Benchmark). Keine Wire-Änderung. GSO-beim-Senden ist Opt-in,
+  **standardmäßig aus** (ein Hyper-V-/Offload-Pfad verursachte in Tests
+  Paketverlust). Siehe §4a.
+- **Multi-Core-Krypto.** Batch-Seal/-Open laufen parallel auf allen Kernen über
+  rayon (`engine.rs`), ~4,5×/~13× auf 12 Threads, begrenzt durch
+  `[engine].workers`. Nur der ungepacte Schnellpfad; keine Wire-/Krypto-Änderung.
+  Siehe §4a.
+- **Krypto-Pipeline nach wireguard-go-Vorbild.** Outbound reserviert den
+  AEAD-Zählerbereich jedes Batches im Voraus, versiegelt auf dem warmen
+  rayon-Pool, und ein dedizierter sequenzieller Sender erzwingt die
+  Wire-Reihenfolge beim Ausgang – das ersetzt ein früheres Design mit
+  Batch-Größen-Schwelle, das hinter den Erwartungen zurückblieb und in einer
+  Iteration einen echten Zählerreihenfolge-Fehler auslieferte. Jeder
+  rayon-Job ist Panic-geschützt (`rayon_spawn_guarded`), damit ein einzelnes
+  fehlerhaftes Paket nicht den ganzen Prozess abbricht. Siehe §4a.
+- **Härtung durch Sicherheits-Review (0.5.1–0.6.0).** Ein Self-Review trieb an:
+  die Control-Plane an den etablierten Peer zu binden (beseitigt einen
+  Reflection-/Amplification-Vektor), einen begrenzten initialen Handshake (kein
+  dauerhaftes Festhängen, kein Absturz bei fehlerhaftem Init),
+  rollengetrennte Transcript-Signaturen (eine Responder-Signatur lässt sich
+  nicht als Confirm spiegeln), die Bindung beider Identitäten in das Transcript
+  (Abwehr von Unknown-Key-Share), das Zurückweisen einer All-Zero-/Low-Order-
+  X25519-Ausgabe, das Nullen langlebigen Schlüsselmaterials und eine deutliche
+  Warnung vor dem nicht authentifizierten Debug-Modus mit abgeschalteter
+  Obfuskation.
+- **KEM-Standard.** Der Schlüsselaustausch wurde vom Vorstandard-Kyber768 auf
+  **FIPS 203 ML-KEM-768** (`pqcrypto-mlkem`) umgestellt – gleiche Größen
+  1184/1088, standardisierter Algorithmus. Handshake-inkompatibel
+  (PROTO_VERSION erhöht).
+- **Aus dem Shared Secret abgeleitete Session-ID.** Die Session-ID wird nun aus
+  dem gemeinsamen Geheimnis abgeleitet (`crypto::derive_session_id`) statt aus
+  einem prozessweiten Zähler, sodass beide Seiten immer übereinstimmen, ohne
+  einen Zähler, der desynchronisieren könnte.
+- **Return-Routability-Cookie (L-4).** Bevor der Responder teure
+  KEM-/DH-/Signatur-Arbeit leistet – oder eine große Antwort sendet –, verlangt
+  er vom Initiator das Echo eines zustandslosen, an dessen Quelladresse
+  gebundenen Cookies (`crypto::compute_cookie` = HMAC(prozessweites Geheimnis,
+  IP‖Port‖Zeitfenster), 16 B, nicht im Transcript). Ein Init ohne gültiges
+  Cookie erhält eine billige `CookieChallenge` (eine volle, verschleierte
+  Handshake-Nachricht, damit sie keinen auffälligen Fingerabdruck hinzufügt);
+  der Initiator sendet den Init mit Cookie erneut, und erst dann führt der
+  Responder den echten Handshake durch. Das schließt die CPU-DoS mit
+  gefälschter Quelladresse und die Reflection großer Antworten; nur der
+  initiale Handshake braucht es (Rekey ist bereits an den etablierten Peer
+  gebunden). WireGuard-artig, hier immer an, da Site-to-Site-Handshakes selten
+  sind und die zusätzliche Round-Trip-Zeit vernachlässigbar ist.
+- **Rekey-Pacing.** Die Datagramme eines Rekeys mitten in der Session laufen
+  nun über `net::HandshakeSink`: direkt auf den Socket, wenn kein
+  Traffic-Profil aktiv ist (unverändert), oder in den Slot-Plan des
+  Outbound-Pacers eingereiht, wenn eines aktiv ist (`tunnel_loops.rs`). Der
+  Tick-Zweig des Pacers wartet den Rekey außerdem nicht mehr inline ab – er
+  hält den laufenden Versuch (`rekey_fut`) als eigenen `select!`-Zweig, sodass
+  der Constant-Rate-Cover-Strom über die gesamte Mehr-Round-Trip-Dauer eines
+  Rekeys weiterläuft, statt zu verstummen. Siehe §9a.
+- **Kill-Switch (`killswitch.rs`).** Für den Full-Tunnel-Client: ein
+  fail-closed-Firewall-Wächter (nftables unter Linux, Windows-Firewall unter
+  Windows), der den gesamten Egress blockiert – außer Loopback, Tunnel-Transport,
+  TUN-Interface und lokalem Subnetz/DHCP. Anders als die RAII-Full-Tunnel-Routen,
+  die er absichert (fail-*open* – sie werden beim Drop entfernt, ein
+  abgestürzter Client fällt also auf Klartext zurück), wird der Kill-Switch
+  bewusst NICHT beim Drop entfernt: Er bleibt aktiv, wenn der Tunnel stirbt oder
+  der Client abstürzt, und wird nur durch ein explizites Trennen oder den
+  `killswitch off`-Notausgang aufgehoben. Opt-in (`[tun].kill_switch = true`)
+  und nur mit `[tun].route_all = true` (Full-Tunnel-Modus) sinnvoll – siehe §1.
+- **DNS-Leak-Schutz (`dns.rs`).** Für den Full-Tunnel-Client: Listet
+  `[tun].dns` Resolver auf, verweist der Client das Betriebssystem über das
+  Tun-Interface auf sie statt auf den LAN-/ISP-Resolver (WireGuard-artig; unter
+  Windows wird zusätzlich die „Smart Multi-Homed Name Resolution“ deaktiviert,
+  damit Anfragen nicht auch über die physische NIC streuen). RAII wie die
+  Full-Tunnel-Routen – für sich fail-*open*, daher gedacht für die Kombination
+  mit dem Kill-Switch oben, um zu garantieren, dass auch DNS bei einem
+  abgebrochenen Tunnel nicht im Klartext leckt.
+- **`#![deny(unsafe_code)]`.** `src/lib.rs`/`src/main.rs` stellen sicher, dass
+  diese Crate genau einen echten `unsafe`-Block hat (`udp.rs::set_buffer_force`,
+  ein Linux-`setsockopt`-FFI-Aufruf, ausdrücklich `#[allow(unsafe_code)]`) –
+  vom Compiler erzwungen, nicht nur Konvention. Beschränkt auf diese Crate:
+  `gui/` (Desktop-GUI) und `android/rust-jni/` (die JNI-Brücke der Android-App)
+  sind eigene Crates außerhalb dieser Invariante – JNI braucht grundlegend
+  `unsafe` (rohes `JNIEnv`, `extern "system"`-ABI), weshalb diese Grenze in
+  einer eigenen Crate liegt und nicht in `src/`.
