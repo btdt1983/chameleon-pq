@@ -125,4 +125,9 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    # Pipe DACL from an SDDL string (control/pipe_windows.rs).
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ]}
+# Windows service host (SCM registration + control handler).
+windows-service = "0.8"

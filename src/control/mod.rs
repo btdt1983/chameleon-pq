@@ -9,4 +9,9 @@
 pub mod controller;
 pub mod protocol;
 pub mod server;
+
+#[cfg(windows)]
+pub mod pipe_windows;
+#[cfg(windows)]
+pub mod service_windows;
 pub mod supervisor;

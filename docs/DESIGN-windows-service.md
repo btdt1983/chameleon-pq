@@ -212,7 +212,7 @@ these are the conservative picks; both are policy and can change in M4):
 | M | Scope | Verification |
 |---|---|---|
 | M1 | `protocol.rs` + `supervisor.rs`; GUI calls Supervisor in-process. **No behaviour change.** | Existing tests + new Supervisor tests with mock TUN; Windows regression on the Hyper-V VM |
-| M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run` for dev | Pipe tests on Windows CI; manual service run on the VM |
+| M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run/console` (**implemented**: protocol + codec, controller actor, transport-independent connection server, pipe transport, SCM host) | Linux: duplex-stream tests. Windows CI: real-pipe tests. Manual: install and run the service on the VM |
 | M3 | GUI on `ServiceClient`; remove admin requirement and the "Browse config" path | End-to-end on the VM as a standard user |
 | M4 | ProgramData layout, ACL checks, `policy.toml`, enforced kill switch | Policy matrix tests; kill-switch crash/recovery scenarios |
 | M5 | Codec fuzz target, threat-model review, docs | Fuzz in CI; reviewed against section 7 |

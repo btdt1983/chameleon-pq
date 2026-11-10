@@ -32,9 +32,21 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // The Windows service host needs the main thread before any tokio runtime
+    // exists (the Service Control Manager dispatcher blocks it and calls back on
+    // its own thread), and logs to a file rather than stderr.
+    #[cfg(windows)]
+    if let Command::Service { action } = &cli.command {
+        return chameleon::control::service_windows::run_cli(action, &cli.config, cli.verbose);
+    }
+
+    tokio::runtime::Runtime::new()?.block_on(real_main(cli))
+}
+
+async fn real_main(cli: Cli) -> anyhow::Result<()> {
     init_logging(cli.verbose);
 
     match &cli.command {
