@@ -399,7 +399,7 @@ pub enum TrafficMode {
 /// one go so a user doesn't have to work out the throughput-vs-concealment
 /// trade-off themselves. The profile WINS; the individual fields below apply
 /// only with `custom`. See `effective()` for the exact values per profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrafficProfile {
     /// Max anti-analysis: CBR, low ceiling (~5 Mbit/s), constant bandwidth 24/7.

@@ -150,7 +150,7 @@ the pipe, or impersonates the service/GUI.
 |---|---|
 | Arbitrary user controls SYSTEM service | Restricted request set (section 5); policy checks server-side; no paths/addresses in requests |
 | Remote pipe access | `PIPE_REJECT_REMOTE_CLIENTS` |
-| Wrong principals on the pipe | DACL via SDDL, e.g. `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)`; later narrowed to a dedicated local group |
+| Wrong principals on the pipe | DACL via SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;AU)`; later narrowed to a dedicated local group. The Authenticated Users mask is an explicit `FILE_GENERIC_READ \| FILE_GENERIC_WRITE` **without** `FILE_CREATE_PIPE_INSTANCE` (0x4, which shares its bit with `FILE_APPEND_DATA`): the generic `GW` right would let any user create a rogue instance of the pipe and impersonate the service. The same descriptor is applied to every instance, not just the first |
 | Pipe squatting (fake service) | Service creates the pipe with `first_pipe_instance(true)`; GUI checks the server PID's token is SYSTEM before sending anything |
 | Malformed/oversized input | Length cap, strict serde types, per-connection timeouts, connection cap, fuzz target for the codec |
 | DLL hijack of `wintun.dll` | Load from the install directory (admin-writable only) by full path; no search-path loading; verify Authenticode signature of `wintun.dll` at load |
@@ -198,6 +198,14 @@ checks need a small amount of `unsafe` (`windows-sys`); confine it to
 3. **Direct backend** kept for Linux/dev (recommended) or Windows-only service?
 4. **Who may disconnect?** Default `true`, or admin-only for the strictest setup?
 5. **Per-machine key** as the interim identity model: acceptable for a pilot?
+
+Defaults implemented (no explicit recommendation was given for 2 and 4, so
+these are the conservative picks; both are policy and can change in M4):
+
+- Decision 2: `auto_connect = never`. Always-on is opt-in via policy.
+- Decision 4: users may disconnect (`allow_user_connect_disconnect = true`).
+- Until policy exists (M4), `ClearKillSwitch` over the pipe is always `Denied`;
+  admins use the elevated `chameleon-pq killswitch off`.
 
 ## 11. Milestones (each shippable and testable on its own)
 
