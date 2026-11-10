@@ -12,10 +12,9 @@
 // panic hook. (Harmless / ignored on non-Windows targets.)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chameleon::client::{build_auth, security_warnings, Client, Status};
+use chameleon::client::security_warnings;
 use chameleon::config::{AppConfig, TrafficProfile};
-use chameleon::killswitch::KillSwitch;
-use chameleon::tun_iface::TunPair;
+use chameleon::control::supervisor::{self, ConnectOutcome, Supervisor};
 use iced::widget::{
     button, checkbox, column, container, markdown, pick_list, row, scrollable, svg, text,
     text_input,
@@ -274,22 +273,15 @@ struct App {
     server: String,
     /// Selected traffic profile; wins over the config at Connect.
     profile: TrafficProfile,
-    client: Option<Arc<Client>>,
-    status: Option<Status>,
-    warnings: Vec<String>,
-    log: Vec<String>,
-    connecting: bool,
+    /// Owns the tunnel, the kill switch and drop detection (see
+    /// `chameleon::control::supervisor`). The GUI only renders its state.
+    sup: Supervisor,
     /// Kill switch preference (mirrors config `tun.kill_switch`): engage a
     /// fail-closed firewall while connected so a tunnel drop blocks traffic
     /// instead of leaking to the physical NIC.
     kill_switch: bool,
-    /// The active kill-switch guard. Held HERE (not in `Client`) on purpose: an
-    /// unexpected drop clears `client`, and the switch must survive that. `Some`
-    /// only while engaged.
-    ks: Option<KillSwitch>,
-    /// A kill switch detected at startup that we did NOT create this session —
-    /// left over from a previous crash / app close. Offer to clear it.
-    ks_orphan: bool,
+    warnings: Vec<String>,
+    log: Vec<String>,
     /// "Check for updates" outcome, shown in the sidebar. Only ever changes in
     /// response to the user pressing the button — no automatic/startup check.
     update_status: UpdateStatus,
@@ -299,13 +291,6 @@ struct App {
     /// The checked release's page, for the "Open release" link.
     latest_release_url: Option<String>,
 }
-
-/// `(connect outcome, kill-switch engage outcome)`, produced by the async
-/// connect task. See `Message::Connected`.
-type ConnectOutcome = (
-    Result<Arc<Client>, String>,
-    Option<Result<KillSwitch, String>>,
-);
 
 #[derive(Debug, Clone, Default)]
 enum UpdateStatus {
@@ -398,9 +383,9 @@ impl App {
         // A kill switch still installed at startup means a previous run left it
         // engaged (crash or window-close while connected) — surface it so the
         // user can clear it and get back online.
-        let ks_orphan = KillSwitch::is_engaged();
+        let sup = Supervisor::new();
         let mut log = vec!["Load a config and connect.".into()];
-        if ks_orphan {
+        if sup.kill_switch_orphan() {
             log.push("⚠ Kill switch is still active from a previous session.".into());
         }
         (
@@ -409,14 +394,10 @@ impl App {
                 config: None,
                 server: String::new(),
                 profile: TrafficProfile::default(),
-                client: None,
-                status: None,
+                sup,
                 warnings: Vec::new(),
                 log,
-                connecting: false,
                 kill_switch: false,
-                ks: None,
-                ks_orphan,
                 update_status: UpdateStatus::NotChecked,
                 release_notes: None,
                 latest_release_url: None,
@@ -434,7 +415,7 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         // Refresh the status every second while there is a client.
-        if self.client.is_some() {
+        if self.sup.is_connected() {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
         } else {
             Subscription::none()
@@ -483,14 +464,13 @@ impl App {
                     .map(security_warnings)
                     .unwrap_or_default();
                 // Apply live when connected; otherwise it takes effect at Connect.
-                if let Some(client) = &self.client {
-                    let mut tc = self
-                        .config
-                        .as_ref()
-                        .map(|c| c.traffic.clone())
-                        .unwrap_or_default();
-                    tc.profile = p;
-                    client.set_traffic(tc.effective());
+                let mut tc = self
+                    .config
+                    .as_ref()
+                    .map(|c| c.traffic.clone())
+                    .unwrap_or_default();
+                tc.profile = p;
+                if self.sup.apply_traffic(&tc) {
                     self.log(format!("Profile changed live → {p}"));
                 } else {
                     self.log(format!("Profile: {p}"));
@@ -539,131 +519,23 @@ impl App {
                     self.log("No valid server address (host:port).");
                     return Task::none();
                 };
-                self.connecting = true;
+                self.sup.begin_connect();
                 self.log(format!("Connecting to {server} …"));
                 let want_kill_switch = self.kill_switch;
                 return Task::perform(
-                    async move {
-                        // Log step by step: if the process dies hard (a native
-                        // access violation in wintun/quinn-udp does NOT fire the
-                        // Rust panic hook), the last line in the log points to
-                        // exactly which step caused the crash.
-                        tracing::info!("connect: step 1/3 build_auth");
-                        let auth = match build_auth(&cfg) {
-                            Ok(a) => a,
-                            Err(e) => return (Err(e.to_string()), None),
-                        };
-                        tracing::info!("connect: step 2/3 TunPair::create (Windows: admin + wintun.dll next to .exe)");
-                        let tun = match TunPair::create(&cfg.tun) {
-                            Ok(t) => t,
-                            Err(e) => return (Err(e.to_string()), None),
-                        };
-
-                        // Engage the kill switch now: the tun interface exists
-                        // (needed — Windows' New-NetFirewallRule -InterfaceAlias
-                        // errors "interface not found" against an adapter that
-                        // isn't registered yet), but full-tunnel routing/DNS
-                        // haven't been installed by Client::connect below yet,
-                        // so there's still no window where they're live without
-                        // fail-closed backing. A couple of retries: the adapter
-                        // can take a brief moment to become visible to Windows
-                        // right after creation (same settling delay
-                        // Client::connect's own route-install retries around).
-                        let ks: Option<Result<KillSwitch, String>> = if want_kill_switch {
-                            if cfg.tun.route_all {
-                                let mut attempt = KillSwitch::engage(server, &cfg.tun.name);
-                                for _ in 0..4 {
-                                    if attempt.is_ok() {
-                                        break;
-                                    }
-                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                    attempt = KillSwitch::engage(server, &cfg.tun.name);
-                                }
-                                Some(attempt.map_err(|e| e.to_string()))
-                            } else {
-                                Some(Err(
-                                    "skipped: needs full-tunnel (tun.route_all = true)".into()
-                                ))
-                            }
-                        } else {
-                            None
-                        };
-
-                        tracing::info!("connect: step 3/3 Client::connect → {server}");
-                        let res = Client::connect(&cfg, server, auth, tun)
-                            .await
-                            .map(Arc::new)
-                            .map_err(|e| e.to_string());
-                        tracing::info!("connect: done (ok={})", res.is_ok());
-                        (res, ks)
-                    },
+                    supervisor::connect(cfg, server, want_kill_switch),
                     Message::Connected,
                 );
             }
-            Message::Connected((client_res, ks)) => {
-                self.connecting = false;
-                match ks {
-                    Some(Ok(k)) => {
-                        self.log("Kill switch engaged — traffic is locked to the tunnel.");
-                        // Windows only: a pre-existing outbound Allow rule (from
-                        // other software, or a Windows built-in) can override
-                        // our default-block — see killswitch.rs. Surface that
-                        // instead of implying full protection.
-                        if let Some(n) = k.other_allow_rules {
-                            if n > 0 {
-                                self.log(format!(
-                                    "⚠ {n} other outbound-allow firewall rule(s) found — \
-                                     traffic matching one of those could bypass the kill switch."
-                                ));
-                            }
-                        }
-                        self.ks = Some(k);
-                        self.ks_orphan = false;
-                    }
-                    Some(Err(e)) => self.log(format!("Kill switch: {e}")),
-                    None => {}
-                }
-                match client_res {
-                    Ok(client) => {
-                        self.log(format!(
-                            "Connected — session {}",
-                            client.status().session_id
-                        ));
-                        // The kill switch (if requested) was already engaged
-                        // above, before Client::connect started.
-                        self.status = Some(client.status());
-                        self.client = Some(client);
-                    }
-                    Err(e) => {
-                        self.log(format!("Connection failed: {e}"));
-                        // The kill switch was engaged pre-emptively (see above,
-                        // set into self.ks by the `ks` match just before this);
-                        // a failed attempt leaves no tunnel, so it stays up
-                        // fail-closed rather than being silently dropped — make
-                        // that visible instead of leaving the user to wonder why
-                        // they're offline.
-                        if self.ks.is_some() {
-                            self.log(
-                                "⚠ Kill switch still ACTIVE — traffic stays blocked. Retry, \
-                                 or disable the kill switch to go online without the VPN.",
-                            );
-                        }
-                    }
+            Message::Connected(outcome) => {
+                for line in self.sup.on_connected(outcome) {
+                    self.log(line);
                 }
             }
             Message::Disconnect => {
-                if let Some(c) = &self.client {
-                    c.disconnect();
+                for line in self.sup.disconnect() {
+                    self.log(line);
                 }
-                self.client = None;
-                self.status = None;
-                // Deliberate disconnect → take the kill switch down (fail-open is
-                // correct HERE: the user asked to stop).
-                if let Some(mut k) = self.ks.take() {
-                    k.disengage();
-                    self.log("Kill switch disengaged.");
-                }
-                self.log("Disconnected.");
             }
             Message::ToggleKillSwitch(on) => {
                 self.kill_switch = on;
@@ -676,38 +548,12 @@ impl App {
                 ));
             }
             Message::DisableKillSwitch => {
-                KillSwitch::clear();
-                self.ks = None;
-                self.ks_orphan = false;
+                self.sup.clear_kill_switch();
                 self.log("Kill switch disabled — connectivity restored.");
             }
             Message::Tick => {
-                if let Some(c) = &self.client {
-                    let st = c.status();
-                    // The tunnel loops run in the background; if they die (TUN/socket
-                    // error, dead peer, peer close) `connected` flips to false. Make
-                    // that visible instead of silently freezing — the reason is in
-                    // the log file (see init_diagnostics).
-                    if !st.connected {
-                        tracing::warn!("tunnel loops stopped — see the log file for the reason");
-                        self.log(
-                            "Tunnel closed (background loops stopped). \
-                             Details are in chameleon-gui.log next to the binary.",
-                        );
-                        self.client = None;
-                        self.status = None;
-                        // Do NOT disengage the kill switch here: this is exactly
-                        // the unexpected-drop case it exists for. It stays engaged
-                        // (fail-closed); the banner offers a way to disable it.
-                        if self.ks.is_some() {
-                            self.log(
-                                "⚠ Kill switch ACTIVE — traffic is blocked. Reconnect, \
-                                 or disable the kill switch to go online without the VPN.",
-                            );
-                        }
-                    } else {
-                        self.status = Some(st);
-                    }
+                for line in self.sup.poll() {
+                    self.log(line);
                 }
             }
             Message::CheckForUpdates => {
@@ -840,9 +686,9 @@ impl App {
         .style(card_style);
 
         // Big action button: Connect / Disconnect / (busy).
-        let action: Element<Message> = if self.connecting {
+        let action: Element<Message> = if self.sup.is_connecting() {
             button(text("Connecting …")).padding([10, 22]).into()
-        } else if self.client.is_some() {
+        } else if self.sup.is_connected() {
             button(text("Disconnect"))
                 .style(button::danger)
                 .padding([10, 22])
@@ -859,8 +705,9 @@ impl App {
         // Kill-switch recovery banner: shown when the switch is engaged but the
         // tunnel is NOT connected (an unexpected drop, or a leftover from a
         // previous session). Offers a one-click way back online.
-        let ks_stranded =
-            self.client.is_none() && !self.connecting && (self.ks_orphan || self.ks.is_some());
+        let ks_stranded = !self.sup.is_connected()
+            && !self.sup.is_connecting()
+            && (self.sup.kill_switch_orphan() || self.sup.kill_switch_engaged());
         let ks_banner: Element<Message> = if ks_stranded {
             container(
                 column![
@@ -919,7 +766,7 @@ impl App {
         };
 
         // Status card.
-        let status_card: Element<Message> = match &self.status {
+        let status_card: Element<Message> = match self.sup.status() {
             Some(s) if s.connected => container(
                 column![
                     text("● Connected")

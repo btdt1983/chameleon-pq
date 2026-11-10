@@ -8,6 +8,7 @@
 pub mod aead;
 pub mod client;
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod dns;
 pub mod engine;
