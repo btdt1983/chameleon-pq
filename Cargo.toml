@@ -114,7 +114,7 @@ anyhow             = "1"
 
 [dev-dependencies]
 # Voor #[tokio::test] loopback-tests van de gebatchte UDP-I/O.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 
 # SO_RCVBUFFORCE/SO_SNDBUFFORCE (bypass net.core.rmem_max when privileged) live
 # behind a raw setsockopt — Linux only.
