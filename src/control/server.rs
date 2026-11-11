@@ -120,7 +120,10 @@ where
 
     // 2. Reader task feeds decoded frames in; this loop never reads directly.
     let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Vec<u8>, CodecError>>(4);
-    let reader_task = tokio::spawn(async move {
+    // Aborted on drop, so cancelling `serve_connection` itself (e.g. a shutdown
+    // that aborts the connection task) cannot leak the reader and keep the
+    // transport open.
+    let _reader_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
             let frame = read_frame(&mut reader).await;
             let stop = frame.is_err();
@@ -128,7 +131,7 @@ where
                 break;
             }
         }
-    });
+    }));
 
     let result = async {
         loop {
@@ -170,8 +173,15 @@ where
     }
     .await;
 
-    reader_task.abort();
     result
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn send_error<W: AsyncWrite + Unpin>(w: &mut W, code: ErrorCode, message: String) {
