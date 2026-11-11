@@ -553,6 +553,36 @@ impl App {
         }
     }
 
+    /// The administrator policy, in service mode once the service has reported it.
+    /// Standalone mode has no policy: everything is allowed.
+    fn policy(&self) -> Option<&PolicySummary> {
+        match &self.mode {
+            Mode::Service(l) => l.state.as_ref().map(|s| &s.policy),
+            Mode::Direct => None,
+        }
+    }
+
+    fn may_disconnect(&self) -> bool {
+        self.policy().map_or(true, |p| p.allow_user_disconnect)
+    }
+
+    fn may_check_updates(&self) -> bool {
+        match &self.mode {
+            Mode::Direct => true,
+            // Until the policy is known, stay on the safe side.
+            Mode::Service(_) => self.policy().is_some_and(|p| p.allow_update_check),
+        }
+    }
+
+    /// Profiles to offer in the dropdown.
+    fn profiles(&self) -> Vec<TrafficProfile> {
+        TrafficProfile::ALL
+            .iter()
+            .copied()
+            .filter(|p| self.policy().map_or(true, |pol| pol.profile_allowed(*p)))
+            .collect()
+    }
+
     fn tunnel(&self) -> Option<TunnelView> {
         match &self.mode {
             Mode::Direct => self
@@ -861,6 +891,9 @@ impl App {
                     }
                 }
             }
+            Message::CheckForUpdates if !self.may_check_updates() => {
+                self.log("Update checks are turned off by your administrator.");
+            }
             Message::CheckForUpdates => {
                 self.update_status = UpdateStatus::Checking;
                 return Task::perform(fetch_latest_release(), Message::UpdateChecked);
@@ -955,11 +988,7 @@ impl App {
         .align_y(Alignment::Center);
         let profile_row = row![
             label("Profile"),
-            pick_list(
-                &TrafficProfile::ALL[..],
-                Some(self.profile),
-                Message::ProfileChanged
-            ),
+            pick_list(self.profiles(), Some(self.profile), Message::ProfileChanged),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -1006,6 +1035,12 @@ impl App {
         // Big action button: Connect / Disconnect / (busy).
         let action: Element<Message> = if self.is_connecting() {
             button(text("Connecting …")).padding([10, 22]).into()
+        } else if self.is_connected() && !self.may_disconnect() {
+            // Shown but inert: the administrator does not allow disconnecting.
+            button(text("Disconnect (not allowed)"))
+                .style(button::secondary)
+                .padding([10, 22])
+                .into()
         } else if self.is_connected() {
             button(text("Disconnect"))
                 .style(button::danger)
@@ -1185,6 +1220,12 @@ impl App {
         let red = Color::from_rgb8(0xff, 0xb4, 0xb4);
 
         let update_row: Element<Message> = match &self.update_status {
+            _ if !self.may_check_updates() => {
+                text("Update checks are turned off by your administrator.")
+                    .size(12)
+                    .color(muted)
+                    .into()
+            }
             UpdateStatus::NotChecked => button(text("Check for updates").size(13))
                 .style(button::secondary)
                 .on_press(Message::CheckForUpdates)
@@ -1362,6 +1403,51 @@ mod tests {
         // No service connection yet: nothing is claimed.
         let app = service_app(None);
         assert!(!app.is_connected() && !app.is_connecting() && !app.ks_stranded());
+    }
+
+    fn with_policy(text: &str) -> App {
+        let mut st = snap(Phase::Connected, KillSwitchState::Engaged, true);
+        st.policy = PolicySummary::from(&Policy::parse(text, "t").unwrap());
+        service_app(Some(st))
+    }
+
+    #[test]
+    fn the_gui_follows_the_policy_it_is_told() {
+        // Standalone / default: everything offered, except update checks in
+        // service mode (off by default for a managed machine).
+        let app = with_policy("");
+        assert!(app.may_disconnect());
+        assert!(!app.may_check_updates());
+        assert_eq!(app.profiles().len(), TrafficProfile::ALL.len());
+
+        let app = with_policy("allow_user_disconnect = false\nallow_update_check = true");
+        assert!(!app.may_disconnect());
+        assert!(app.may_check_updates());
+
+        let app = with_policy("allowed_profiles = [\"balanced\", \"stealth\"]");
+        assert_eq!(
+            app.profiles(),
+            vec![TrafficProfile::Stealth, TrafficProfile::Balanced]
+        );
+
+        // Before the service has reported anything, do not phone out.
+        let app = service_app(None);
+        assert!(!app.may_check_updates());
+
+        // Standalone mode has no policy at all.
+        let (app, _) = App::new();
+        assert!(app.may_disconnect() && app.may_check_updates());
+    }
+
+    #[test]
+    fn update_check_is_refused_when_the_policy_says_so() {
+        let mut app = with_policy("");
+        let _ = app.update(Message::CheckForUpdates);
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.contains("turned off by your administrator")));
+        assert!(matches!(app.update_status, UpdateStatus::NotChecked));
     }
 
     #[test]
