@@ -16,12 +16,14 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on an incompatible change. Exchanged in [`Hello`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: `StateSnapshot` carries the administrator policy summary.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME: usize = 64 * 1024;
 
 pub use crate::config::TrafficProfile;
+pub use crate::control::policy::KillSwitchPolicy;
 
 /// Lifecycle phase of the tunnel as seen by a frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,38 @@ pub struct TunnelInfo {
     pub uptime_secs: u64,
 }
 
+/// The part of the administrator policy a frontend needs to shape its UI. The
+/// service enforces the policy regardless; this only avoids offering buttons
+/// that would be refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySummary {
+    pub allow_user_disconnect: bool,
+    /// `None` = every profile.
+    pub allowed_profiles: Option<Vec<TrafficProfile>>,
+    pub kill_switch: KillSwitchPolicy,
+    pub allow_update_check: bool,
+}
+
+impl PolicySummary {
+    pub fn profile_allowed(&self, p: TrafficProfile) -> bool {
+        self.allowed_profiles
+            .as_ref()
+            .map_or(true, |list| list.contains(&p))
+    }
+}
+
+impl From<&crate::control::policy::Policy> for PolicySummary {
+    fn from(p: &crate::control::policy::Policy) -> Self {
+        Self {
+            allow_user_disconnect: p.allow_user_disconnect,
+            allowed_profiles: p.allowed_profiles.clone(),
+            kill_switch: p.kill_switch,
+            allow_update_check: p.allow_update_check,
+        }
+    }
+}
+
 /// Everything a frontend needs to draw its state. Owned by the protocol, not
 /// derived from internal types, so internals can change without a wire change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +115,7 @@ pub struct StateSnapshot {
     pub profile: TrafficProfile,
     /// Secure-by-default warnings for the active config.
     pub warnings: Vec<String>,
+    pub policy: PolicySummary,
 }
 
 /// First message in each direction.
@@ -246,6 +281,7 @@ mod tests {
             kill_switch: KillSwitchState::Engaged,
             profile: TrafficProfile::Balanced,
             warnings: vec!["w".into()],
+            policy: PolicySummary::from(&crate::control::policy::Policy::default()),
         }
     }
 

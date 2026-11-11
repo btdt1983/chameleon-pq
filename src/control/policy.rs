@@ -97,6 +97,13 @@ impl Policy {
             path: "policy".into(),
             message,
         };
+        if self.kill_switch == KillSwitchPolicy::Enforced && !cfg.tun.route_all {
+            return Err(bad(
+                "kill_switch = \"enforced\" needs tun.route_all = true in the service config \
+                 (the kill switch only works with a full tunnel)"
+                    .into(),
+            ));
+        }
         if let Some(list) = &self.allowed_profiles {
             if list.is_empty() {
                 return Err(bad("allowed_profiles is empty: nobody could connect".into()));

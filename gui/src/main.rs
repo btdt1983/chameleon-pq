@@ -16,7 +16,7 @@ use chameleon::client::security_warnings;
 use chameleon::config::{AppConfig, TrafficProfile};
 use chameleon::control::client::ServiceClient;
 use chameleon::control::protocol::{
-    ErrorCode, KillSwitchState, Phase, Request, Response, StateSnapshot,
+    ErrorCode, KillSwitchState, Phase, PolicySummary, Request, Response, StateSnapshot,
 };
 use chameleon::control::supervisor::{self, ConnectOutcome, Supervisor};
 use iced::widget::{
@@ -784,7 +784,7 @@ impl App {
                 return self.service_request(Request::Disconnect {});
             }
             Message::Disconnect => {
-                for line in self.sup.disconnect() {
+                for line in self.sup.disconnect(false) {
                     self.log(line);
                 }
             }
@@ -1300,6 +1300,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chameleon::control::policy::Policy;
     use chameleon::control::protocol::TunnelInfo;
 
     fn snap(phase: Phase, ks: KillSwitchState, tunnel: bool) -> StateSnapshot {
@@ -1316,6 +1317,7 @@ mod tests {
             kill_switch: ks,
             profile: TrafficProfile::default(),
             warnings: vec![],
+            policy: PolicySummary::from(&Policy::default()),
         }
     }
 

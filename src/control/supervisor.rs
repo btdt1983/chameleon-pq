@@ -224,16 +224,22 @@ impl Supervisor {
         log
     }
 
-    /// Deliberate disconnect. Takes the kill switch down too (fail-open is
-    /// correct HERE: the user asked to stop). Returns the log lines.
-    pub fn disconnect(&mut self) -> Vec<String> {
+    /// Deliberate disconnect. Normally takes the kill switch down too (fail-open
+    /// is correct HERE: the user asked to stop). With `keep_kill_switch` (policy
+    /// `enforced`) the tunnel closes but the kill switch stays engaged, so the
+    /// user is offline rather than unprotected. Returns the log lines.
+    pub fn disconnect(&mut self, keep_kill_switch: bool) -> Vec<String> {
         let mut log = Vec::new();
         if let Some(c) = &self.client {
             c.disconnect();
         }
         self.client = None;
         self.status = None;
-        if let Some(mut k) = self.ks.take() {
+        if keep_kill_switch {
+            if self.ks.is_some() {
+                log.push("Kill switch stays engaged (enforced by your administrator).".into());
+            }
+        } else if let Some(mut k) = self.ks.take() {
             k.disengage();
             log.push("Kill switch disengaged.".into());
         }
@@ -367,7 +373,8 @@ mod tests {
     #[test]
     fn disconnect_while_idle_is_a_noop_that_still_reports() {
         let mut s = Supervisor::with_orphan(false);
-        assert_eq!(s.disconnect(), vec!["Disconnected.".to_string()]);
+        assert_eq!(s.disconnect(false), vec!["Disconnected.".to_string()]);
+        assert_eq!(s.disconnect(true), vec!["Disconnected.".to_string()]);
         assert!(!s.is_connected());
     }
 
