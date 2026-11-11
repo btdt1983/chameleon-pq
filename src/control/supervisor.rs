@@ -119,6 +119,12 @@ impl Supervisor {
         Self::with_orphan(KillSwitch::is_engaged())
     }
 
+    /// An idle supervisor that does not probe the firewall. For a frontend that
+    /// delegates to the service and never uses its own supervisor.
+    pub fn new_unprobed() -> Self {
+        Self::with_orphan(false)
+    }
+
     pub(super) fn with_orphan(ks_orphan: bool) -> Self {
         Self {
             log_hint: "chameleon-gui.log next to the binary".into(),

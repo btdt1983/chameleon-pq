@@ -20,10 +20,35 @@ Requirements
     elevated rights; without admin the connect step fails.
   * Keep wintun.dll next to the executable. Do not move or rename it.
 
-Quick start (GUI)
------------------
+Quick start (GUI, standalone)
+-----------------------------
+  Used when the Windows service below is NOT installed.
   1. Right-click chameleon-gui.exe -> "Run as administrator".
   2. Point it at your config (or generate keys first with the CLI, below).
+
+Managed mode (Windows service, no administrator for the user)
+--------------------------------------------------------------
+  EXPERIMENTAL - not yet verified on a real machine. For a managed
+  installation an administrator installs a background service that owns the
+  tunnel, routes, DNS and kill switch. Users then run chameleon-gui.exe as
+  themselves; it only connects/disconnects and picks a traffic profile.
+
+  Administrator, once (elevated prompt). The program and wintun.dll must be
+  in a folder only administrators can write, normally under Program Files;
+  the installer refuses anything else:
+      chameleon-pq.exe --config "C:\ProgramData\Chameleon-PQ\config.toml" service install
+      sc start ChameleonPQ
+
+  Check the registered path is quoted:   sc qc ChameleonPQ
+  Service log:   C:\ProgramData\Chameleon-PQ\logs\service.log
+  Remove:        chameleon-pq.exe service uninstall
+  Debug in a console instead of the SCM:
+      chameleon-pq.exe --config config.toml service console
+
+  If the service is installed, the GUI always runs in managed mode: it has
+  no config/server fields and never starts a tunnel of its own. If the
+  kill switch is left on, an administrator can remove it with:
+      chameleon-pq.exe killswitch off
 
 Quick start (CLI)
 -----------------
