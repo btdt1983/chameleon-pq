@@ -15,17 +15,26 @@
 //!   as `FILE_CREATE_PIPE_INSTANCE`: with it any user could create a rogue
 //!   instance of the pipe.)
 
+use super::client::ServiceClient;
 use super::server::Server;
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::ptr;
-use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
-use tokio::sync::oneshot;
-use windows_sys::Win32::Foundation::{LocalFree, FALSE};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use std::time::Duration;
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
 };
-use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use tokio::sync::oneshot;
+use windows_sys::Win32::Foundation::{LocalFree, ERROR_PIPE_BUSY, ERROR_SUCCESS, FALSE};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\chameleon-pq-control";
 
@@ -122,6 +131,114 @@ pub async fn serve(name: &str, server: Server, mut stop: oneshot::Receiver<()>) 
     }
 }
 
+// ── Client side ──────────────────────────────────────────────────────────────
+
+/// Who owns the pipe object we just connected to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeOwner {
+    /// Owned by LocalSystem or Administrators: only an elevated process can
+    /// create a pipe object with that owner.
+    Trusted(&'static str),
+    /// Owned by someone else (e.g. a standard user running their own server).
+    Untrusted,
+    /// The check itself failed (Win32 error code); not a verdict.
+    Unknown(u32),
+}
+
+/// Read the owner of the pipe object behind `handle`.
+///
+/// A standard user's pipe is owned by that user, and a standard user cannot
+/// assign SYSTEM or Administrators as owner, so this separates the real service
+/// from a look-alike started by a normal user. (The binary's path would not:
+/// anyone can run the installed exe unelevated, or any interpreter under
+/// Program Files.)
+#[allow(unsafe_code)]
+fn pipe_owner(handle: isize) -> PipeOwner {
+    let mut owner: *mut c_void = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `handle` is a live pipe handle owned by the caller for the whole
+    // call; the out-pointers are valid; the unused ones are null as documented
+    // for OWNER_SECURITY_INFORMATION.
+    let err = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return PipeOwner::Unknown(err);
+    }
+    // SAFETY: on success `owner` points into the descriptor `sd`, which stays
+    // allocated until the LocalFree below.
+    let verdict = unsafe {
+        if IsWellKnownSid(owner, WinLocalSystemSid) != 0 {
+            PipeOwner::Trusted("SYSTEM")
+        } else if IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 {
+            PipeOwner::Trusted("Administrators")
+        } else {
+            PipeOwner::Untrusted
+        }
+    };
+    // SAFETY: `sd` was allocated by GetSecurityInfo and is freed exactly once.
+    unsafe {
+        LocalFree(sd as _);
+    }
+    verdict
+}
+
+/// Open the control pipe and connect a protocol client.
+///
+/// * The tokio default `SECURITY_IDENTIFICATION` QoS stays in place, so a
+///   look-alike server can read who we are but cannot impersonate us.
+/// * The pipe owner must be SYSTEM or Administrators. A definite mismatch is
+///   refused; if the check itself fails we continue and say so.
+///
+/// Returns the client and a short note for the log.
+pub async fn connect_client(name: &str) -> Result<(ServiceClient, String), String> {
+    let pipe = open_with_retry(name)
+        .await
+        .map_err(|e| format!("cannot open {name}: {e}"))?;
+    let note = match pipe_owner(pipe.as_raw_handle() as isize) {
+        PipeOwner::Trusted(who) => format!("service identity verified (pipe owner: {who})"),
+        PipeOwner::Untrusted => {
+            return Err(
+                "refusing to talk to the pipe: it is not owned by SYSTEM or Administrators,                  so it is not the installed service"
+                    .into(),
+            )
+        }
+        PipeOwner::Unknown(code) => {
+            format!("warning: could not verify the pipe owner (Win32 error {code})")
+        }
+    };
+    let client = ServiceClient::connect_stream(pipe)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((client, note))
+}
+
+async fn open_with_retry(name: &str) -> io::Result<NamedPipeClient> {
+    // ERROR_PIPE_BUSY: every instance is momentarily connected; the server
+    // creates the next one right away, so a short wait is enough.
+    let mut last = None;
+    for _ in 0..20 {
+        match ClientOptions::new().open(name) {
+            Ok(c) => return Ok(c),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::TimedOut)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +309,32 @@ mod tests {
 
         let _ = stop.send(());
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_client_reads_the_owner_and_talks_protocol() {
+        let name = unique_name();
+        let (stop, task) = start(&name);
+        let mut result = Err("never tried".to_string());
+        for _ in 0..50 {
+            result = connect_client(&name).await;
+            if result.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // CI runs as a non-elevated or elevated user: the owner is that user or
+        // Administrators, so the verdict may legitimately be a refusal. What
+        // must hold: either we got a working client, or a clear owner refusal.
+        match result {
+            Ok((client, note)) => {
+                assert!(note.contains("verified") || note.contains("warning"));
+                assert_eq!(client.state().phase, Phase::Disconnected);
+            }
+            Err(e) => assert!(e.contains("not owned by SYSTEM or Administrators"), "{e}"),
+        }
+        let _ = stop.send(());
+        let _ = task.await;
     }
 
     #[tokio::test]

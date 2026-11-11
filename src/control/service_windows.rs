@@ -228,6 +228,43 @@ async fn run_core_with(
     }
 }
 
+// ── Is the service installed? (frontend side) ───────────────────────────────
+
+/// What a frontend learns from the Service Control Manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Installed {
+    No,
+    Yes {
+        running: bool,
+    },
+    /// Could not ask (message for the log). Treated as "not managed".
+    Unknown(String),
+}
+
+/// Whether the service exists and is running. Needs only read access, which
+/// standard users have by default. A frontend decides its mode from this (not
+/// from whether the pipe happens to answer), so a service restart never flips a
+/// session from managed to standalone.
+pub fn installed() -> Installed {
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
+        Ok(m) => m,
+        Err(e) => return Installed::Unknown(e.to_string()),
+    };
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(svc) => match svc.query_status() {
+            Ok(st) => Installed::Yes {
+                running: st.current_state == ServiceState::Running,
+            },
+            Err(_) => Installed::Yes { running: false },
+        },
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1060) => {
+            Installed::No // ERROR_SERVICE_DOES_NOT_EXIST
+        }
+        Err(e) => Installed::Unknown(e.to_string()),
+    }
+}
+
 // ── Install / uninstall ──────────────────────────────────────────────────────
 
 fn strip_verbatim(p: PathBuf) -> PathBuf {
