@@ -563,7 +563,7 @@ impl App {
     }
 
     fn may_disconnect(&self) -> bool {
-        self.policy().map_or(true, |p| p.allow_user_disconnect)
+        self.policy().is_none_or(|p| p.allow_user_disconnect)
     }
 
     fn may_check_updates(&self) -> bool {
@@ -579,7 +579,7 @@ impl App {
         TrafficProfile::ALL
             .iter()
             .copied()
-            .filter(|p| self.policy().map_or(true, |pol| pol.profile_allowed(*p)))
+            .filter(|p| self.policy().is_none_or(|pol| pol.profile_allowed(*p)))
             .collect()
     }
 
