@@ -184,6 +184,7 @@ jobs:
           cp wintun/bin/amd64/wintun.dll           "$DIR/wintun.dll"
           cp config.example.toml                   "$DIR/config.example.toml"
           cp packaging/windows/README-windows.txt  "$DIR/README-windows.txt"
+          cp packaging/windows/policy.managed.example.toml "$DIR/policy.managed.example.toml"
           zip -r "${DIR}.zip" "$DIR"
 
       - name: Rename loose binaries for release

@@ -192,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_managed_example_parses_and_validates() {
+        let text = include_str!("../../packaging/windows/policy.managed.example.toml");
+        let p = Policy::parse(text, "policy.managed.example.toml").unwrap();
+        assert!(!p.allow_user_disconnect);
+        assert_eq!(p.kill_switch, KillSwitchPolicy::Enforced);
+        // `enforced` needs a full tunnel in the service config.
+        let mut c = cfg();
+        c.tun.route_all = true;
+        assert!(p.validate(&c).is_ok());
+        c.tun.route_all = false;
+        assert!(p.validate(&c).is_err());
+    }
+
+    #[test]
     fn kill_switch_modes() {
         let enforced = Policy::parse("kill_switch = \"enforced\"", "t").unwrap();
         assert!(enforced.kill_switch_wanted(false) && enforced.kill_switch_wanted(true));

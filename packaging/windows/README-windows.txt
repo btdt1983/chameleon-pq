@@ -11,6 +11,7 @@ Contents
   wintun.dll            TUN driver (amd64). MUST stay in the same folder as
                         the .exe you run — the client loads it at runtime.
   config.example.toml   Annotated example configuration.
+  policy.managed.example.toml  Example policy for managed machines (see below).
   README-windows.txt    This file.
 
 Requirements
@@ -53,6 +54,9 @@ Managed mode (Windows service, no administrator for the user)
       kill_switch = "enforced"       # user_choice | enforced | off
       allow_update_check = false
   Without a policy file nothing changes. An invalid policy stops the service.
+  A ready-made "users cannot disconnect, kill switch enforced" policy is in
+  policy.managed.example.toml. (Always-on, i.e. connecting by itself and
+  reconnecting, is not available yet.)
 
   UPGRADING from a build without these checks: replace chameleon-pq.exe AND
   chameleon-gui.exe together (the pipe protocol changed), then run `service
