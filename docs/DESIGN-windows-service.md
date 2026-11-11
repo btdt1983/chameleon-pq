@@ -111,32 +111,73 @@ read a file of its choosing or talk to a server of its choosing. (The current GU
 
 ## 6. Policy and configuration
 
-Location: `%ProgramData%\Chameleon-PQ\`
+The folder holding the service config is the **data folder**; it must be a
+dedicated subfolder of `%ProgramData%` (for example
+`C:\ProgramData\Chameleon-PQ\`).
 
-| File | Contents | ACL |
+| File | Contents | Access |
 |---|---|---|
-| `config.toml` | Existing `AppConfig`, **including secret keys** | SYSTEM + Administrators only |
-| `policy.toml` | What the user may do | SYSTEM + Admins write; Users read |
-| `logs\` | Service log (rotated) | SYSTEM + Admins write; Users read |
+| `<config>.toml` | Existing `AppConfig`, **including secret keys** | SYSTEM + Administrators only |
+| `policy.toml` | What users may do (optional) | SYSTEM + Administrators only |
+| `logs\service.log` | Service log | SYSTEM + Administrators only |
 
-The service creates this directory with an explicit protected DACL at install/first
-start and **refuses to start** if `config.toml` is readable/writable by non-admins
-(checked, not assumed).
+Nobody else needs access: the GUI never reads these files, it gets everything it
+shows (including a summary of the policy) from the service over the pipe.
 
-Policy fields (initial):
+**Startup order, and why.** Before the service reads or writes anything it
+verifies the data folder; only then does it start its log, load the config and
+load the policy:
+
+1. The folder (and the config, policy and `logs` in it) must be owned by SYSTEM or
+   Administrators, grant access to nobody but SYSTEM, Administrators and CREATOR
+   OWNER, and the folder's DACL must be *protected* (not inheriting ProgramData's
+   permissive defaults). The folder and `logs` must not be junctions or symlinks.
+   On failure the service **refuses to start**, exits with service-specific code 2
+   and writes the reason to the Windows Event Log (Application, source
+   `ChameleonPQ`). It does not write a log file into a folder it just decided it
+   cannot trust.
+2. A *missing* `policy.toml` means the default policy. That is only safe because of
+   step 1: otherwise any user could plant the file.
+3. An *invalid* policy (unknown key, bad value, profile list that excludes the
+   config's own profile, `enforced` without `tun.route_all`) also stops the service.
+
+`service install` locks the folder down first (`icacls` with well-known SIDs, so it
+works on any Windows language), and `service harden` re-applies that and the crash
+recovery settings to an installed service. Hardening re-permissions a whole tree,
+so it refuses any folder that is not a subfolder of `%ProgramData%`.
+
+Policy fields:
 
 ```toml
-allow_user_connect_disconnect = true
-allowed_profiles   = ["balanced", "stealth"]   # or ["*"]
-kill_switch        = "enforced"                # enforced | user_choice | off
-auto_connect       = "on_service_start"        # never | on_service_start
-allow_update_check = false                      # GUI GitHub check off in managed mode
+allow_user_disconnect = true                  # connecting is always allowed
+allowed_profiles   = ["balanced", "stealth"]  # omit = all; must include the config's profile
+kill_switch        = "user_choice"            # user_choice | enforced | off
+allow_update_check = false                    # GUI GitHub check; off by default when managed
 ```
 
-`kill_switch = enforced` means: engaged whenever the service is running, and
-users cannot clear it. Admins can via `chameleon-pq.exe killswitch off`
-(elevated) or by stopping the service. This is the semantic difference from today,
-where the escape hatch is available to whoever runs the GUI.
+`auto_connect` is intentionally not offered yet: it needs a reconnect/backoff
+design first, and an option that does nothing is worse than none.
+
+`kill_switch`:
+
+* `user_choice`: follow `tun.kill_switch` in the service config (today's behaviour).
+* `off`: never engage it.
+* `enforced`: engaged at **every connect**, whatever the config says, and kept
+  engaged when a user disconnects (the user is offline rather than unprotected).
+  A connection whose kill switch could not be engaged is closed. Users cannot
+  clear it; administrators can (`chameleon-pq.exe killswitch off`, or stopping the
+  service). This is **not** "traffic blocked whenever the service runs": engaging
+  needs the TUN adapter to exist, so it takes effect from the first connect.
+  `allow_user_disconnect = false` is the stricter knob (no Disconnect at all).
+
+The pipe protocol is version 2: the pushed state carries a policy summary so the
+GUI can offer only the allowed profiles and hide Disconnect or the update check.
+The service enforces the policy regardless of what the GUI shows.
+
+**Crash recovery.** The service is registered to restart 5 s and then 30 s after a
+crash, and only after a crash: a deliberate exit with an error code (like the
+folder check above) must not become a restart loop. The tunnel does not come back
+on its own; the service and its pipe do, so a user can reconnect.
 
 Later (not now): the same fields read from `HKLM\Software\Policies\Chameleon-PQ`
 (ADMX/GPO/Intune) with registry taking precedence over `policy.toml`.
@@ -202,8 +243,8 @@ checks need a small amount of `unsafe` (`windows-sys`); confine it to
 Defaults implemented (no explicit recommendation was given for 2 and 4, so
 these are the conservative picks; both are policy and can change in M4):
 
-- Decision 2: `auto_connect = never`. Always-on is opt-in via policy.
-- Decision 4: users may disconnect (`allow_user_connect_disconnect = true`).
+- Decision 2: no auto-connect. It will be an opt-in policy field once reconnect/backoff exists.
+- Decision 4: users may disconnect (`allow_user_disconnect = true`).
 - Until policy exists (M4), `ClearKillSwitch` over the pipe is always `Denied`;
   admins use the elevated `chameleon-pq killswitch off`.
 
@@ -214,7 +255,7 @@ these are the conservative picks; both are policy and can change in M4):
 | M1 | `protocol.rs` + `supervisor.rs`; GUI calls Supervisor in-process. **No behaviour change.** | Existing tests + new Supervisor tests with mock TUN; Windows regression on the Hyper-V VM |
 | M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run/console` (**implemented**: protocol + codec, controller actor, transport-independent connection server, pipe transport, SCM host) | Linux: duplex-stream tests. Windows CI: real-pipe tests. Manual: install and run the service on the VM |
 | M3 | GUI on `ServiceClient` (**implemented**: `control::client`, Windows pipe client with pipe-owner check, GUI service mode; standalone mode kept for Linux/dev). Mode is decided by "service installed", never by pipe reachability, and never changes mid-session | Linux: client tested against the real server over duplex streams; GUI view-model tests. Manual: standard user on the VM |
-| M4 | ProgramData layout, ACL checks, `policy.toml`, enforced kill switch | Policy matrix tests; kill-switch crash/recovery scenarios |
+| M4 | Data-folder checks and hardening, `policy.toml`, enforced kill switch, crash recovery, protocol v2 (**implemented**) | Linux: policy matrix through the controller, GUI policy tests. Windows CI: DACL check against a hardened, widened and inheriting folder, junction rejection. Manual: upgrade steps in `README-windows.txt` |
 | M5 | Codec fuzz target, threat-model review, docs | Fuzz in CI; reviewed against section 7 |
 
 MSI/signing (next phase) builds on M4.

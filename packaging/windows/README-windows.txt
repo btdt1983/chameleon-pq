@@ -39,6 +39,25 @@ Managed mode (Windows service, no administrator for the user)
       chameleon-pq.exe --config "C:\ProgramData\Chameleon-PQ\config.toml" service install
       sc start ChameleonPQ
 
+  `service install` also locks the config folder down: only SYSTEM and
+  Administrators may read or write it (it holds your private key). The folder
+  must be its own subfolder of C:\ProgramData. The service refuses to start if
+  that is not the case and says why in the Windows Event Log (Application,
+  source ChameleonPQ). Repair at any time (and after upgrading from an older
+  version) with:
+      chameleon-pq.exe --config "C:\ProgramData\Chameleon-PQ\config.toml" service harden
+
+  Optional policy file next to the config (policy.toml), for example:
+      allow_user_disconnect = false
+      allowed_profiles = ["balanced", "stealth"]
+      kill_switch = "enforced"       # user_choice | enforced | off
+      allow_update_check = false
+  Without a policy file nothing changes. An invalid policy stops the service.
+
+  UPGRADING from a build without these checks: replace chameleon-pq.exe AND
+  chameleon-gui.exe together (the pipe protocol changed), then run `service
+  harden` once, then `sc.exe stop ChameleonPQ` and `sc.exe start ChameleonPQ`.
+
   Check the registered path is quoted:   sc qc ChameleonPQ
   Service log:   C:\ProgramData\Chameleon-PQ\logs\service.log
   Remove:        chameleon-pq.exe service uninstall

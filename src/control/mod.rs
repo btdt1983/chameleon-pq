@@ -17,3 +17,5 @@ pub mod pipe_windows;
 #[cfg(windows)]
 pub mod service_windows;
 pub mod supervisor;
+#[cfg(windows)]
+pub mod winsec_windows;

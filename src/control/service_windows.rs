@@ -10,8 +10,10 @@
 
 use super::controller::{self, ControllerHandle};
 use super::pipe_windows;
+use super::policy::Policy;
 use super::server::Server;
 use super::supervisor::Supervisor;
+use super::winsec_windows as winsec;
 use crate::config::{AppConfig, ServiceAction};
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::OsString;
@@ -21,8 +23,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction as ScmAction, ServiceActionType, ServiceControl,
+    ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
+    ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -42,9 +46,9 @@ pub fn run_cli(action: &ServiceAction, config: &Path, verbose: u8) -> Result<()>
         ServiceAction::Install {
             allow_insecure_path,
         } => install(config, *allow_insecure_path),
+        ServiceAction::Harden => harden(config),
         ServiceAction::Uninstall => uninstall(),
         ServiceAction::Run => {
-            init_file_logging(verbose)?;
             CONFIG_PATH
                 .set(config.to_path_buf())
                 .map_err(|_| anyhow!("service started twice"))?;
@@ -53,9 +57,11 @@ pub fn run_cli(action: &ServiceAction, config: &Path, verbose: u8) -> Result<()>
         }
         ServiceAction::Console => {
             init_console_logging(verbose);
-            let cfg = AppConfig::load(config)?;
+            // Debug mode: a failing folder check is a warning here, not a stop,
+            // so an administrator can try things in a scratch folder.
+            let (cfg, policy) = startup(config, false)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_core(cfg, async {
+            rt.block_on(run_core(cfg, policy, async {
                 let _ = tokio::signal::ctrl_c().await;
             }))
         }
@@ -114,8 +120,7 @@ fn run_service() -> Result<()> {
 
     let result = (|| -> Result<()> {
         let path = CONFIG_PATH.get().ok_or_else(|| anyhow!("no config path"))?;
-        let cfg = AppConfig::load(path)
-            .with_context(|| format!("loading service config {}", path.display()))?;
+        let (cfg, policy) = startup(path, true)?;
         let rt = tokio::runtime::Runtime::new()?;
         let status_handle = &handle;
         rt.block_on(async {
@@ -127,6 +132,7 @@ fn run_service() -> Result<()> {
             });
             run_core_with(
                 cfg,
+                policy,
                 async {
                     let _ = stop_async_rx.await;
                 },
@@ -157,7 +163,12 @@ fn run_service() -> Result<()> {
         Ok(()) => ServiceExitCode::Win32(0),
         Err(e) => {
             tracing::error!("service stopping on error: {e:#}");
-            ServiceExitCode::ServiceSpecific(1)
+            // 2 = refused to trust its data folder, 1 = anything else.
+            if e.downcast_ref::<SecurityRefusal>().is_some() {
+                ServiceExitCode::ServiceSpecific(2)
+            } else {
+                ServiceExitCode::ServiceSpecific(1)
+            }
         }
     };
     handle.set_service_status(status(
@@ -170,10 +181,69 @@ fn run_service() -> Result<()> {
     result
 }
 
+// ── Startup checks ───────────────────────────────────────────────────────────
+
+/// The data folder could not be trusted; distinct so the exit code says so.
+#[derive(Debug)]
+struct SecurityRefusal(String);
+
+impl std::fmt::Display for SecurityRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SecurityRefusal {}
+
+/// Everything the service needs before it may run, in the order that matters:
+/// 1. verify the data folder (before reading or writing anything in it);
+/// 2. only then start the file log inside it;
+/// 3. load and cross-check the config and the policy.
+///
+/// With `enforce_acl` false (console debugging) a failed folder check is only
+/// a warning.
+fn startup(config: &Path, enforce_acl: bool) -> Result<(AppConfig, Policy)> {
+    let dir = config
+        .parent()
+        .ok_or_else(|| anyhow!("the config path has no folder"))?;
+    let policy_path = dir.join("policy.toml");
+
+    if let Err(why) = winsec::check_data_dir(dir, &[config.to_path_buf(), policy_path.clone()]) {
+        if enforce_acl {
+            let msg = format!(
+                "refusing to start: the data folder is not safe ({why}). Run, as \
+                 Administrator: chameleon-pq.exe --config \"{}\" service harden",
+                config.display()
+            );
+            // Not the file log: that would write into a folder we just decided
+            // we cannot trust.
+            winsec::report_error_event(&msg);
+            return Err(SecurityRefusal(msg).into());
+        }
+        eprintln!(
+            "WARNING: data folder check failed ({why}); continuing because this is console mode"
+        );
+    }
+
+    if enforce_acl {
+        init_file_logging(&dir.join("logs"))?;
+    }
+    let cfg = AppConfig::load(config)
+        .with_context(|| format!("loading service config {}", config.display()))?;
+    let policy = Policy::load(&policy_path)?;
+    policy.validate(&cfg)?;
+    tracing::info!("policy: {policy:?}");
+    Ok((cfg, policy))
+}
+
 // ── Shared core (service and console) ────────────────────────────────────────
 
-async fn run_core(cfg: AppConfig, stop: impl std::future::Future<Output = ()>) -> Result<()> {
-    run_core_with(cfg, stop, || {}, |_| {}).await
+async fn run_core(
+    cfg: AppConfig,
+    policy: Policy,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    run_core_with(cfg, policy, stop, || {}, |_| {}).await
 }
 
 /// Start the controller and the pipe; wait for `stop`; tear down in order.
@@ -181,12 +251,13 @@ async fn run_core(cfg: AppConfig, stop: impl std::future::Future<Output = ()>) -
 /// increasing checkpoint while teardown is in progress.
 async fn run_core_with(
     cfg: AppConfig,
+    policy: Policy,
     stop: impl std::future::Future<Output = ()>,
     on_running: impl FnOnce(),
     mut on_stopping: impl FnMut(u32),
 ) -> Result<()> {
     let (handle, controller_task): (ControllerHandle, _) =
-        controller::spawn(cfg, Supervisor::new(), controller::real_connect());
+        controller::spawn_with_policy(cfg, policy, Supervisor::new(), controller::real_connect());
     let server = Server::new(handle.clone());
     let (pipe_stop_tx, pipe_stop_rx) = oneshot::channel();
     let mut pipe_task = tokio::spawn(pipe_windows::serve(
@@ -317,8 +388,21 @@ fn install(config: &Path, allow_insecure_path: bool) -> Result<()> {
             .canonicalize()
             .with_context(|| format!("config {} not found", config.display()))?,
     );
+    let data_dir = config
+        .parent()
+        .ok_or_else(|| anyhow!("the config path has no folder"))?
+        .to_path_buf();
+    // Lock the data folder down BEFORE the service can ever read it: it holds
+    // the private key and is read by a SYSTEM process.
+    winsec::harden_data_dir(&data_dir).map_err(|e| anyhow!(e))?;
+    println!(
+        "Folder {} is now readable by SYSTEM and Administrators only.",
+        data_dir.display()
+    );
     // Fail now rather than at first start.
-    AppConfig::load(&config).context("the service config is not valid")?;
+    let cfg = AppConfig::load(&config).context("the service config is not valid")?;
+    let policy = Policy::load(&data_dir.join("policy.toml"))?;
+    policy.validate(&cfg)?;
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -344,14 +428,72 @@ fn install(config: &Path, allow_insecure_path: bool) -> Result<()> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        .create_service(
+            &info,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+        )
         .context("could not create the service (is it already installed? run as Administrator)")?;
     service.set_description(DESCRIPTION)?;
+    apply_recovery(&service)?;
     println!(
         "Service {SERVICE_NAME} installed ({}), config {}.\nStart it with: sc start {SERVICE_NAME}\nVerify the quoting with: sc qc {SERVICE_NAME}",
         exe.display(),
         config.display()
     );
+    Ok(())
+}
+
+/// Restart the service after a crash (5 s, then 30 s), then leave it stopped.
+/// Only real crashes count: a deliberate exit with an error code (for example
+/// the folder check refusing to start) must not turn into a restart loop.
+/// The tunnel itself does not come back on its own (there is no auto-connect);
+/// the service and its pipe do, so a user can reconnect without an administrator.
+fn apply_recovery(service: &windows_service::service::Service) -> Result<()> {
+    service.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(vec![
+            ScmAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(5),
+            },
+            ScmAction {
+                action_type: ServiceActionType::Restart,
+                delay: Duration::from_secs(30),
+            },
+            ScmAction {
+                action_type: ServiceActionType::None,
+                delay: Duration::from_secs(0),
+            },
+        ]),
+    })?;
+    service.set_failure_actions_on_non_crash_failures(false)?;
+    Ok(())
+}
+
+/// `service harden`: re-apply the folder permissions and the recovery settings
+/// to an already installed service. Idempotent.
+fn harden(config: &Path) -> Result<()> {
+    let config = strip_verbatim(
+        config
+            .canonicalize()
+            .with_context(|| format!("config {} not found", config.display()))?,
+    );
+    let dir = config
+        .parent()
+        .ok_or_else(|| anyhow!("the config path has no folder"))?;
+    winsec::harden_data_dir(dir).map_err(|e| anyhow!(e))?;
+    println!(
+        "Folder {} is now readable by SYSTEM and Administrators only.",
+        dir.display()
+    );
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        .context("service not installed (or not running as Administrator)")?;
+    apply_recovery(&service)?;
+    println!("Crash recovery set: restart after 5 s, then after 30 s.");
     Ok(())
 }
 
@@ -395,20 +537,24 @@ fn init_console_logging(verbose: u8) {
         .try_init();
 }
 
-/// stderr goes nowhere under the SCM, so log to a file under ProgramData.
-fn init_file_logging(verbose: u8) -> Result<()> {
+/// stderr goes nowhere under the SCM, so log to a file in the (already
+/// verified) data folder. The `logs` folder must be a real directory, not a
+/// junction someone planted to redirect a SYSTEM write.
+fn init_file_logging(logs: &Path) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
-    let base = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    let dir = base.join("Chameleon-PQ").join("logs");
-    std::fs::create_dir_all(&dir)?;
+    if logs.exists() {
+        if winsec::is_reparse_point(logs)? {
+            bail!("{} is a junction or symlink", logs.display());
+        }
+    } else {
+        std::fs::create_dir(logs)?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("service.log"))?;
+        .open(logs.join("service.log"))?;
     let _ = fmt()
-        .with_env_filter(EnvFilter::new(level(verbose)))
+        .with_env_filter(EnvFilter::new("info"))
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(file))
         .try_init();
