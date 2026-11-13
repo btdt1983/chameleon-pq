@@ -363,7 +363,28 @@ mod tests {
         let file = dir.join("config.toml");
         std::fs::write(&file, "x").unwrap();
         // A fresh child inherits the clean ACL.
-        check_data_dir(&dir, &[file.clone()]).expect("hardened dir passes");
+        if let Err(e) = check_data_dir(&dir, &[file.clone()]) {
+            // Diagnostic for CI: show the real ACL the check objected to.
+            let acl = Command::new("icacls").arg(&dir).output().unwrap();
+            let sids = Command::new("icacls")
+                .arg(&dir)
+                .arg("/save")
+                .arg(dir.with_extension("acl.txt"))
+                .output()
+                .unwrap();
+            let saved = std::fs::read(dir.with_extension("acl.txt")).unwrap_or_default();
+            panic!(
+                "hardened dir passes: {e}\n--- icacls ---\n{}\n--- icacls /save ({:?}) ---\n{}",
+                String::from_utf8_lossy(&acl.stdout),
+                sids.status,
+                String::from_utf16_lossy(
+                    &saved
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
 
         // Add read access for the BUILTIN\Users group (S-1-5-32-545).
         run_icacls(&[&dir.to_string_lossy(), "/grant", "*S-1-5-32-545:(OI)(CI)R"]).unwrap();
