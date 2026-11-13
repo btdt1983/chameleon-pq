@@ -318,6 +318,9 @@ mod tests {
             kill_switch: crate::control::protocol::KillSwitchState::Off,
             profile: TrafficProfile::default(),
             warnings: vec![],
+            policy: crate::control::protocol::PolicySummary::from(
+                &crate::control::policy::Policy::default(),
+            ),
         };
         tokio::spawn(async move {
             let _ = read_frame(&mut s).await; // client Hello

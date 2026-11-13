@@ -1,0 +1,26 @@
+# Chameleon-PQ policy for a managed machine (Netskope-style: users cannot turn
+# the VPN off). Copy next to the service config as policy.toml, for example
+#   C:\ProgramData\Chameleon-PQ\policy.toml
+# then: sc.exe stop ChameleonPQ  and  sc.exe start ChameleonPQ
+#
+# Only SYSTEM and Administrators may read or write that folder; the service
+# refuses to start otherwise (run `service harden` to fix the permissions).
+
+# Users cannot disconnect (the GUI shows an inert button, the service refuses).
+allow_user_disconnect = false
+
+# The kill switch is forced on at every connect and stays on if the tunnel
+# drops or a user disconnects. Requires tun.route_all = true in the service
+# config. Administrators remove it with: chameleon-pq.exe killswitch off
+kill_switch = "enforced"
+
+# Optional: restrict which traffic profiles users can pick. The profile in the
+# service config must be in the list. Leave it out to allow all of them.
+# allowed_profiles = ["balanced", "stealth"]
+
+# No "Check for updates" from the GUI on a managed machine.
+allow_update_check = false
+
+# NOT YET AVAILABLE: always-on. There is no auto-connect or automatic reconnect
+# yet, so a user still has to press Connect after the service starts, and until
+# the first connection no kill switch is engaged. Planned as a separate step.

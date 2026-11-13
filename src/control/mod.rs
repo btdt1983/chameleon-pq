@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod controller;
+pub mod policy;
 pub mod protocol;
 pub mod server;
 
@@ -16,3 +17,5 @@ pub mod pipe_windows;
 #[cfg(windows)]
 pub mod service_windows;
 pub mod supervisor;
+#[cfg(windows)]
+pub mod winsec_windows;

@@ -9,9 +9,10 @@
 //! The connect function is injected ([`ConnectFn`]) so tests never touch a TUN
 //! adapter or the firewall.
 
+use super::policy::Policy;
 use super::protocol::{
-    ErrorCode, KillSwitchState, LogLine, Phase, Request, Response, StateSnapshot, TrafficProfile,
-    TunnelInfo,
+    ErrorCode, KillSwitchState, LogLine, Phase, PolicySummary, Request, Response, StateSnapshot,
+    TrafficProfile, TunnelInfo,
 };
 use super::supervisor::{self, ConnectOutcome, Supervisor};
 use crate::client::security_warnings;
@@ -73,6 +74,30 @@ impl ControllerHandle {
     }
 }
 
+/// Under `enforced`, a tunnel without its kill switch is not acceptable: if the
+/// switch could not be engaged, close the tunnel and report why. (A failed
+/// attempt leaves any switch that did engage in place, as for a failed connect.)
+fn require_kill_switch(outcome: ConnectOutcome) -> ConnectOutcome {
+    match outcome {
+        (Ok(client), Some(Ok(ks))) => (Ok(client), Some(Ok(ks))),
+        (Ok(client), other) => {
+            client.disconnect();
+            let why = match &other {
+                Some(Err(e)) => e.clone(),
+                _ => "not requested".to_string(),
+            };
+            (
+                Err(format!(
+                    "the kill switch is enforced by your administrator but could not be \
+                     engaged ({why}); the connection was closed"
+                )),
+                other,
+            )
+        }
+        failed => failed,
+    }
+}
+
 fn stopped() -> Response {
     Response::Error {
         code: ErrorCode::Internal,
@@ -87,9 +112,21 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     }
 }
 
-/// Start the controller task. `cfg` is the administrator's config.
+/// Start the controller task with the default (permissive, today's) policy.
 pub fn spawn(
     cfg: AppConfig,
+    supervisor: Supervisor,
+    connect_fn: ConnectFn,
+) -> (ControllerHandle, JoinHandle<()>) {
+    spawn_with_policy(cfg, Policy::default(), supervisor, connect_fn)
+}
+
+/// Start the controller task. `cfg` is the administrator's config and `policy`
+/// what the users of the service may do; the caller has validated the pair
+/// ([`Policy::validate`]).
+pub fn spawn_with_policy(
+    cfg: AppConfig,
+    policy: Policy,
     mut supervisor: Supervisor,
     connect_fn: ConnectFn,
 ) -> (ControllerHandle, JoinHandle<()>) {
@@ -97,9 +134,10 @@ pub fn spawn(
     let (tx, rx) = mpsc::channel(32);
     let (outcome_tx, outcome_rx) = mpsc::channel(1);
     let profile = cfg.traffic.profile;
-    let (state_tx, state_rx) = watch::channel(snapshot(&supervisor, profile, &cfg));
+    let (state_tx, state_rx) = watch::channel(snapshot(&supervisor, profile, &cfg, &policy));
     let actor = Actor {
         cfg,
+        policy,
         sup: supervisor,
         profile,
         log: VecDeque::new(),
@@ -118,7 +156,12 @@ pub fn spawn(
     )
 }
 
-fn snapshot(sup: &Supervisor, profile: TrafficProfile, cfg: &AppConfig) -> StateSnapshot {
+fn snapshot(
+    sup: &Supervisor,
+    profile: TrafficProfile,
+    cfg: &AppConfig,
+    policy: &Policy,
+) -> StateSnapshot {
     let phase = if sup.is_connecting() {
         Phase::Connecting
     } else if sup.is_connected() {
@@ -147,11 +190,13 @@ fn snapshot(sup: &Supervisor, profile: TrafficProfile, cfg: &AppConfig) -> State
         kill_switch,
         profile,
         warnings: security_warnings(cfg),
+        policy: PolicySummary::from(policy),
     }
 }
 
 struct Actor {
     cfg: AppConfig,
+    policy: Policy,
     sup: Supervisor,
     profile: TrafficProfile,
     log: VecDeque<LogLine>,
@@ -202,20 +247,34 @@ impl Actor {
 
     fn handle(&mut self, req: Request) -> Response {
         match req {
-            Request::GetState {} => Response::State(snapshot(&self.sup, self.profile, &self.cfg)),
+            Request::GetState {} => Response::State(self.snapshot()),
             Request::GetLog { since } => Response::Log {
                 lines: self.log.iter().filter(|l| l.seq > since).cloned().collect(),
             },
             Request::Connect { profile } => self.connect(profile),
             Request::Disconnect {} => {
+                if !self.policy.allow_user_disconnect {
+                    return error(
+                        ErrorCode::Denied,
+                        "your administrator does not allow disconnecting",
+                    );
+                }
                 if self.sup.is_connecting() {
                     return error(ErrorCode::Busy, "a connection attempt is in progress");
                 }
-                let lines = self.sup.disconnect();
+                let lines = self
+                    .sup
+                    .disconnect(self.policy.disconnect_keeps_kill_switch());
                 self.push_log(lines);
                 Response::Ok {}
             }
             Request::SetProfile { profile } => {
+                if !self.policy.profile_allowed(profile) {
+                    return error(
+                        ErrorCode::Denied,
+                        format!("the profile '{profile}' is not allowed by your administrator"),
+                    );
+                }
                 self.profile = profile;
                 self.cfg.traffic.profile = profile;
                 let line = if self.sup.apply_traffic(&self.cfg.traffic) {
@@ -243,17 +302,29 @@ impl Actor {
             return error(ErrorCode::Internal, "the service config has no server_addr");
         };
         if let Some(p) = profile {
+            if !self.policy.profile_allowed(p) {
+                return error(
+                    ErrorCode::Denied,
+                    format!("the profile '{p}' is not allowed by your administrator"),
+                );
+            }
             self.profile = p;
             self.cfg.traffic.profile = p;
         }
         let cfg = self.cfg.clone();
-        let want_kill_switch = cfg.tun.kill_switch;
+        let want_kill_switch = self.policy.kill_switch_wanted(cfg.tun.kill_switch);
+        let enforced = self.policy.kill_switch == super::policy::KillSwitchPolicy::Enforced;
         self.sup.begin_connect();
         self.push_log(vec![format!("Connecting to {server} …")]);
         let fut = (self.connect_fn)(cfg, server, want_kill_switch);
         let tx = self.outcome_tx.clone();
         tokio::spawn(async move {
             let outcome = fut.await;
+            let outcome = if enforced {
+                require_kill_switch(outcome)
+            } else {
+                outcome
+            };
             let _ = tx.send(outcome).await;
         });
         Response::Ok {}
@@ -273,6 +344,10 @@ impl Actor {
         self.publish();
     }
 
+    fn snapshot(&self) -> StateSnapshot {
+        snapshot(&self.sup, self.profile, &self.cfg, &self.policy)
+    }
+
     fn push_log(&mut self, lines: Vec<String>) {
         for text in lines {
             tracing::info!("{text}");
@@ -289,7 +364,7 @@ impl Actor {
 
     /// Publish the snapshot if it changed.
     fn publish(&self) {
-        let snap = snapshot(&self.sup, self.profile, &self.cfg);
+        let snap = self.snapshot();
         self.state_tx.send_if_modified(|cur| {
             if *cur == snap {
                 false
@@ -454,6 +529,137 @@ mod tests {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::Internal),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn start_with(
+        cfg: AppConfig,
+        policy: Policy,
+        connect_fn: ConnectFn,
+    ) -> (ControllerHandle, JoinHandle<()>) {
+        spawn_with_policy(cfg, policy, Supervisor::with_orphan(false), connect_fn)
+    }
+
+    fn denied(resp: Response) -> bool {
+        matches!(
+            resp,
+            Response::Error {
+                code: ErrorCode::Denied,
+                ..
+            }
+        )
+    }
+
+    /// A connect fn that records the kill-switch flag it was asked for.
+    fn recording(flag: Arc<std::sync::atomic::AtomicI8>) -> ConnectFn {
+        Arc::new(move |_c, _s, ks| {
+            flag.store(ks as i8, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { (Err("x".to_string()), None) })
+        })
+    }
+
+    #[tokio::test]
+    async fn policy_can_forbid_disconnect() {
+        let policy = Policy::parse("allow_user_disconnect = false", "t").unwrap();
+        let (h, _j) = start_with(
+            test_cfg(),
+            policy,
+            gated_failure(Arc::new(Notify::new()), "x"),
+        );
+        assert!(denied(h.request(Request::Disconnect {}).await));
+        // The summary tells the GUI, so it can hide the button.
+        assert!(!state(&h).await.policy.allow_user_disconnect);
+    }
+
+    #[tokio::test]
+    async fn policy_limits_the_profiles_for_set_profile_and_connect() {
+        let cfg = test_cfg();
+        let own = format!("{:?}", cfg.traffic.profile).to_lowercase();
+        // Allow only the config's own profile.
+        let policy = Policy::parse(&format!("allowed_profiles = [\"{own}\"]"), "t").unwrap();
+        let other = [
+            TrafficProfile::Stealth,
+            TrafficProfile::Balanced,
+            TrafficProfile::Throughput,
+            TrafficProfile::Off,
+        ]
+        .into_iter()
+        .find(|p| *p != cfg.traffic.profile)
+        .unwrap();
+        let (h, _j) = start_with(
+            cfg.clone(),
+            policy,
+            gated_failure(Arc::new(Notify::new()), "x"),
+        );
+
+        assert!(denied(
+            h.request(Request::SetProfile { profile: other }).await
+        ));
+        assert!(denied(
+            h.request(Request::Connect {
+                profile: Some(other)
+            })
+            .await
+        ));
+        // Neither the refused SetProfile nor the refused Connect changed anything.
+        let s = state(&h).await;
+        assert_eq!(s.profile, cfg.traffic.profile);
+        assert_eq!(s.phase, Phase::Disconnected);
+        // The allowed profile still works.
+        assert_eq!(
+            h.request(Request::SetProfile {
+                profile: cfg.traffic.profile
+            })
+            .await,
+            Response::Ok {}
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_policy_decides_what_connect_asks_for() {
+        use std::sync::atomic::{AtomicI8, Ordering};
+        for (policy, cfg_value, expected) in [
+            ("kill_switch = \"user_choice\"", true, 1),
+            ("kill_switch = \"user_choice\"", false, 0),
+            ("kill_switch = \"enforced\"", false, 1),
+            ("kill_switch = \"enforced\"", true, 1),
+            ("kill_switch = \"off\"", true, 0),
+            ("kill_switch = \"off\"", false, 0),
+        ] {
+            let mut cfg = test_cfg();
+            cfg.tun.kill_switch = cfg_value;
+            cfg.tun.route_all = true;
+            let flag = Arc::new(AtomicI8::new(-1));
+            let (h, _j) = start_with(
+                cfg,
+                Policy::parse(policy, "t").unwrap(),
+                recording(flag.clone()),
+            );
+            assert_eq!(
+                h.request(Request::Connect { profile: None }).await,
+                Response::Ok {}
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while flag.load(Ordering::SeqCst) == -1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("connect fn called");
+            assert_eq!(
+                flag.load(Ordering::SeqCst),
+                expected,
+                "policy [{policy}] with config kill_switch={cfg_value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_under_enforced_passes_through_untouched() {
+        // Failures (no tunnel was built) need no extra handling.
+        let failed: ConnectOutcome = (Err("boom".into()), Some(Err("ks".into())));
+        let out = require_kill_switch(failed);
+        assert_eq!(out.0.err().as_deref(), Some("boom"));
+        assert_eq!(out.1.unwrap().err().as_deref(), Some("ks"));
     }
 
     #[tokio::test]

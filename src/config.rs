@@ -170,6 +170,10 @@ pub enum ServiceAction {
         #[arg(long)]
         allow_insecure_path: bool,
     },
+    /// Re-apply the folder permissions and the crash-recovery settings to an
+    /// installed service (idempotent). Run this after upgrading from a version
+    /// that did not set them.
+    Harden,
     /// Stop (if running) and remove the service.
     Uninstall,
     /// Entry point used by the Service Control Manager. Not for interactive use.

@@ -128,6 +128,8 @@ windows-sys = { version = "0.52", features = [
     # Pipe DACL from an SDDL string (control/pipe_windows.rs).
     "Win32_Security",
     "Win32_Security_Authorization",
+    # Event Log entry when the service refuses to start (control/winsec_windows.rs).
+    "Win32_System_EventLog",
 ]}
 # Windows service host (SCM registration + control handler).
 windows-service = "0.8"
