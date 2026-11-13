@@ -44,7 +44,12 @@ pub async fn connect(cfg: AppConfig, server: SocketAddr, want_kill_switch: bool)
     tracing::info!("connect: step 1/3 build_auth");
     let auth = match build_auth(&cfg) {
         Ok(a) => a,
-        Err(e) => return (Err(e.to_string()), None),
+        Err(e) => {
+            return (
+                Err(format!("{}{e}", super::reconnect::CONFIG_ERROR_PREFIX)),
+                None,
+            )
+        }
     };
     tracing::info!("connect: step 2/3 TunPair::create (Windows: admin + wintun.dll next to .exe)");
     let tun = match TunPair::create(&cfg.tun) {

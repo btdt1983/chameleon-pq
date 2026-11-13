@@ -17,7 +17,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped on an incompatible change. Exchanged in [`Hello`].
 /// v2: `StateSnapshot` carries the administrator policy summary.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: `Phase::Reconnecting` and `StateSnapshot::reconnect` (automatic reconnect).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -31,6 +32,9 @@ pub enum Phase {
     Disconnected,
     Connecting,
     Connected,
+    /// The service wants to be connected, the last attempt failed or the tunnel
+    /// dropped, and it is waiting for the next attempt (see `reconnect`).
+    Reconnecting,
 }
 
 /// Machine-readable error class (the human text travels separately and is
@@ -116,6 +120,20 @@ pub struct StateSnapshot {
     /// Secure-by-default warnings for the active config.
     pub warnings: Vec<String>,
     pub policy: PolicySummary,
+    /// Present while the service is retrying on its own.
+    pub reconnect: Option<ReconnectInfo>,
+}
+
+/// Progress of the automatic reconnect, for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconnectInfo {
+    /// 1 for the first retry.
+    pub attempt: u32,
+    /// Seconds until the next attempt; `None` while an attempt is running.
+    pub next_in_secs: Option<u64>,
+    /// Why the previous attempt (or the tunnel) failed.
+    pub last_error: Option<String>,
 }
 
 /// First message in each direction.
@@ -281,6 +299,7 @@ mod tests {
             kill_switch: KillSwitchState::Engaged,
             profile: TrafficProfile::Balanced,
             warnings: vec!["w".into()],
+            reconnect: None,
             policy: PolicySummary::from(&crate::control::policy::Policy::default()),
         }
     }

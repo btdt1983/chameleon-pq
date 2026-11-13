@@ -16,7 +16,8 @@ use chameleon::client::security_warnings;
 use chameleon::config::{AppConfig, TrafficProfile};
 use chameleon::control::client::ServiceClient;
 use chameleon::control::protocol::{
-    ErrorCode, KillSwitchState, Phase, PolicySummary, Request, Response, StateSnapshot,
+    ErrorCode, KillSwitchState, Phase, PolicySummary, ReconnectInfo, Request, Response,
+    StateSnapshot,
 };
 use chameleon::control::supervisor::{self, ConnectOutcome, Supervisor};
 use iced::widget::{
@@ -539,6 +540,25 @@ impl App {
         }
     }
 
+    /// The service is waiting to retry after a failure or a dropped tunnel.
+    fn is_reconnecting(&self) -> bool {
+        match &self.mode {
+            Mode::Direct => false,
+            Mode::Service(l) => l
+                .state
+                .as_ref()
+                .is_some_and(|s| s.phase == Phase::Reconnecting),
+        }
+    }
+
+    /// Progress of the service's automatic reconnect, if it is retrying.
+    fn reconnect(&self) -> Option<&ReconnectInfo> {
+        match &self.mode {
+            Mode::Direct => None,
+            Mode::Service(l) => l.state.as_ref().and_then(|s| s.reconnect.as_ref()),
+        }
+    }
+
     /// Kill switch engaged (or left over) while there is no tunnel.
     fn ks_stranded(&self) -> bool {
         match &self.mode {
@@ -1034,7 +1054,31 @@ impl App {
 
         // Big action button: Connect / Disconnect / (busy).
         let action: Element<Message> = if self.is_connecting() {
-            button(text("Connecting …")).padding([10, 22]).into()
+            let label = match self.reconnect() {
+                Some(r) => format!("Reconnecting … (attempt {})", r.attempt),
+                None => "Connecting …".to_string(),
+            };
+            button(text(label)).padding([10, 22]).into()
+        } else if self.is_reconnecting() {
+            let r = self.reconnect();
+            let label = format!(
+                "Reconnecting in {} s (attempt {})",
+                r.and_then(|r| r.next_in_secs).unwrap_or(0),
+                r.map_or(0, |r| r.attempt)
+            );
+            if self.may_disconnect() {
+                // Cancels the retries, same request as Disconnect.
+                button(text(format!("{label} — Cancel")))
+                    .style(button::secondary)
+                    .padding([10, 22])
+                    .on_press(Message::Disconnect)
+                    .into()
+            } else {
+                button(text(label))
+                    .style(button::secondary)
+                    .padding([10, 22])
+                    .into()
+            }
         } else if self.is_connected() && !self.may_disconnect() {
             // Shown but inert: the administrator does not allow disconnecting.
             button(text("Disconnect (not allowed)"))
@@ -1358,6 +1402,7 @@ mod tests {
             kill_switch: ks,
             profile: TrafficProfile::default(),
             warnings: vec![],
+            reconnect: None,
             policy: PolicySummary::from(&Policy::default()),
         }
     }
@@ -1399,6 +1444,18 @@ mod tests {
         assert!(app.ks_stranded());
         let app = service_app(Some(snap(Phase::Disconnected, KillSwitchState::Off, false)));
         assert!(!app.ks_stranded());
+
+        // Waiting to retry: not connected, not "stranded", and the info is shown.
+        let mut st = snap(Phase::Reconnecting, KillSwitchState::Engaged, false);
+        st.reconnect = Some(ReconnectInfo {
+            attempt: 3,
+            next_in_secs: Some(8),
+            last_error: Some("unreachable".into()),
+        });
+        let app = service_app(Some(st));
+        assert!(app.is_reconnecting() && !app.is_connected() && !app.is_connecting());
+        assert!(!app.ks_stranded());
+        assert_eq!(app.reconnect().unwrap().attempt, 3);
 
         // No service connection yet: nothing is claimed.
         let app = service_app(None);
