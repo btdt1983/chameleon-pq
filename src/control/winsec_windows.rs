@@ -252,6 +252,10 @@ pub fn apply_admin_only(dir: &Path) -> Result<(), String> {
     let d = dir.to_string_lossy().to_string();
     let grant_system = format!("{SID_SYSTEM}:(OI)(CI)F");
     let grant_admins = format!("{SID_ADMINS}:(OI)(CI)F");
+    // 0. Wipe every explicit entry the directory already has. `/grant:r` below only
+    //    replaces entries for the SIDs it names, so a leftover grant to some other
+    //    account (for example the user that created the folder) would survive.
+    run_icacls(&[&d, "/reset"])?;
     // 1. The directory itself: drop inherited entries, keep only ours.
     run_icacls(&[
         &d,
