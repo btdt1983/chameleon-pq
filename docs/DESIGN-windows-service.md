@@ -151,7 +151,7 @@ the pipe, or impersonates the service/GUI.
 | Arbitrary user controls SYSTEM service | Restricted request set (section 5); policy checks server-side; no paths/addresses in requests |
 | Remote pipe access | `PIPE_REJECT_REMOTE_CLIENTS` |
 | Wrong principals on the pipe | DACL via SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;AU)`; later narrowed to a dedicated local group. The Authenticated Users mask is an explicit `FILE_GENERIC_READ \| FILE_GENERIC_WRITE` **without** `FILE_CREATE_PIPE_INSTANCE` (0x4, which shares its bit with `FILE_APPEND_DATA`): the generic `GW` right would let any user create a rogue instance of the pipe and impersonate the service. The same descriptor is applied to every instance, not just the first |
-| Pipe squatting (fake service) | Service creates the pipe with `first_pipe_instance(true)`; GUI checks the server PID's token is SYSTEM before sending anything |
+| Pipe squatting (fake service) | Service creates the pipe with `first_pipe_instance(true)`. The GUI keeps tokio's `SECURITY_IDENTIFICATION` QoS (a look-alike server cannot impersonate the user) and requires the pipe object's **owner** to be SYSTEM or Administrators, which a standard user cannot arrange. A process-path check was rejected: anyone can run the installed exe unelevated, or script a pipe from an interpreter under Program Files |
 | Malformed/oversized input | Length cap, strict serde types, per-connection timeouts, connection cap, fuzz target for the codec |
 | DLL hijack of `wintun.dll` | Load from the install directory (admin-writable only) by full path; no search-path loading; verify Authenticode signature of `wintun.dll` at load |
 | Key exposure | `config.toml` readable by SYSTEM/Admins only; the GUI never sees key material |
@@ -213,7 +213,7 @@ these are the conservative picks; both are policy and can change in M4):
 |---|---|---|
 | M1 | `protocol.rs` + `supervisor.rs`; GUI calls Supervisor in-process. **No behaviour change.** | Existing tests + new Supervisor tests with mock TUN; Windows regression on the Hyper-V VM |
 | M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run/console` (**implemented**: protocol + codec, controller actor, transport-independent connection server, pipe transport, SCM host) | Linux: duplex-stream tests. Windows CI: real-pipe tests. Manual: install and run the service on the VM |
-| M3 | GUI on `ServiceClient`; remove admin requirement and the "Browse config" path | End-to-end on the VM as a standard user |
+| M3 | GUI on `ServiceClient` (**implemented**: `control::client`, Windows pipe client with pipe-owner check, GUI service mode; standalone mode kept for Linux/dev). Mode is decided by "service installed", never by pipe reachability, and never changes mid-session | Linux: client tested against the real server over duplex streams; GUI view-model tests. Manual: standard user on the VM |
 | M4 | ProgramData layout, ACL checks, `policy.toml`, enforced kill switch | Policy matrix tests; kill-switch crash/recovery scenarios |
 | M5 | Codec fuzz target, threat-model review, docs | Fuzz in CI; reviewed against section 7 |
 
