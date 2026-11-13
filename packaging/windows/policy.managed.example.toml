@@ -6,12 +6,22 @@
 # Only SYSTEM and Administrators may read or write that folder; the service
 # refuses to start otherwise (run `service harden` to fix the permissions).
 
-# Users cannot disconnect (the GUI shows an inert button, the service refuses).
+# Always-on: the service connects by itself when it starts (before anyone logs
+# in) and reconnects after every drop. This also means users cannot disconnect
+# (the GUI shows an inert button, the service refuses), whatever
+# allow_user_disconnect says. Needs network.server_addr in the service config.
+auto_connect = true
+
+# Redundant with auto_connect, kept to show the explicit form.
 allow_user_disconnect = false
 
-# The kill switch is forced on at every connect and stays on if the tunnel
-# drops or a user disconnects. Requires tun.route_all = true in the service
-# config. Administrators remove it with: chameleon-pq.exe killswitch off
+# The kill switch is engaged when the service starts, before any connection:
+# until the tunnel is up only the VPN server, the local network and DHCP are
+# reachable (so hotel or train Wi-Fi sign-in pages do not work). It stays on if
+# the tunnel drops. A system shutdown or crash leaves it on across the reboot;
+# stopping the service as an administrator releases it. Requires
+# tun.route_all = true in the service config. Administrators can also remove
+# it with: chameleon-pq.exe killswitch off
 kill_switch = "enforced"
 
 # Optional: restrict which traffic profiles users can pick. The profile in the
@@ -20,7 +30,3 @@ kill_switch = "enforced"
 
 # No "Check for updates" from the GUI on a managed machine.
 allow_update_check = false
-
-# NOT YET AVAILABLE: always-on. There is no auto-connect or automatic reconnect
-# yet, so a user still has to press Connect after the service starts, and until
-# the first connection no kill switch is engaged. Planned as a separate step.

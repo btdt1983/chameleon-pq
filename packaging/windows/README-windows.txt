@@ -50,17 +50,35 @@ Managed mode (Windows service, no administrator for the user)
 
   Optional policy file next to the config (policy.toml), for example:
       allow_user_disconnect = false
+      auto_connect = true            # connect at service start, always reconnect
       allowed_profiles = ["balanced", "stealth"]
       kill_switch = "enforced"       # user_choice | enforced | off
       allow_update_check = false
   Without a policy file nothing changes. An invalid policy stops the service.
   A ready-made "users cannot disconnect, kill switch enforced" policy is in
-  policy.managed.example.toml. (Always-on, i.e. connecting by itself and
-  reconnecting, is not available yet.)
+  policy.managed.example.toml.
+
+  Reconnect: whenever someone has pressed Connect (or auto_connect is on) the
+  service retries by itself after a failure or a dropped tunnel: after 1, 2, 4,
+  8, 16 and then every 30 s (every 15 s up to 5 min if the server's identity
+  check fails). Disconnect, where allowed, stops it.
+
+  auto_connect = true means: the service connects when it starts, before logon,
+  and users cannot disconnect. With the kill switch on (enforced, or user_choice
+  and tun.kill_switch) the service blocks the machine at start: only the VPN
+  server, the local network and DHCP are reachable until the tunnel is up. That
+  also blocks Wi-Fi sign-in pages. Stopping the service as an administrator
+  (sc.exe stop) releases the kill switch; a system shutdown or a crash keeps
+  it, also across the reboot. If the service cannot start (for example the data
+  folder check fails) while the kill switch is on, the machine stays blocked
+  until an administrator runs: chameleon-pq.exe killswitch off
 
   UPGRADING from a build without these checks: replace chameleon-pq.exe AND
   chameleon-gui.exe together (the pipe protocol changed), then run `service
   harden` once, then `sc.exe stop ChameleonPQ` and `sc.exe start ChameleonPQ`.
+  The service now depends on Tcpip and BFE (the Windows Firewall engine). An
+  existing installation does not get that by itself: run `service uninstall`
+  and `service install` again (the config and policy stay) to add it.
 
   Check the registered path is quoted:   sc qc ChameleonPQ
   Service log:   C:\ProgramData\Chameleon-PQ\logs\service.log

@@ -7,8 +7,8 @@
 //! today's behaviour; that is only safe because the directory holding it is
 //! admin-only (the Windows host verifies that before reading anything).
 //!
-//! `auto_connect` is deliberately absent: it needs a real reconnect/backoff
-//! story first, and an option that does nothing is worse than none.
+//! `auto_connect` (M5b) builds on the controller's reconnect loop: the service
+//! connects on its own at start, and the user may then not disconnect.
 
 use crate::config::{AppConfig, TrafficProfile};
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,12 @@ pub enum KillSwitchPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Policy {
-    /// May the user disconnect? Connecting is always allowed (there is no
-    /// auto-connect yet, so forbidding it would make the tunnel unusable).
+    /// May the user disconnect? Connecting is always allowed. Ignored (always
+    /// "no") while `auto_connect` is on, see [`Policy::disconnect_allowed`].
     pub allow_user_disconnect: bool,
+    /// Connect at service start, before anyone logs in, and keep reconnecting.
+    /// Implies that users cannot disconnect.
+    pub auto_connect: bool,
     /// Profiles the user may pick. `None` = all of them. The config's own
     /// profile must be in the list (checked by [`Policy::validate`]).
     pub allowed_profiles: Option<Vec<TrafficProfile>>,
@@ -51,6 +54,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             allow_user_disconnect: true,
+            auto_connect: false,
             allowed_profiles: None,
             kill_switch: KillSwitchPolicy::UserChoice,
             allow_update_check: false,
@@ -97,6 +101,11 @@ impl Policy {
             path: "policy".into(),
             message,
         };
+        if self.auto_connect && cfg.network.server_addr.is_none() {
+            return Err(bad(
+                "auto_connect = true needs network.server_addr in the service config".into(),
+            ));
+        }
         if self.kill_switch == KillSwitchPolicy::Enforced && !cfg.tun.route_all {
             return Err(bad(
                 "kill_switch = \"enforced\" needs tun.route_all = true in the service config \
@@ -132,6 +141,27 @@ impl Policy {
         match self.kill_switch {
             KillSwitchPolicy::UserChoice => config_value,
             KillSwitchPolicy::Enforced => true,
+            KillSwitchPolicy::Off => false,
+        }
+    }
+
+    /// May a user disconnect? `auto_connect` forbids it: a tunnel that comes up
+    /// by itself and that anyone can drop would not be always-on.
+    pub fn disconnect_allowed(&self) -> bool {
+        self.allow_user_disconnect && !self.auto_connect
+    }
+
+    /// Whether the service engages the (base) kill switch at start, before any
+    /// connection exists: always under `enforced`; under `user_choice` when the
+    /// service connects by itself and the config asks for a kill switch. It needs
+    /// a full tunnel, like every kill switch.
+    pub fn kill_switch_at_start(&self, cfg: &AppConfig) -> bool {
+        if !cfg.tun.route_all {
+            return false;
+        }
+        match self.kill_switch {
+            KillSwitchPolicy::Enforced => true,
+            KillSwitchPolicy::UserChoice => self.auto_connect && cfg.tun.kill_switch,
             KillSwitchPolicy::Off => false,
         }
     }
@@ -195,7 +225,7 @@ mod tests {
     fn the_shipped_managed_example_parses_and_validates() {
         let text = include_str!("../../packaging/windows/policy.managed.example.toml");
         let p = Policy::parse(text, "policy.managed.example.toml").unwrap();
-        assert!(!p.allow_user_disconnect);
+        assert!(!p.allow_user_disconnect && p.auto_connect && !p.disconnect_allowed());
         assert_eq!(p.kill_switch, KillSwitchPolicy::Enforced);
         // `enforced` needs a full tunnel in the service config.
         let mut c = cfg();
@@ -203,6 +233,42 @@ mod tests {
         assert!(p.validate(&c).is_ok());
         c.tun.route_all = false;
         assert!(p.validate(&c).is_err());
+    }
+
+    #[test]
+    fn auto_connect_forbids_disconnect_and_needs_a_server() {
+        let p = Policy::parse("auto_connect = true", "t").unwrap();
+        assert!(p.allow_user_disconnect && !p.disconnect_allowed());
+        assert!(Policy::default().disconnect_allowed());
+        let strict = Policy::parse("allow_user_disconnect = false", "t").unwrap();
+        assert!(!strict.disconnect_allowed());
+
+        let mut c = cfg();
+        assert!(p.validate(&c).is_ok());
+        c.network.server_addr = None;
+        assert!(p.validate(&c).is_err());
+        assert!(Policy::default().validate(&c).is_ok());
+    }
+
+    #[test]
+    fn the_base_kill_switch_at_start_follows_policy_and_config() {
+        let mut c = cfg();
+        c.tun.route_all = true;
+        c.tun.kill_switch = true;
+        let enforced = Policy::parse("kill_switch = \"enforced\"", "t").unwrap();
+        let auto = Policy::parse("auto_connect = true", "t").unwrap();
+        let auto_off = Policy::parse("auto_connect = true\nkill_switch = \"off\"", "t").unwrap();
+        assert!(enforced.kill_switch_at_start(&c));
+        assert!(auto.kill_switch_at_start(&c));
+        assert!(!auto_off.kill_switch_at_start(&c));
+        assert!(!Policy::default().kill_switch_at_start(&c));
+        // The config asks for none: user_choice follows it, enforced does not.
+        c.tun.kill_switch = false;
+        assert!(!auto.kill_switch_at_start(&c));
+        assert!(enforced.kill_switch_at_start(&c));
+        // No full tunnel, no kill switch.
+        c.tun.route_all = false;
+        assert!(!enforced.kill_switch_at_start(&c));
     }
 
     #[test]
