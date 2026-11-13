@@ -102,6 +102,9 @@ pub struct Supervisor {
     /// A kill switch detected at construction that we did NOT create this
     /// session (left over from a crash / app close).
     ks_orphan: bool,
+    /// Where the user finds the reason for a dropped tunnel; embedded in the
+    /// "Tunnel closed" log line. The GUI's default names its own log file.
+    log_hint: String,
 }
 
 impl Default for Supervisor {
@@ -116,14 +119,20 @@ impl Supervisor {
         Self::with_orphan(KillSwitch::is_engaged())
     }
 
-    fn with_orphan(ks_orphan: bool) -> Self {
+    pub(super) fn with_orphan(ks_orphan: bool) -> Self {
         Self {
+            log_hint: "chameleon-gui.log next to the binary".into(),
             client: None,
             status: None,
             connecting: false,
             ks: None,
             ks_orphan,
         }
+    }
+
+    /// Override the log location named in the "Tunnel closed" line.
+    pub fn set_log_hint(&mut self, hint: impl Into<String>) {
+        self.log_hint = hint.into();
     }
 
     pub fn is_connecting(&self) -> bool {
@@ -226,6 +235,27 @@ impl Supervisor {
         log
     }
 
+    /// Orderly teardown for a process that is exiting (service stop). Unlike
+    /// [`Self::disconnect`] this does not return until the tunnel task has
+    /// fully dropped, so routes, DNS and the TUN adapter are restored before the
+    /// caller reports "stopped". Then the kill switch is released (an admin
+    /// stopping the service is a deliberate stop; a crash never gets here and
+    /// leaves it engaged).
+    pub async fn shutdown(&mut self) -> Vec<String> {
+        let mut log = Vec::new();
+        if let Some(c) = self.client.take() {
+            c.disconnect_and_wait().await;
+        }
+        self.status = None;
+        self.connecting = false;
+        if let Some(mut k) = self.ks.take() {
+            k.disengage();
+            log.push("Kill switch disengaged.".into());
+        }
+        log.push("Stopped.".into());
+        log
+    }
+
     /// Periodic refresh (the GUI's 1 s tick). Detects a tunnel that died in the
     /// background and refreshes the status otherwise. Returns log lines.
     pub fn poll(&mut self) -> Vec<String> {
@@ -238,11 +268,10 @@ impl Supervisor {
             // log file.
             if !st.connected {
                 tracing::warn!("tunnel loops stopped — see the log file for the reason");
-                log.push(
-                    "Tunnel closed (background loops stopped). \
-                     Details are in chameleon-gui.log next to the binary."
-                        .into(),
-                );
+                log.push(format!(
+                    "Tunnel closed (background loops stopped). Details are in {}.",
+                    self.log_hint
+                ));
                 self.client = None;
                 self.status = None;
                 // Do NOT disengage the kill switch here: this is exactly the

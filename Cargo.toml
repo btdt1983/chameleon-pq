@@ -99,6 +99,7 @@ tun               = { version = "=0.8.6", features = ["async"] }
 
 # Config
 serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
 toml              = "0.7"
 clap = { version = "4", features = ["derive"] }
 
@@ -113,7 +114,7 @@ anyhow             = "1"
 
 [dev-dependencies]
 # Voor #[tokio::test] loopback-tests van de gebatchte UDP-I/O.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 
 # SO_RCVBUFFORCE/SO_SNDBUFFORCE (bypass net.core.rmem_max when privileged) live
 # behind a raw setsockopt — Linux only.
@@ -124,4 +125,9 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    # Pipe DACL from an SDDL string (control/pipe_windows.rs).
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ]}
+# Windows service host (SCM registration + control handler).
+windows-service = "0.8"

@@ -149,6 +149,33 @@ pub enum Command {
         #[command(subcommand)]
         action: KillSwitchAction,
     },
+    /// Windows service host (run as Administrator): register or remove the
+    /// background service, or run its logic in this console for debugging.
+    /// Uses the global `--config` (absolute path) as the service's config.
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Subcommand, Debug)]
+pub enum ServiceAction {
+    /// Register the service (automatic start, LocalSystem).
+    Install {
+        /// Allow installing from a directory that is not under Program Files.
+        /// A user-writable location lets that user replace a SYSTEM binary:
+        /// development only.
+        #[arg(long)]
+        allow_insecure_path: bool,
+    },
+    /// Stop (if running) and remove the service.
+    Uninstall,
+    /// Entry point used by the Service Control Manager. Not for interactive use.
+    Run,
+    /// Run the service logic in this console until Ctrl-C (debugging).
+    Console,
 }
 
 #[derive(Subcommand, Debug)]
@@ -399,7 +426,7 @@ pub enum TrafficMode {
 /// one go so a user doesn't have to work out the throughput-vs-concealment
 /// trade-off themselves. The profile WINS; the individual fields below apply
 /// only with `custom`. See `effective()` for the exact values per profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrafficProfile {
     /// Max anti-analysis: CBR, low ceiling (~5 Mbit/s), constant bandwidth 24/7.

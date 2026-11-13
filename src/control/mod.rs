@@ -6,5 +6,12 @@
 //! supervisor runs inside a Windows service and the GUI talks to it over a
 //! named pipe using the types in [`protocol`].
 
+pub mod controller;
 pub mod protocol;
+pub mod server;
+
+#[cfg(windows)]
+pub mod pipe_windows;
+#[cfg(windows)]
+pub mod service_windows;
 pub mod supervisor;
