@@ -24,6 +24,9 @@ use tokio::sync::{mpsc, Semaphore};
 
 /// How long a new connection may take to send its `Hello`.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one message may take to write to a client. A client that stays
+/// connected but never reads would otherwise hold its connection slot forever.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Concurrent connections served at once (design doc, section 5).
 pub const MAX_CONNECTIONS: usize = 8;
 
@@ -112,11 +115,11 @@ where
             return Err(e);
         }
     }
-    write_message(&mut writer, &ServerMessage::Hello(Hello::current())).await?;
+    send(&mut writer, &ServerMessage::Hello(Hello::current())).await?;
 
     let mut state = handle.subscribe();
     let initial = state.borrow_and_update().clone();
-    write_message(&mut writer, &ServerMessage::Event(Event::State(initial))).await?;
+    send(&mut writer, &ServerMessage::Event(Event::State(initial))).await?;
 
     // 2. Reader task feeds decoded frames in; this loop never reads directly.
     let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Vec<u8>, CodecError>>(4);
@@ -149,7 +152,7 @@ where
                     match decode::<ClientMessage>(&body) {
                         Ok(ClientMessage::Request(req)) => {
                             let resp = handle.request(req).await;
-                            write_message(&mut writer, &ServerMessage::Response(resp)).await?;
+                            send(&mut writer, &ServerMessage::Response(resp)).await?;
                         }
                         Ok(ClientMessage::Hello(_)) => {
                             send_error(&mut writer, ErrorCode::Protocol, "unexpected Hello".into()).await;
@@ -166,7 +169,7 @@ where
                         return Ok(()); // controller gone
                     }
                     let snap = state.borrow_and_update().clone();
-                    write_message(&mut writer, &ServerMessage::Event(Event::State(snap))).await?;
+                    send(&mut writer, &ServerMessage::Event(Event::State(snap))).await?;
                 }
             }
         }
@@ -174,6 +177,18 @@ where
     .await;
 
     result
+}
+
+/// `write_message` with a deadline.
+async fn send<W: AsyncWrite + Unpin>(w: &mut W, msg: &ServerMessage) -> Result<(), CodecError> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_message(w, msg))
+        .await
+        .map_err(|_| {
+            CodecError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "client does not read",
+            ))
+        })?
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -185,7 +200,7 @@ impl Drop for AbortOnDrop {
 }
 
 async fn send_error<W: AsyncWrite + Unpin>(w: &mut W, code: ErrorCode, message: String) {
-    let _ = write_message(
+    let _ = send(
         w,
         &ServerMessage::Response(Response::Error { code, message }),
     )
@@ -361,6 +376,19 @@ mod tests {
         // Never send Hello; virtual time jumps past the deadline.
         expect_eof(&mut c).await;
         match t.await.unwrap() {
+            Err(CodecError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_never_reads_is_dropped() {
+        // A tiny pipe buffer and a client that sends Hello but never reads:
+        // the server's reply cannot be written, so it must give up, not wait.
+        let (mut c, server) = tokio::io::duplex(16);
+        let task = tokio::spawn(serve_connection(server, controller()));
+        send(&mut c, &ClientMessage::Hello(Hello::current())).await;
+        match task.await.unwrap() {
             Err(CodecError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
             other => panic!("{other:?}"),
         }

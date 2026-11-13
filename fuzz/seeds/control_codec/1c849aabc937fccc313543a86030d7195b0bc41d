@@ -1,0 +1,3 @@
+auto_connect = true
+kill_switch = "enforced"
+alolwed_profiles = ["balanced"]

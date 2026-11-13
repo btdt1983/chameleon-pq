@@ -1,0 +1,3 @@
+auto_connect = true
+kill_switch = "enforced"
+allowed_profiles = ["belanced"]

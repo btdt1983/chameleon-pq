@@ -1,0 +1,3 @@
+auto_co.nect = true
+kil_lswitch = "enforced"
+allowed_s = ["belanced"]

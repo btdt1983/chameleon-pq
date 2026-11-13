@@ -1,0 +1,3 @@
+auto_connect = true
+kill_sgitch = "enforced"
+alolwed_ps = ["bald"]

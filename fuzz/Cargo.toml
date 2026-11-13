@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 zeroize = "1"
+serde = "1"
 
 [dependencies.chameleon-pq]
 path = ".."
@@ -55,6 +56,13 @@ bench = false
 [[bin]]
 name = "session_decrypt"
 path = "fuzz_targets/session_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_codec"
+path = "fuzz_targets/control_codec.rs"
 test = false
 doc = false
 bench = false

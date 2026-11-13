@@ -120,3 +120,59 @@ fn fuzz_session_decrypt() {
         }
     }
 }
+
+/// Control-pipe codec (control/protocol.rs): anything a local user can write to
+/// the service's pipe, plus the policy file parser.
+#[test]
+fn fuzz_control_codec() {
+    use chameleon::control::policy::Policy;
+    use chameleon::control::protocol::{
+        decode, encode, parse_len, ClientMessage, ServerMessage, MAX_FRAME,
+    };
+
+    // The length header is checked before anything is allocated.
+    assert!(parse_len((MAX_FRAME as u32).to_be_bytes()).is_ok());
+    assert!(parse_len((MAX_FRAME as u32 + 1).to_be_bytes()).is_err());
+    assert!(parse_len(u32::MAX.to_be_bytes()).is_err());
+    assert!(decode::<ClientMessage>(&vec![b' '; MAX_FRAME + 1]).is_err());
+
+    let mut inputs = corpus(7);
+    let deep = |open: &str, close: &str| format!("{}{}", open.repeat(50_000), close.repeat(50_000));
+    for text in [
+        deep("[", "]"),
+        deep("{\"a\":", "}"),
+        r#"{"kind":"Hello","protocol_version":3}"#.to_string(),
+        r#"{"kind":"Hello","protocol_version":3,"extra":1}"#.to_string(),
+        r#"{"kind":"Request","type":"Disconnect","x":1}"#.to_string(),
+        r#"{"kind":"Request","type":"Connect","profile":null}"#.to_string(),
+        r#"{"kind":"Request","type":"Connect","profile":"turbo"}"#.to_string(),
+        r#"{"kind":"Request","type":"GetLog","since":18446744073709551616}"#.to_string(),
+        r#"{"kind":"Request","type":"GetLog","since":-1}"#.to_string(),
+        "\u{0}\u{feff}{\"kind\":\"Hello\"}".to_string(),
+    ] {
+        inputs.push(text.into_bytes());
+    }
+    for buf in inputs {
+        // A body that decodes must encode and decode to the same value.
+        if let Ok(m) = decode::<ClientMessage>(&buf) {
+            let frame = encode(&m).expect("encodes");
+            assert_eq!(decode::<ClientMessage>(&frame[4..]).expect("decodes"), m);
+        }
+        if let Ok(m) = decode::<ServerMessage>(&buf) {
+            let frame = encode(&m).expect("encodes");
+            assert_eq!(decode::<ServerMessage>(&frame[4..]).expect("decodes"), m);
+        }
+        if let Ok(text) = std::str::from_utf8(&buf) {
+            let _ = Policy::parse(text, "fuzz");
+        }
+    }
+    // Valid policy edge: unknown key, wrong type, huge number.
+    for bad in [
+        "auto_connect = 1",
+        "auto_connect = true\nauto_connect = false",
+        "allowed_profiles = [\"balanced\",]x",
+        "kill_switch = \"enforced\" # ok\nunknown = 1",
+    ] {
+        assert!(Policy::parse(bad, "t").is_err(), "{bad}");
+    }
+}

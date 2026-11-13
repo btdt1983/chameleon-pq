@@ -1,0 +1,6 @@
+auto_connect = true
+kill_to_connect = true
+kill_switch = "&nforced"
+allowed_profiles = ["belan@~d"]
+switch = "&nforced"
+allowed_profiles = ["belan@~d"]

@@ -133,7 +133,7 @@ Known scope limits:
   `profile = "off"`); with timing-shaping on (opt-in) the configured rate caps
   throughput, so speed vs.
   timing-obfuscation are opposed dimensions you choose between
-- 204 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
+- 206 tests covering handshake (incl. mutual-auth + fragmentation), hybrid
   ML-DSA auth (and that a wrong PQ key fails even when Ed25519 matches),
   AEAD negotiation and AEGIS sessions, associated-data header binding, data
   path, replay (incl. wide reordering), MITM (both directions), rekey,
