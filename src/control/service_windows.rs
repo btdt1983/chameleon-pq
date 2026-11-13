@@ -430,7 +430,9 @@ fn install(config: &Path, allow_insecure_path: bool) -> Result<()> {
     let service = manager
         .create_service(
             &info,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+            // START is needed as well: a failure action of type Restart is
+            // refused (access denied) on a handle without it.
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG | ServiceAccess::START,
         )
         .context("could not create the service (is it already installed? run as Administrator)")?;
     service.set_description(DESCRIPTION)?;
@@ -449,26 +451,27 @@ fn install(config: &Path, allow_insecure_path: bool) -> Result<()> {
 /// The tunnel itself does not come back on its own (there is no auto-connect);
 /// the service and its pipe do, so a user can reconnect without an administrator.
 fn apply_recovery(service: &windows_service::service::Service) -> Result<()> {
-    service.update_failure_actions(ServiceFailureActions {
-        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![
-            ScmAction {
-                action_type: ServiceActionType::Restart,
-                delay: Duration::from_secs(5),
-            },
-            ScmAction {
-                action_type: ServiceActionType::Restart,
-                delay: Duration::from_secs(30),
-            },
-            ScmAction {
-                action_type: ServiceActionType::None,
-                delay: Duration::from_secs(0),
-            },
-        ]),
-    })
-    .context("setting the crash-recovery actions (SERVICE_CONFIG_FAILURE_ACTIONS) failed")?;
+    service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![
+                ScmAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(5),
+                },
+                ScmAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(30),
+                },
+                ScmAction {
+                    action_type: ServiceActionType::None,
+                    delay: Duration::from_secs(0),
+                },
+            ]),
+        })
+        .context("setting the crash-recovery actions (SERVICE_CONFIG_FAILURE_ACTIONS) failed")?;
     service
         .set_failure_actions_on_non_crash_failures(false)
         .context("setting the failure-actions flag (SERVICE_CONFIG_FAILURE_ACTIONS_FLAG) failed")?;
@@ -493,7 +496,11 @@ fn harden(config: &Path) -> Result<()> {
     );
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        // START as well: a Restart failure action needs it (see `install`).
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+        )
         .context("service not installed (or not running as Administrator)")?;
     apply_recovery(&service)?;
     println!("Crash recovery set: restart after 5 s, then after 30 s.");
