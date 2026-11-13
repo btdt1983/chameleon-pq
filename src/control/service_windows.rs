@@ -467,8 +467,11 @@ fn apply_recovery(service: &windows_service::service::Service) -> Result<()> {
                 delay: Duration::from_secs(0),
             },
         ]),
-    })?;
-    service.set_failure_actions_on_non_crash_failures(false)?;
+    })
+    .context("setting the crash-recovery actions (SERVICE_CONFIG_FAILURE_ACTIONS) failed")?;
+    service
+        .set_failure_actions_on_non_crash_failures(false)
+        .context("setting the failure-actions flag (SERVICE_CONFIG_FAILURE_ACTIONS_FLAG) failed")?;
     Ok(())
 }
 
