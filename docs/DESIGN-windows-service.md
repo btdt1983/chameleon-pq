@@ -256,6 +256,60 @@ these are the conservative picks; both are policy and can change in M4):
 | M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run/console` (**implemented**: protocol + codec, controller actor, transport-independent connection server, pipe transport, SCM host) | Linux: duplex-stream tests. Windows CI: real-pipe tests. Manual: install and run the service on the VM |
 | M3 | GUI on `ServiceClient` (**implemented**: `control::client`, Windows pipe client with pipe-owner check, GUI service mode; standalone mode kept for Linux/dev). Mode is decided by "service installed", never by pipe reachability, and never changes mid-session | Linux: client tested against the real server over duplex streams; GUI view-model tests. Manual: standard user on the VM |
 | M4 | Data-folder checks and hardening, `policy.toml`, enforced kill switch, crash recovery, protocol v2 (**implemented**) | Linux: policy matrix through the controller, GUI policy tests. Windows CI: DACL check against a hardened, widened and inheriting folder, junction rejection. Manual: upgrade steps in `README-windows.txt` |
-| M5 | Codec fuzz target, threat-model review, docs | Fuzz in CI; reviewed against section 7 |
+| M5 | Always-on: reconnect, auto-connect, kill switch from start (see section 12), then codec fuzz target, threat-model review, docs | Paused-time controller tests; VM checklist; fuzz in CI; reviewed against section 7 |
 
 MSI/signing (next phase) builds on M4.
+
+## 12. M5: always-on (reconnect, auto-connect, kill switch from service start)
+
+Decisions (David, 2026-11-13):
+
+1. **Reconnect is always on in service mode** while the user wants to be connected. No policy knob.
+2. **`auto_connect = true` forbids user Disconnect.** The effective rule is
+   `disconnect allowed = allow_user_disconnect && !auto_connect`; the GUI hides the button.
+3. **Stop semantics:** an administrator stop (SCM Stop) releases the kill switch; a crash or
+   system shutdown leaves it engaged and the crash-recovery restart adopts it (orphan logic).
+4. **Captive portals** are a documented limitation (no grace period) until a deployment needs one.
+
+### 12.1 Reconnect (controller actor, not the Supervisor)
+
+State: `want_connected`, set by user Connect or `auto_connect` at service start, cleared by an
+allowed user Disconnect. While it is set and no attempt is running, the actor schedules one:
+backoff 1, 2, 4, 8, 16, then 30 s, +-20% jitter; back to 1 s once a connection lasted 30 s.
+A manual Connect skips the wait and resets the counter. Connect errors become an enum:
+
+* *Network* (unreachable, timeout): normal backoff, cap 30 s.
+* *Rejected* (server does not trust the key, handshake refused): cap 5 min, clear message.
+* *Permanent* (no `server_addr`, `wintun.dll` missing, invalid config): no retry, error shown.
+
+Protocol v3 (additive): the snapshot carries `phase` (Idle, Connecting, Connected,
+Reconnecting{attempt, next_in_s}, Blocked{reason}) and `auto_connect`.
+
+### 12.2 Two-phase kill switch
+
+`engage_base(server)`: allow server IP, LocalSubnet and DHCP, then default outbound Block; needs
+no interface. `attach_tun(name)`: adds the allow rule for the TUN once the adapter exists; called
+in `connect()` where `engage` is today. Nothing can enter the tunnel before routes are installed,
+which happens after `attach_tun`. Linux nft already references `oifname` without the interface.
+
+At service start, before the pipe opens: `enforced` engages the base rules (failure = stay up,
+report Blocked, retry); `user_choice` with `tun.kill_switch` and `auto_connect` engages them too;
+otherwise nothing. The service depends on `Tcpip` and `BFE` and stays Automatic (not Delayed).
+The Block default survives a reboot, so a switch left engaged protects the host before the
+service even starts.
+
+### 12.3 Risks
+
+A failed folder check (exit 2) while Block is still set leaves the machine offline: fail-closed
+by intent, recovered with an elevated `chameleon-pq killswitch off` (document in
+`README-windows.txt`). Captive portal login is impossible while engaged. The kill switch stays a
+firewall default, not a WFP filter (KNOWN GAP, keep in the audit scope).
+
+### 12.4 Delivery
+
+* **M5a:** reconnect/backoff, error classes, protocol v3, GUI phase display. Tests with paused
+  tokio time (schedule, reset, cancel, error classes, auto-connect, policy wins over intent).
+* **M5b:** two-phase kill switch, engage at start, `auto_connect`, service dependencies, stop
+  semantics. Windows verified by hand on the VM (CI runner would lose its network): reboot with
+  `enforced`, cable out/in, sleep/resume, `sc.exe stop` (released), `taskkill` (stays, service returns).
+* **M5c:** codec fuzz target in CI, threat-model review against section 7, docs.
