@@ -42,7 +42,11 @@ pub fn real_connect() -> ConnectFn {
 
 enum Cmd {
     Request(Request, oneshot::Sender<Response>),
-    Shutdown(oneshot::Sender<()>),
+    /// `keep_kill_switch`: leave it engaged (system shutdown).
+    Shutdown {
+        keep_kill_switch: bool,
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Cheap, cloneable front door to the controller task.
@@ -67,10 +71,25 @@ impl ControllerHandle {
         self.state.clone()
     }
 
-    /// Orderly teardown; returns once routes/DNS/kill switch are restored.
+    /// Orderly teardown (an administrator stop); returns once routes, DNS and
+    /// the kill switch are restored.
     pub async fn shutdown(&self) {
-        let (done_tx, done_rx) = oneshot::channel();
-        if self.tx.send(Cmd::Shutdown(done_tx)).await.is_ok() {
+        self.shutdown_with(false).await;
+    }
+
+    /// Like [`Self::shutdown`] but the kill switch stays engaged: for a system
+    /// shutdown, where fail-closed is preferred.
+    pub async fn shutdown_keeping_kill_switch(&self) {
+        self.shutdown_with(true).await;
+    }
+
+    async fn shutdown_with(&self, keep_kill_switch: bool) {
+        let (done, done_rx) = oneshot::channel();
+        let cmd = Cmd::Shutdown {
+            keep_kill_switch,
+            done,
+        };
+        if self.tx.send(cmd).await.is_ok() {
             let _ = done_rx.await;
         }
     }
@@ -133,6 +152,7 @@ pub fn spawn_with_policy(
     connect_fn: ConnectFn,
 ) -> (ControllerHandle, JoinHandle<()>) {
     supervisor.set_log_hint("the service log");
+    let startup_notes = supervisor.take_notes();
     let (tx, rx) = mpsc::channel(32);
     let (outcome_tx, outcome_rx) = mpsc::channel(1);
     let profile = cfg.traffic.profile;
@@ -155,6 +175,8 @@ pub fn spawn_with_policy(
         connect_fn,
         outcome_tx,
     };
+    let mut actor = actor;
+    actor.push_log(startup_notes);
     let join = tokio::spawn(actor.run(rx, outcome_rx));
     (
         ControllerHandle {
@@ -252,6 +274,14 @@ impl Actor {
         mut rx: mpsc::Receiver<Cmd>,
         mut outcome_rx: mpsc::Receiver<ConnectOutcome>,
     ) {
+        // Always-on: the first attempt starts at once, not after the first tick.
+        if self.policy.auto_connect {
+            if let Some(server) = self.cfg.network.server_addr {
+                self.rc.want_connected = true;
+                self.start_attempt(server);
+                self.publish();
+            }
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -261,14 +291,14 @@ impl Actor {
                         let resp = self.handle(req);
                         let _ = reply.send(resp);
                     }
-                    Some(Cmd::Shutdown(done)) => {
-                        self.shutdown(&mut outcome_rx).await;
+                    Some(Cmd::Shutdown { keep_kill_switch, done }) => {
+                        self.shutdown(&mut outcome_rx, keep_kill_switch).await;
                         let _ = done.send(());
                         return;
                     }
                     // Every handle dropped: nobody can talk to us any more.
                     None => {
-                        self.shutdown(&mut outcome_rx).await;
+                        self.shutdown(&mut outcome_rx, false).await;
                         return;
                     }
                 },
@@ -294,7 +324,7 @@ impl Actor {
             },
             Request::Connect { profile } => self.connect(profile),
             Request::Disconnect {} => {
-                if !self.policy.allow_user_disconnect {
+                if !self.policy.disconnect_allowed() {
                     return error(
                         ErrorCode::Denied,
                         "your administrator does not allow disconnecting",
@@ -463,7 +493,11 @@ impl Actor {
 
     /// Finish an in-flight connect first (it may have created the adapter and
     /// engaged the kill switch), then tear everything down in order.
-    async fn shutdown(&mut self, outcome_rx: &mut mpsc::Receiver<ConnectOutcome>) {
+    async fn shutdown(
+        &mut self,
+        outcome_rx: &mut mpsc::Receiver<ConnectOutcome>,
+        keep_kill_switch: bool,
+    ) {
         if self.sup.is_connecting() {
             if let Some(outcome) = outcome_rx.recv().await {
                 let lines = self.sup.on_connected(outcome);
@@ -471,7 +505,7 @@ impl Actor {
             }
         }
         self.rc = Reconnect::default();
-        let lines = self.sup.shutdown().await;
+        let lines = self.sup.shutdown(keep_kill_switch).await;
         self.push_log(lines);
         self.publish();
     }
@@ -941,6 +975,65 @@ mod tests {
         run_for(60).await;
         assert!(calls_of(&calls) > before, "retries continue");
         assert_ne!(state(&h).await.phase, Phase::Disconnected);
+    }
+
+    // ---- auto_connect ----
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_connect_connects_at_start_retries_and_cannot_be_disconnected() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy = Policy::parse("auto_connect = true", "t").unwrap();
+        let (h, _j) = start_with(
+            test_cfg(),
+            policy,
+            counting_failure(calls.clone(), "unreachable"),
+        );
+        // No request was sent, yet the service is already trying.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls_of(&calls), 1, "first attempt at once");
+        let s = state(&h).await;
+        assert_eq!(s.phase, Phase::Reconnecting);
+        assert!(s.policy.auto_connect);
+        assert!(
+            !s.policy.allow_user_disconnect,
+            "the summary shows the effective rule"
+        );
+
+        // Users cannot stop it, and it keeps going.
+        assert!(denied(h.request(Request::Disconnect {}).await));
+        run_for(40).await;
+        assert!(calls_of(&calls) >= 4);
+        assert_ne!(state(&h).await.phase, Phase::Disconnected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_auto_connect_nothing_happens_until_asked() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(calls.clone(), "unreachable"));
+        run_for(30).await;
+        assert_eq!(calls_of(&calls), 0);
+        assert_eq!(state(&h).await.phase, Phase::Disconnected);
+        assert!(!state(&h).await.policy.auto_connect);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_kill_switch_failure_is_logged_for_the_user() {
+        let mut sup = Supervisor::with_orphan(false);
+        sup.adopt_start_kill_switch(Err("no firewall".into()));
+        let (h, _j) = spawn(
+            test_cfg(),
+            sup,
+            counting_failure(Arc::new(std::sync::atomic::AtomicUsize::new(0)), "x"),
+        );
+        let lines = match h.request(Request::GetLog { since: 0 }).await {
+            Response::Log { lines } => lines,
+            other => panic!("{other:?}"),
+        };
+        assert!(lines
+            .iter()
+            .any(|l| l.text.contains("could not be engaged at service start")));
     }
 
     #[tokio::test]

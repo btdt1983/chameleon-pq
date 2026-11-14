@@ -88,6 +88,26 @@ impl KillSwitch {
         })
     }
 
+    /// Engage the kill switch *without* the tunnel's own interface: the server
+    /// endpoint, LAN and DHCP are allowed, everything else is blocked. This is
+    /// what the service can do at start, before any TUN adapter exists (the
+    /// Windows allow rule scoped by `-InterfaceAlias` would fail). The later
+    /// [`KillSwitch::engage`] at connect re-applies the full rule set, including
+    /// the TUN allow rule; it is idempotent, so engaging twice is fine.
+    pub fn engage_base(server: SocketAddr, tun: &str) -> Result<Self> {
+        if tun.contains(['"', '\'', '\n', '\r', '\\']) {
+            return Err(ChameleonError::KillSwitch(format!(
+                "refusing unsafe tun name '{tun}'"
+            )));
+        }
+        engage_base_backend(server, tun)?;
+        info!("kill switch ENGAGED (base) — only the server, LAN and DHCP are reachable");
+        Ok(Self {
+            engaged: true,
+            other_allow_rules: other_allow_rules_hint(),
+        })
+    }
+
     /// Disengage: remove the rules we installed and restore normal connectivity.
     /// Idempotent. Call this on a DELIBERATE disconnect only — never rely on drop.
     pub fn disengage(&mut self) {
@@ -133,6 +153,13 @@ fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
         tracing::warn!("kill switch: local subnet not found — LAN access blocked while engaged");
     }
     nft_apply(&build_ruleset(server, tun, lan))
+}
+
+/// nftables can name an interface that does not exist yet, so the base rule set
+/// is the full one.
+#[cfg(not(target_os = "windows"))]
+fn engage_base_backend(server: SocketAddr, tun: &str) -> Result<()> {
+    engage_backend(server, tun)
 }
 
 /// Build the nftables ruleset for the given tunnel. Pure (no I/O) so it can be
@@ -305,16 +332,25 @@ fn ipv4_network(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
 // exists, `other_allow_rules_hint` at least makes the residual exposure
 // visible instead of silent.
 
-#[cfg(target_os = "windows")]
-fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
+/// The PowerShell that installs the Windows rules. `tun = None` leaves out the
+/// rule scoped to the TUN adapter (it cannot be created before the adapter
+/// exists). Pure, so the shape of the script is unit-tested on every platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_engage_script(server: SocketAddr, tun: Option<&str>) -> String {
     let ip = server.ip();
+    let tun_rule = tun.map_or_else(String::new, |tun| {
+        format!(
+            "New-NetFirewallRule -DisplayName 'Chameleon-KS tun' -Group 'ChameleonKS' \
+               -Direction Outbound -InterfaceAlias '{tun}' -Action Allow | Out-Null;\
+             "
+        )
+    });
     // Allow rules FIRST, default-block LAST, so there is no window where even the
     // tunnel is black-holed before its allow rule exists.
-    let script = format!(
+    format!(
         "$ErrorActionPreference='Stop';\
          Remove-NetFirewallRule -Group 'ChameleonKS' -ErrorAction SilentlyContinue;\
-         New-NetFirewallRule -DisplayName 'Chameleon-KS tun' -Group 'ChameleonKS' \
-           -Direction Outbound -InterfaceAlias '{tun}' -Action Allow | Out-Null;\
+         {tun_rule}\
          New-NetFirewallRule -DisplayName 'Chameleon-KS server' -Group 'ChameleonKS' \
            -Direction Outbound -RemoteAddress '{ip}' -Action Allow | Out-Null;\
          New-NetFirewallRule -DisplayName 'Chameleon-KS lan' -Group 'ChameleonKS' \
@@ -322,8 +358,18 @@ fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
          New-NetFirewallRule -DisplayName 'Chameleon-KS dhcp' -Group 'ChameleonKS' \
            -Direction Outbound -Protocol UDP -LocalPort 68 -RemotePort 67 -Action Allow | Out-Null;\
          Set-NetFirewallProfile -All -DefaultOutboundAction Block"
-    );
-    run_powershell(&script)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn engage_backend(server: SocketAddr, tun: &str) -> Result<()> {
+    run_powershell(&windows_engage_script(server, Some(tun)))
+}
+
+/// See [`KillSwitch::engage_base`]: no TUN rule, the adapter may not exist yet.
+#[cfg(target_os = "windows")]
+fn engage_base_backend(server: SocketAddr, _tun: &str) -> Result<()> {
+    run_powershell(&windows_engage_script(server, None))
 }
 
 /// Count enabled outbound Allow rules NOT owned by us. See the KNOWN GAP note
@@ -455,11 +501,29 @@ mod tests {
     }
 
     #[test]
+    fn base_script_has_no_tun_rule_and_blocks_last() {
+        let server: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let base = super::windows_engage_script(server, None);
+        assert!(!base.contains("InterfaceAlias"));
+        for needle in ["'203.0.113.7'", "LocalSubnet", "LocalPort 68"] {
+            assert!(base.contains(needle), "{needle}");
+        }
+        let full = super::windows_engage_script(server, Some("chameleon0"));
+        assert!(full.contains("-InterfaceAlias 'chameleon0'"));
+        // Both end by flipping the default to Block, after every allow rule.
+        for s in [&base, &full] {
+            let block = s.find("DefaultOutboundAction Block").unwrap();
+            assert!(s.rfind("New-NetFirewallRule").unwrap() < block);
+        }
+    }
+
+    #[test]
     fn unsafe_tun_name_is_rejected() {
         use super::KillSwitch;
         use std::net::SocketAddr;
         let server: SocketAddr = "1.2.3.4:51820".parse().unwrap();
         assert!(KillSwitch::engage(server, "tun\"; rm -rf /").is_err());
         assert!(KillSwitch::engage(server, "bad'name").is_err());
+        assert!(KillSwitch::engage_base(server, "tun\"; x").is_err());
     }
 }

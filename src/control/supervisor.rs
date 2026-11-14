@@ -110,6 +110,9 @@ pub struct Supervisor {
     /// Where the user finds the reason for a dropped tunnel; embedded in the
     /// "Tunnel closed" log line. The GUI's default names its own log file.
     log_hint: String,
+    /// Lines produced before the controller exists (the kill switch at service
+    /// start); the controller moves them into its log.
+    notes: Vec<String>,
 }
 
 impl Default for Supervisor {
@@ -138,7 +141,35 @@ impl Supervisor {
             connecting: false,
             ks: None,
             ks_orphan,
+            notes: Vec::new(),
         }
+    }
+
+    /// Take over a kill switch the service engaged at start (before any
+    /// connection), or record why that failed. Either way a note is kept for the
+    /// controller's log. A failure is not fatal: the connect engages the full
+    /// kill switch again, and under `enforced` refuses a tunnel without one.
+    pub fn adopt_start_kill_switch(&mut self, outcome: Result<KillSwitch, String>) {
+        match outcome {
+            Ok(k) => {
+                self.notes.push(
+                    "Kill switch engaged at service start — traffic is blocked until the \
+                     tunnel is up."
+                        .into(),
+                );
+                self.ks = Some(k);
+                self.ks_orphan = false;
+            }
+            Err(e) => self.notes.push(format!(
+                "Kill switch could not be engaged at service start: {e}. It will be tried \
+                 again when connecting."
+            )),
+        }
+    }
+
+    /// Lines to move into the controller's log (see [`Self::adopt_start_kill_switch`]).
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Override the log location named in the "Tunnel closed" line.
@@ -257,15 +288,21 @@ impl Supervisor {
     /// fully dropped, so routes, DNS and the TUN adapter are restored before the
     /// caller reports "stopped". Then the kill switch is released (an admin
     /// stopping the service is a deliberate stop; a crash never gets here and
-    /// leaves it engaged).
-    pub async fn shutdown(&mut self) -> Vec<String> {
+    /// leaves it engaged). With `keep_kill_switch` (a system shutdown) it stays
+    /// engaged: the firewall default survives the reboot, so the host is blocked
+    /// until the service is back up.
+    pub async fn shutdown(&mut self, keep_kill_switch: bool) -> Vec<String> {
         let mut log = Vec::new();
         if let Some(c) = self.client.take() {
             c.disconnect_and_wait().await;
         }
         self.status = None;
         self.connecting = false;
-        if let Some(mut k) = self.ks.take() {
+        if keep_kill_switch {
+            if self.ks.is_some() {
+                log.push("Kill switch stays engaged (system shutdown).".into());
+            }
+        } else if let Some(mut k) = self.ks.take() {
             k.disengage();
             log.push("Kill switch disengaged.".into());
         }
@@ -381,6 +418,17 @@ mod tests {
         assert_eq!(s.disconnect(false), vec!["Disconnected.".to_string()]);
         assert_eq!(s.disconnect(true), vec!["Disconnected.".to_string()]);
         assert!(!s.is_connected());
+    }
+
+    #[test]
+    fn a_failed_start_kill_switch_leaves_a_note_and_nothing_engaged() {
+        let mut s = Supervisor::with_orphan(false);
+        s.adopt_start_kill_switch(Err("boom".into()));
+        assert!(!s.kill_switch_engaged());
+        let notes = s.take_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("boom"));
+        assert!(s.take_notes().is_empty(), "notes are handed over once");
     }
 
     #[test]

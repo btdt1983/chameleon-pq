@@ -81,7 +81,10 @@ pub struct TunnelInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySummary {
+    /// The effective answer: false whenever `auto_connect` is on.
     pub allow_user_disconnect: bool,
+    /// The service connects by itself at start and keeps reconnecting.
+    pub auto_connect: bool,
     /// `None` = every profile.
     pub allowed_profiles: Option<Vec<TrafficProfile>>,
     pub kill_switch: KillSwitchPolicy,
@@ -99,7 +102,8 @@ impl PolicySummary {
 impl From<&crate::control::policy::Policy> for PolicySummary {
     fn from(p: &crate::control::policy::Policy) -> Self {
         Self {
-            allow_user_disconnect: p.allow_user_disconnect,
+            allow_user_disconnect: p.disconnect_allowed(),
+            auto_connect: p.auto_connect,
             allowed_profiles: p.allowed_profiles.clone(),
             kill_switch: p.kill_switch,
             allow_update_check: p.allow_update_check,

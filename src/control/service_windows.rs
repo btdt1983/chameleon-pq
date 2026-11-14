@@ -15,6 +15,7 @@ use super::server::Server;
 use super::supervisor::Supervisor;
 use super::winsec_windows as winsec;
 use crate::config::{AppConfig, ServiceAction};
+use crate::killswitch::KillSwitch;
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,9 +25,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use windows_service::service::{
     ServiceAccess, ServiceAction as ScmAction, ServiceActionType, ServiceControl,
-    ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
-    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
-    ServiceType,
+    ServiceControlAccept, ServiceDependency, ServiceErrorControl, ServiceExitCode,
+    ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
+    ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -63,6 +64,7 @@ pub fn run_cli(action: &ServiceAction, config: &Path, verbose: u8) -> Result<()>
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_core(cfg, policy, async {
                 let _ = tokio::signal::ctrl_c().await;
+                false
             }))
         }
     }
@@ -97,10 +99,17 @@ fn status(
 }
 
 fn run_service() -> Result<()> {
-    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+    // The value says whether the kill switch must stay engaged: true for a
+    // system shutdown (fail-closed across the reboot), false for an
+    // administrator's stop (release, so the machine is not stranded).
+    let (stop_tx, stop_rx) = std_mpsc::channel::<bool>();
     let handler = move |event| match event {
-        ServiceControl::Stop | ServiceControl::Shutdown => {
-            let _ = stop_tx.send(());
+        ServiceControl::Stop => {
+            let _ = stop_tx.send(false);
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::Shutdown => {
+            let _ = stop_tx.send(true);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -125,17 +134,16 @@ fn run_service() -> Result<()> {
         let status_handle = &handle;
         rt.block_on(async {
             // Bridge the SCM's blocking stop signal into async.
-            let (stop_async_tx, stop_async_rx) = oneshot::channel::<()>();
+            let (stop_async_tx, stop_async_rx) = oneshot::channel::<bool>();
             std::thread::spawn(move || {
-                let _ = stop_rx.recv();
-                let _ = stop_async_tx.send(());
+                // If the handler is dropped without a signal, treat it as a stop.
+                let keep = stop_rx.recv().unwrap_or(false);
+                let _ = stop_async_tx.send(keep);
             });
             run_core_with(
                 cfg,
                 policy,
-                async {
-                    let _ = stop_async_rx.await;
-                },
+                async { stop_async_rx.await.unwrap_or(false) },
                 || {
                     let _ = status_handle.set_service_status(status(
                         ServiceState::Running,
@@ -241,7 +249,7 @@ fn startup(config: &Path, enforce_acl: bool) -> Result<(AppConfig, Policy)> {
 async fn run_core(
     cfg: AppConfig,
     policy: Policy,
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl std::future::Future<Output = bool>,
 ) -> Result<()> {
     run_core_with(cfg, policy, stop, || {}, |_| {}).await
 }
@@ -252,12 +260,23 @@ async fn run_core(
 async fn run_core_with(
     cfg: AppConfig,
     policy: Policy,
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl std::future::Future<Output = bool>,
     on_running: impl FnOnce(),
     mut on_stopping: impl FnMut(u32),
 ) -> Result<()> {
+    // Block the machine before the pipe opens or any connection is tried, when
+    // the policy asks for it (see `Policy::kill_switch_at_start`). The TUN
+    // adapter does not exist yet, so this is the base rule set.
+    let mut supervisor = Supervisor::new();
+    if policy.kill_switch_at_start(&cfg) {
+        if let Some(server) = cfg.network.server_addr {
+            supervisor.adopt_start_kill_switch(
+                KillSwitch::engage_base(server, &cfg.tun.name).map_err(|e| e.to_string()),
+            );
+        }
+    }
     let (handle, controller_task): (ControllerHandle, _) =
-        controller::spawn_with_policy(cfg, policy, Supervisor::new(), controller::real_connect());
+        controller::spawn_with_policy(cfg, policy, supervisor, controller::real_connect());
     let server = Server::new(handle.clone());
     let (pipe_stop_tx, pipe_stop_rx) = oneshot::channel();
     let mut pipe_task = tokio::spawn(pipe_windows::serve(
@@ -270,16 +289,33 @@ async fn run_core_with(
 
     // Run until asked to stop, or until the pipe dies (then there is no way to
     // control the service, so stop rather than run headless).
+    let mut keep_kill_switch = false;
     let pipe_result = tokio::select! {
-        _ = stop => None,
+        keep = stop => {
+            keep_kill_switch = keep;
+            None
+        }
         res = &mut pipe_task => Some(res),
     };
 
-    tracing::info!("stopping");
+    tracing::info!(
+        "stopping ({})",
+        if keep_kill_switch {
+            "system shutdown: the kill switch stays engaged"
+        } else {
+            "the kill switch is released"
+        }
+    );
     let mut checkpoint = 1;
     on_stopping(checkpoint);
     let _ = pipe_stop_tx.send(());
-    let mut shutdown = Box::pin(handle.shutdown());
+    let mut shutdown = Box::pin(async {
+        if keep_kill_switch {
+            handle.shutdown_keeping_kill_switch().await
+        } else {
+            handle.shutdown().await
+        }
+    });
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -423,7 +459,12 @@ fn install(config: &Path, allow_insecure_path: bool) -> Result<()> {
             OsString::from("service"),
             OsString::from("run"),
         ],
-        dependencies: vec![],
+        // The firewall service (the kill switch) and the TCP/IP stack must be
+        // up before this service starts. Not delayed-auto-start on purpose.
+        dependencies: vec![
+            ServiceDependency::Service(OsString::from("Tcpip")),
+            ServiceDependency::Service(OsString::from("BFE")),
+        ],
         account_name: None, // LocalSystem
         account_password: None,
     };
