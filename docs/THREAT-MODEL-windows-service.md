@@ -46,7 +46,7 @@ Attackers considered:
 | F3 | `wintun.dll` is not verified (row 6) | Low while program files stay admin-only | **Open**, installer phase |
 | F4 | Any authenticated user can press Disconnect when the policy allows it (default), including malware running as that user. Policy applies to everyone, administrators included, because requests carry no identity | By design | Documented. `allow_user_disconnect = false` or `auto_connect = true` removes it. A per-user identity is a later step |
 | F5 | The kill switch is a firewall default-outbound-Block. Any pre-existing outbound Allow rule overrides it (known gap, see `killswitch.rs`) | Medium for a high-assurance deployment | **Open.** Closing it needs WFP-level filters. The GUI log reports how many such rules exist. Keep in the audit scope |
-| F6 | Section 7 names a file (`ipc_windows.rs`) for the `unsafe` code that does not exist; it is in two files | Documentation | See the inventory below; fix section 7 when the design PR merges |
+| F6 | Section 7 names a file (`ipc_windows.rs`) for the `unsafe` code that does not exist; it is in two files | Documentation | **Fixed:** section 7 and the file table now name `pipe_windows.rs` and `winsec_windows.rs` |
 | F7 | While the base kill switch is engaged at start, captive-portal sign-in pages cannot be reached | By design | Documented in `README-windows.txt` and the managed policy example |
 | F8 | Windows Event Log only receives the refusal to start; connect, auth-failure and rekey events are not forwarded | Operational | Open, listed under "Later" in the design |
 
