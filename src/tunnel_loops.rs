@@ -199,6 +199,42 @@ impl TunnelParams {
 // parked in a channel `recv()`) which both showed measurable, live-tested
 // dispatch overhead.
 
+/// In-flight jobs whose results must come out in the order the jobs were
+/// started, however they complete. Used for inbound decrypt: batches run in
+/// parallel on the rayon pool, but a batch is handed to the TUN only after
+/// every earlier batch was, so a fast batch cannot overtake a slow one.
+struct InOrder<T> {
+    queue: VecDeque<tokio::sync::oneshot::Receiver<T>>,
+}
+
+impl<T> Default for InOrder<T> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> InOrder<T> {
+    fn push(&mut self, rx: tokio::sync::oneshot::Receiver<T>) {
+        self.queue.push_back(rx);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// The oldest job's result; waits for it even if younger jobs are done.
+    /// `None` when nothing is in flight. Cancel safe: the job leaves the queue
+    /// only once its result is in hand, so a dropped call loses nothing.
+    async fn next(&mut self) -> Option<Result<T, tokio::sync::oneshot::error::RecvError>> {
+        let front = self.queue.front_mut()?;
+        let result = front.await;
+        self.queue.pop_front();
+        Some(result)
+    }
+}
+
 /// Every `rayon::spawn` crypto job in this module MUST go through this.
 /// `rayon::spawn`'s job type has NO `catch_unwind` of its own (checked
 /// against the vendored rayon-core source): an escaping panic calls
@@ -836,19 +872,23 @@ pub async fn run_tunnel_loops(
         let mut rekey_confirm_reasm = Reassembler::default();
         let mut prune_tick = interval(Duration::from_secs(10));
         // Warm-pool dispatch for decrypt (see the module-level doc above
-        // `dispatch_seal`/`rayon_spawn_guarded`). No ordering step needed
-        // here, unlike outbound: the replay window tolerates reordering and
-        // TUN write order need not match receive order (the OS already
-        // handles out-of-order network delivery), so results are just
-        // processed as they land, via a JoinSet — the same idiom this
-        // function already uses for its top-level tasks. `rayon::spawn`
-        // removes the old dedicated-thread design's implicit concurrency=1
-        // bound, so a semaphore (sized to rayon's actual pool) caps
-        // in-flight decrypt jobs instead of growing unboundedly if decrypt
-        // ever falls behind recv.
+        // `dispatch_seal`/`rayon_spawn_guarded`). Decrypt runs in parallel,
+        // but the RESULTS ARE DELIVERED TO THE TUN IN ARRIVAL ORDER, like
+        // the outbound side restores order in `run_sequential_sender`.
+        // Delivering batches as they complete (an earlier JoinSet) let a
+        // fast batch overtake a slow one: measured on a 4-core server as 14%
+        // of the packets out of order and 1% loss on a 100 Mbit upload, and
+        // a single TCP stream collapsing to ~9 Mbit/s (TCP reads reordering
+        // as loss and spuriously retransmits). With one crypto thread the
+        // same path gave 0 reordered and 38 Mbit/s. The replay window
+        // tolerates reordering, so correctness never depended on this; the
+        // cost was throughput. `rayon::spawn` removes the old
+        // dedicated-thread design's implicit concurrency=1 bound, so a
+        // semaphore (sized to rayon's actual pool) caps in-flight decrypt
+        // jobs instead of growing unboundedly if decrypt falls behind recv.
         let decrypt_sem = Arc::new(tokio::sync::Semaphore::new(rayon::current_num_threads()));
-        let mut decrypt_jobs: tokio::task::JoinSet<Vec<DecryptResult>> =
-            tokio::task::JoinSet::new();
+        let mut decrypt_queue: InOrder<crate::error::Result<Vec<DecryptResult>>> =
+            InOrder::default();
 
         'inbound: loop {
             tokio::select! {
@@ -876,23 +916,25 @@ pub async fn run_tunnel_loops(
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let eng = engine_in.clone();
-                    rayon_spawn_guarded(move || Ok(eng.decrypt_batch_par(&datagrams)), tx);
-                    decrypt_jobs.spawn(async move {
-                        let _permit = permit; // held until this job's results are consumed
-                        match rx.await {
-                            Ok(Ok(results)) => results,
-                            Ok(Err(e)) => { error!("decrypt: {e}"); Vec::new() }
-                            Err(_) => Vec::new(), // rayon job dropped without replying — shouldn't happen
-                        }
-                    });
+                    // The permit lives inside the job, so it is released when
+                    // decrypt finishes, not when the (ordered) result is
+                    // consumed: waiting for a free permit here must never
+                    // depend on the consumer branch below being polled.
+                    rayon_spawn_guarded(
+                        move || {
+                            let _permit = permit;
+                            Ok(eng.decrypt_batch_par(&datagrams))
+                        },
+                        tx,
+                    );
+                    decrypt_queue.push(rx);
                 }
-                Some(join_res) = decrypt_jobs.join_next(), if !decrypt_jobs.is_empty() => {
-                    let results = match join_res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if !e.is_cancelled() { error!("decrypt job: {e}"); }
-                            continue;
-                        }
+                Some(batch) = decrypt_queue.next(), if !decrypt_queue.is_empty() => {
+                    let results = match batch {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => { error!("decrypt: {e}"); continue; }
+                        // rayon job dropped without replying — shouldn't happen
+                        Err(_) => continue,
                     };
 
                     for (src, datagram, result) in results {
@@ -1179,6 +1221,45 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    #[tokio::test]
+    async fn in_order_yields_submission_order_whatever_the_completion_order() {
+        let mut q = InOrder::default();
+        let mut senders = Vec::new();
+        for _ in 0..4 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+            q.push(rx);
+            senders.push(tx);
+        }
+        // Complete them backwards: 3, 2, 1, 0.
+        for (i, tx) in senders.into_iter().enumerate().rev() {
+            tx.send(i as u32).unwrap();
+        }
+        for want in 0..4u32 {
+            assert_eq!(q.next().await.unwrap().unwrap(), want);
+        }
+        assert!(q.is_empty());
+        assert!(q.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_order_holds_back_finished_jobs_behind_an_unfinished_one() {
+        let mut q = InOrder::default();
+        let (slow_tx, slow_rx) = tokio::sync::oneshot::channel::<u32>();
+        let (fast_tx, fast_rx) = tokio::sync::oneshot::channel::<u32>();
+        q.push(slow_rx);
+        q.push(fast_rx);
+        fast_tx.send(1).unwrap();
+
+        // The younger job is done but must not be handed out yet.
+        let early = tokio::time::timeout(Duration::from_millis(50), q.next()).await;
+        assert!(early.is_err(), "a finished job overtook an unfinished one");
+
+        // The timed-out call lost nothing (cancel safety).
+        slow_tx.send(0).unwrap();
+        assert_eq!(q.next().await.unwrap().unwrap(), 0);
+        assert_eq!(q.next().await.unwrap().unwrap(), 1);
+    }
+
     /// A panic escaping the closure must surface as `Err(..)` on the oneshot,
     /// not `std::process::abort()` the test process — the exact failure mode
     /// `rayon_spawn_guarded` exists to prevent (see its doc comment).
@@ -1420,11 +1501,10 @@ enabled = false
         let post = Bytes::from_static(b"post-rekey packet");
         client_handles.inject_tx.send(post.clone()).await.unwrap();
 
-        // Drain the queued pre-rekey packets plus the post-rekey one. Inbound
-        // decrypt is parallel by design (see the `decrypt_jobs` comment), so
-        // delivery order is NOT guaranteed: assert the SET of payloads, i.e.
-        // that nothing was lost and the post-rekey packet arrived decrypted
-        // under the new session.
+        // Drain the queued pre-rekey packets plus the post-rekey one. Assert
+        // the SET of payloads, i.e. that nothing was lost and the post-rekey
+        // packet arrived decrypted under the new session (order is covered
+        // by the `InOrder` unit tests).
         let mut received = std::collections::HashSet::new();
         for _ in 0..=PRE_REKEY_PACKETS {
             let pkt = tokio::time::timeout(Duration::from_secs(5), server_handles.drain_rx.recv())
