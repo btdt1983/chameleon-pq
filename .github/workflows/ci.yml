@@ -256,9 +256,13 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Fuzz each target (2 min each)
         run: |
-          for t in frame_decode handshake_decode obf_parsers hsobf_parsers reassembler session_decrypt; do
+          for t in frame_decode handshake_decode obf_parsers hsobf_parsers reassembler session_decrypt control_codec; do
             echo "::group::fuzz $t"
-            cargo fuzz run "$t" -- -max_total_time=120
+            # Hand-written valid inputs (fuzz/seeds/<target>) get the fuzzer past
+            # the JSON/TOML syntax layer quickly; the corpus itself is not committed.
+            seeds=""
+            if [ -d "fuzz/seeds/$t" ]; then seeds="$PWD/fuzz/seeds/$t"; fi
+            cargo fuzz run "$t" $seeds -- -max_total_time=120
             echo "::endgroup::"
           done
 
