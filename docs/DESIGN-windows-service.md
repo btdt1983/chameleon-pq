@@ -66,7 +66,7 @@ transport**:
 | `protocol.rs` | `Request`, `Response`, `Event`, `State` types, versioning, frame codec | all |
 | `supervisor.rs` | Connect/disconnect state machine; the logic moved out of `gui/src/main.rs` (TUN create, routes, DNS, kill switch, `Client::connect`, orphan cleanup) | all |
 | `policy.rs` | Policy model + loading + validation | all |
-| `ipc_windows.rs` | Named-pipe server (tokio `named_pipe`), ACL, peer checks | Windows |
+| `pipe_windows.rs`, `winsec_windows.rs` | Named-pipe server (tokio `named_pipe`), ACL and peer checks; data-folder owner/DACL checks, Event Log | Windows |
 | `service_windows.rs` | SCM entry point, stop/shutdown handling | Windows |
 
 `gui/src/main.rs` shrinks to: a `ServiceClient` (async pipe client) plus the
@@ -201,7 +201,7 @@ the pipe, or impersonates the service/GUI.
 `unsafe` budget: the core crate has `#![deny(unsafe_code)]`, with a handful of
 reviewed exceptions (`udp.rs`, `dns.rs`, `killswitch.rs`, ...). ACL/SDDL and peer
 checks need a small amount of `unsafe` (`windows-sys`); confine it to
-`ipc_windows.rs`, document each block, and list it in the audit scope up front.
+`pipe_windows.rs` and `winsec_windows.rs`, document each block, and list it in the audit scope up front.
 
 ## 8. Behaviour details
 
@@ -256,7 +256,7 @@ these are the conservative picks; both are policy and can change in M4):
 | M2 | Service host + pipe server + ACLs; CLI `service install/uninstall/run/console` (**implemented**: protocol + codec, controller actor, transport-independent connection server, pipe transport, SCM host) | Linux: duplex-stream tests. Windows CI: real-pipe tests. Manual: install and run the service on the VM |
 | M3 | GUI on `ServiceClient` (**implemented**: `control::client`, Windows pipe client with pipe-owner check, GUI service mode; standalone mode kept for Linux/dev). Mode is decided by "service installed", never by pipe reachability, and never changes mid-session | Linux: client tested against the real server over duplex streams; GUI view-model tests. Manual: standard user on the VM |
 | M4 | Data-folder checks and hardening, `policy.toml`, enforced kill switch, crash recovery, protocol v2 (**implemented**) | Linux: policy matrix through the controller, GUI policy tests. Windows CI: DACL check against a hardened, widened and inheriting folder, junction rejection. Manual: upgrade steps in `README-windows.txt` |
-| M5 | Always-on: reconnect, auto-connect, kill switch from start (see section 12), then codec fuzz target, threat-model review, docs | Paused-time controller tests; VM checklist; fuzz in CI; reviewed against section 7 |
+| M5 (merged) | Always-on: reconnect, auto-connect, kill switch from start (see section 12), then codec fuzz target, threat-model review, docs | Paused-time controller tests; VM checklist; fuzz in CI; reviewed against section 7 |
 
 MSI/signing (next phase) builds on M4.
 
@@ -307,9 +307,9 @@ firewall default, not a WFP filter (KNOWN GAP, keep in the audit scope).
 
 ### 12.4 Delivery
 
-* **M5a:** reconnect/backoff, error classes, protocol v3, GUI phase display. Tests with paused
+* **M5a (merged, #30):** reconnect/backoff, error classes, protocol v3, GUI phase display. Tests with paused
   tokio time (schedule, reset, cancel, error classes, auto-connect, policy wins over intent).
-* **M5b:** two-phase kill switch, engage at start, `auto_connect`, service dependencies, stop
+* **M5b (merged, #31; VM checklist pending):** two-phase kill switch, engage at start, `auto_connect`, service dependencies, stop
   semantics. Windows verified by hand on the VM (CI runner would lose its network): reboot with
   `enforced`, cable out/in, sleep/resume, `sc.exe stop` (released), `taskkill` (stays, service returns).
-* **M5c:** codec fuzz target in CI, threat-model review against section 7, docs.
+* **M5c (merged, #32):** codec fuzz target in CI, write deadline, threat-model review against section 7 (`THREAT-MODEL-windows-service.md`), docs.
