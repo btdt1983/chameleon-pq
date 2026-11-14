@@ -11,9 +11,10 @@
 
 use super::policy::Policy;
 use super::protocol::{
-    ErrorCode, KillSwitchState, LogLine, Phase, PolicySummary, Request, Response, StateSnapshot,
-    TrafficProfile, TunnelInfo,
+    ErrorCode, KillSwitchState, LogLine, Phase, PolicySummary, ReconnectInfo, Request, Response,
+    StateSnapshot, TrafficProfile, TunnelInfo,
 };
+use super::reconnect::{self, FailClass};
 use super::supervisor::{self, ConnectOutcome, Supervisor};
 use crate::client::security_warnings;
 use crate::config::AppConfig;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 /// Log lines kept for `GetLog`.
 const LOG_CAP: usize = 200;
@@ -134,12 +136,19 @@ pub fn spawn_with_policy(
     let (tx, rx) = mpsc::channel(32);
     let (outcome_tx, outcome_rx) = mpsc::channel(1);
     let profile = cfg.traffic.profile;
-    let (state_tx, state_rx) = watch::channel(snapshot(&supervisor, profile, &cfg, &policy));
+    let (state_tx, state_rx) = watch::channel(snapshot(
+        &supervisor,
+        profile,
+        &cfg,
+        &policy,
+        &Reconnect::default(),
+    ));
     let actor = Actor {
         cfg,
         policy,
         sup: supervisor,
         profile,
+        rc: Reconnect::default(),
         log: VecDeque::new(),
         next_seq: 1,
         state_tx,
@@ -156,19 +165,48 @@ pub fn spawn_with_policy(
     )
 }
 
+/// What the actor remembers about its automatic reconnect.
+#[derive(Debug, Default)]
+struct Reconnect {
+    /// The user (or, later, `auto_connect`) wants a tunnel. Cleared by an
+    /// allowed Disconnect and by a permanent failure.
+    want_connected: bool,
+    /// Failed attempts since the last good connection (0 = none pending).
+    attempt: u32,
+    /// When the next attempt starts; `None` while idle, connecting or connected.
+    next_at: Option<Instant>,
+    last_error: Option<String>,
+    /// When the current connection came up.
+    connected_since: Option<Instant>,
+}
+
 fn snapshot(
     sup: &Supervisor,
     profile: TrafficProfile,
     cfg: &AppConfig,
     policy: &Policy,
+    rc: &Reconnect,
 ) -> StateSnapshot {
+    let waiting = rc.want_connected && rc.next_at.is_some() && !sup.is_connecting();
     let phase = if sup.is_connecting() {
         Phase::Connecting
     } else if sup.is_connected() {
         Phase::Connected
+    } else if waiting {
+        Phase::Reconnecting
     } else {
         Phase::Disconnected
     };
+    let reconnect =
+        (rc.want_connected && rc.attempt > 0 && !sup.is_connected()).then(|| ReconnectInfo {
+            attempt: rc.attempt,
+            next_in_secs: rc.next_at.filter(|_| !sup.is_connecting()).map(|t| {
+                t.saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+                    .ceil() as u64
+            }),
+            last_error: rc.last_error.clone(),
+        });
     let kill_switch = if sup.kill_switch_engaged() {
         KillSwitchState::Engaged
     } else if sup.kill_switch_orphan() {
@@ -191,6 +229,7 @@ fn snapshot(
         profile,
         warnings: security_warnings(cfg),
         policy: PolicySummary::from(policy),
+        reconnect,
     }
 }
 
@@ -199,6 +238,7 @@ struct Actor {
     policy: Policy,
     sup: Supervisor,
     profile: TrafficProfile,
+    rc: Reconnect,
     log: VecDeque<LogLine>,
     next_seq: u64,
     state_tx: watch::Sender<StateSnapshot>,
@@ -233,12 +273,13 @@ impl Actor {
                     }
                 },
                 Some(outcome) = outcome_rx.recv() => {
-                    let lines = self.sup.on_connected(outcome);
-                    self.push_log(lines);
+                    self.on_outcome(outcome);
                 }
                 _ = tick.tick() => {
+                    let was_connected = self.sup.is_connected();
                     let lines = self.sup.poll();
                     self.push_log(lines);
+                    self.on_tick(was_connected);
                 }
             }
             self.publish();
@@ -262,6 +303,8 @@ impl Actor {
                 if self.sup.is_connecting() {
                     return error(ErrorCode::Busy, "a connection attempt is in progress");
                 }
+                // The user no longer wants a tunnel: stop any pending retry.
+                self.rc = Reconnect::default();
                 let lines = self
                     .sup
                     .disconnect(self.policy.disconnect_keeps_kill_switch());
@@ -311,11 +354,28 @@ impl Actor {
             self.profile = p;
             self.cfg.traffic.profile = p;
         }
+        // An explicit Connect starts a fresh series: no waiting, counter reset.
+        self.rc = Reconnect {
+            want_connected: true,
+            ..Reconnect::default()
+        };
+        self.start_attempt(server);
+        Response::Ok {}
+    }
+
+    /// Start one connect attempt (user request or scheduled retry).
+    fn start_attempt(&mut self, server: SocketAddr) {
+        self.rc.next_at = None;
         let cfg = self.cfg.clone();
         let want_kill_switch = self.policy.kill_switch_wanted(cfg.tun.kill_switch);
         let enforced = self.policy.kill_switch == super::policy::KillSwitchPolicy::Enforced;
         self.sup.begin_connect();
-        self.push_log(vec![format!("Connecting to {server} …")]);
+        let what = if self.rc.attempt > 0 {
+            format!("Reconnecting to {server} (attempt {}) …", self.rc.attempt)
+        } else {
+            format!("Connecting to {server} …")
+        };
+        self.push_log(vec![what]);
         let fut = (self.connect_fn)(cfg, server, want_kill_switch);
         let tx = self.outcome_tx.clone();
         tokio::spawn(async move {
@@ -327,7 +387,78 @@ impl Actor {
             };
             let _ = tx.send(outcome).await;
         });
-        Response::Ok {}
+    }
+
+    /// Apply a finished attempt, then decide whether to retry.
+    fn on_outcome(&mut self, outcome: ConnectOutcome) {
+        let error = outcome.0.as_ref().err().cloned();
+        let lines = self.sup.on_connected(outcome);
+        self.push_log(lines);
+        match error {
+            None => {
+                self.rc.connected_since = Some(Instant::now());
+                self.rc.next_at = None;
+                self.rc.last_error = None;
+                // `attempt` is reset once the connection proved stable.
+            }
+            Some(e) if self.rc.want_connected => self.schedule_retry(&e),
+            Some(_) => {}
+        }
+    }
+
+    /// Plan the next attempt after a failure, or give up on a permanent one.
+    fn schedule_retry(&mut self, error: &str) {
+        let class = reconnect::classify(error);
+        self.rc.last_error = Some(error.to_string());
+        if class == FailClass::Permanent {
+            self.rc = Reconnect::default();
+            self.push_log(vec![format!(
+                "Not retrying: {error}. Fix the service config and connect again."
+            )]);
+            return;
+        }
+        self.rc.attempt = self.rc.attempt.saturating_add(1);
+        let wait = reconnect::delay(class, self.rc.attempt, rand::random::<f64>());
+        self.rc.next_at = Some(Instant::now() + wait);
+        let note = if class == FailClass::Rejected {
+            " (the server's identity check failed: check the pinned keys)"
+        } else {
+            ""
+        };
+        self.push_log(vec![format!(
+            "Next attempt in {} s{note}.",
+            wait.as_secs_f64().round() as u64
+        )]);
+    }
+
+    /// Once a second: notice a drop, mark a stable connection, start due retries.
+    fn on_tick(&mut self, was_connected: bool) {
+        if !self.rc.want_connected {
+            return;
+        }
+        if self.sup.is_connected() {
+            if self
+                .rc
+                .connected_since
+                .is_some_and(|t| t.elapsed() >= reconnect::STABLE_AFTER)
+            {
+                self.rc.attempt = 0;
+            }
+            return;
+        }
+        if was_connected {
+            // The tunnel just died. It was good for a while or not: that decides
+            // whether we start from the shortest delay again.
+            self.rc.connected_since = None;
+            self.schedule_retry("the tunnel dropped");
+            return;
+        }
+        let due = self.rc.next_at.is_some_and(|t| Instant::now() >= t);
+        if due && !self.sup.is_connecting() {
+            if let Some(server) = self.cfg.network.server_addr {
+                self.start_attempt(server);
+            }
+        }
     }
 
     /// Finish an in-flight connect first (it may have created the adapter and
@@ -339,13 +470,14 @@ impl Actor {
                 self.push_log(lines);
             }
         }
+        self.rc = Reconnect::default();
         let lines = self.sup.shutdown().await;
         self.push_log(lines);
         self.publish();
     }
 
     fn snapshot(&self) -> StateSnapshot {
-        snapshot(&self.sup, self.profile, &self.cfg, &self.policy)
+        snapshot(&self.sup, self.profile, &self.cfg, &self.policy, &self.rc)
     }
 
     fn push_log(&mut self, lines: Vec<String>) {
@@ -440,14 +572,14 @@ mod tests {
         gate.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if watch.borrow().phase == Phase::Disconnected {
+                if watch.borrow().phase == Phase::Reconnecting {
                     break;
                 }
                 watch.changed().await.unwrap();
             }
         })
         .await
-        .expect("returns to Disconnected after the failed connect");
+        .expect("waits to retry after the failed connect");
 
         let lines = match h.request(Request::GetLog { since: 0 }).await {
             Response::Log { lines } => lines,
@@ -660,6 +792,155 @@ mod tests {
         let out = require_kill_switch(failed);
         assert_eq!(out.0.err().as_deref(), Some("boom"));
         assert_eq!(out.1.unwrap().err().as_deref(), Some("ks"));
+    }
+
+    // ---- automatic reconnect (paused clock: no real waiting) ----
+
+    /// A connect fn that always fails with `err` and counts its calls.
+    fn counting_failure(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        err: &'static str,
+    ) -> ConnectFn {
+        Arc::new(move |_cfg, _server, _ks| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { (Err(err.to_string()), None) })
+        })
+    }
+
+    fn calls_of(c: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        c.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Advance the paused clock one second at a time, letting the actor run.
+    async fn run_for(secs: u64) {
+        for _ in 0..secs {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_connect_is_retried_with_growing_waits() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(
+            calls.clone(),
+            "UDP / IO error: unreachable",
+        ));
+        h.request(Request::Connect { profile: None }).await;
+        // No clock advance yet: the first attempt has failed, the retry waits.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls_of(&calls), 1);
+        let s = state(&h).await;
+        assert_eq!(s.phase, Phase::Reconnecting);
+        let info = s.reconnect.expect("reconnect info while waiting");
+        assert_eq!(info.attempt, 1);
+        assert!(info.next_in_secs.is_some());
+        assert!(info.last_error.unwrap().contains("unreachable"));
+
+        // Waits are about 1, 2, 4, 8 s (+-20%, rounded up by the 1 s tick):
+        // after 40 s there must have been several, but nowhere near one per second.
+        run_for(40).await;
+        let n = calls_of(&calls);
+        assert!((4..=9).contains(&n), "unexpected number of attempts: {n}");
+        assert!(state(&h).await.reconnect.unwrap().attempt as usize >= n - 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_cancels_the_retry_loop() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(calls.clone(), "unreachable"));
+        h.request(Request::Connect { profile: None }).await;
+        run_for(3).await;
+        assert_eq!(state(&h).await.phase, Phase::Reconnecting);
+
+        assert_eq!(h.request(Request::Disconnect {}).await, Response::Ok {});
+        let s = state(&h).await;
+        assert_eq!(s.phase, Phase::Disconnected);
+        assert!(s.reconnect.is_none());
+        let before = calls_of(&calls);
+        run_for(120).await;
+        assert_eq!(calls_of(&calls), before, "no attempts after Disconnect");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_error_is_not_retried() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(
+            calls.clone(),
+            "configuration error: Key derivation failed: invalid Ed25519 seed",
+        ));
+        h.request(Request::Connect { profile: None }).await;
+        run_for(120).await;
+        assert_eq!(calls_of(&calls), 1);
+        let s = state(&h).await;
+        assert_eq!(s.phase, Phase::Disconnected);
+        assert!(s.reconnect.is_none());
+        let lines = match h.request(Request::GetLog { since: 0 }).await {
+            Response::Log { lines } => lines,
+            other => panic!("{other:?}"),
+        };
+        assert!(lines.iter().any(|l| l.text.starts_with("Not retrying:")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_identity_check_waits_much_longer() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(
+            calls.clone(),
+            "Handshake error in state 'Ed25519': Ed25519 verification failed (MITM or wrong peer)",
+        ));
+        h.request(Request::Connect { profile: None }).await;
+        run_for(1).await;
+        let info = state(&h).await.reconnect.unwrap();
+        assert!(info.next_in_secs.unwrap() >= 12, "{info:?}");
+        run_for(10).await;
+        assert_eq!(calls_of(&calls), 1, "still waiting after 10 s");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_connect_skips_the_wait_and_restarts_the_series() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (h, _j) = start(counting_failure(
+            calls.clone(),
+            "Handshake error in state 'Ed25519': Ed25519 verification failed",
+        ));
+        h.request(Request::Connect { profile: None }).await;
+        run_for(1).await;
+        assert_eq!(calls_of(&calls), 1);
+        // Mid-wait (the next automatic attempt is 12 s or more away).
+        h.request(Request::Connect { profile: None }).await;
+        run_for(1).await;
+        assert_eq!(calls_of(&calls), 2);
+        assert_eq!(
+            state(&h).await.reconnect.unwrap().attempt,
+            1,
+            "series restarted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forbidden_disconnect_does_not_stop_the_retries() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy = Policy {
+            allow_user_disconnect: false,
+            ..Policy::default()
+        };
+        let (h, _j) = start_with(
+            test_cfg(),
+            policy,
+            counting_failure(calls.clone(), "unreachable"),
+        );
+        h.request(Request::Connect { profile: None }).await;
+        run_for(3).await;
+        assert!(denied(h.request(Request::Disconnect {}).await));
+        let before = calls_of(&calls);
+        run_for(60).await;
+        assert!(calls_of(&calls) > before, "retries continue");
+        assert_ne!(state(&h).await.phase, Phase::Disconnected);
     }
 
     #[tokio::test]

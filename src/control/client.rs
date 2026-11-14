@@ -318,6 +318,7 @@ mod tests {
             kill_switch: crate::control::protocol::KillSwitchState::Off,
             profile: TrafficProfile::default(),
             warnings: vec![],
+            reconnect: None,
             policy: crate::control::protocol::PolicySummary::from(
                 &crate::control::policy::Policy::default(),
             ),

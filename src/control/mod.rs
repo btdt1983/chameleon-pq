@@ -10,6 +10,7 @@ pub mod client;
 pub mod controller;
 pub mod policy;
 pub mod protocol;
+pub mod reconnect;
 pub mod server;
 
 #[cfg(windows)]
